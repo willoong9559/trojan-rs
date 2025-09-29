@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio_tungstenite::{accept_async, WebSocketStream};
 use tokio_tungstenite::tungstenite::{Message, Result as WsResult};
 use futures_util::{SinkExt, StreamExt, stream::{SplitSink, SplitStream}};
@@ -438,7 +439,6 @@ async fn handle_udp_associate(
     println!("Starting UDP Associate mode for client: {}", client_info);
     
     // Create a unique key for this client's UDP association
-    // We create separate sockets per client to avoid conflicts
     let socket_key = format!("client_{}_{}", client_info, 
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -448,11 +448,6 @@ async fn handle_udp_associate(
     let udp_association = {
         let mut associations = server.udp_associations.lock().await;
         
-        // Always create a new UDP socket for each UDP Associate request
-        // This avoids binding conflicts and provides better isolation
-        // For UDP Associate, we should bind to a local address, not the target address
-        // The bind_addr from the client is the target they want to associate with,
-        // but we need to create a local UDP socket to forward traffic
         let bind_socket_addr = SocketAddr::new(
             IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 
             0  // Let OS choose an available port
@@ -469,34 +464,49 @@ async fn handle_udp_associate(
 
     // Create channels for UDP packet forwarding
     let (udp_tx, mut udp_rx) = mpsc::unbounded_channel::<(SocketAddr, Vec<u8>)>();
+    
+    // Create cancellation channel for UDP receiver task
+    let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
-    // Spawn UDP receiver task
+    // Spawn UDP receiver task with proper cancellation
     let socket_clone = Arc::clone(&udp_association.socket);
     let udp_tx_clone = udp_tx.clone();
     let activity_tracker = Arc::clone(&udp_association.last_activity);
     
-    tokio::spawn(async move {
+    let udp_recv_handle: JoinHandle<()> = tokio::spawn(async move {
         let mut buf = vec![0u8; BUF_SIZE];
         loop {
-            match socket_clone.recv_from(&mut buf).await {
-                Ok((len, from_addr)) => {
-                    // Update activity time
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                    *activity_tracker.lock().await = now;
-                    
-                    if udp_tx_clone.send((from_addr, buf[..len].to_vec())).is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    println!("UDP recv error: {}", e);
+            tokio::select! {
+                // Listen for cancellation signal
+                _ = &mut cancel_rx => {
+                    println!("UDP receiver task cancelled for socket");
                     break;
+                }
+                // Receive UDP packets
+                result = socket_clone.recv_from(&mut buf) => {
+                    match result {
+                        Ok((len, from_addr)) => {
+                            // Update activity time
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs();
+                            *activity_tracker.lock().await = now;
+                            
+                            if udp_tx_clone.send((from_addr, buf[..len].to_vec())).is_err() {
+                                println!("UDP channel closed, stopping receiver");
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            println!("UDP recv error: {}", e);
+                            break;
+                        }
+                    }
                 }
             }
         }
+        println!("UDP receiver task terminated");
     });
 
     let result = async {
@@ -538,36 +548,43 @@ async fn handle_udp_associate(
                             println!("WebSocket error: {}", e);
                             break;
                         }
-                        None => break,
+                        None => {
+                            println!("WebSocket stream ended");
+                            break;
+                        }
                         _ => continue,
                     }
                 }
                 
                 // Handle incoming UDP packets (from remote servers)
                 udp_msg = udp_rx.recv() => {
-                    if let Some((from_addr, data)) = udp_msg {
-                        // Update activity (already updated in UDP receiver task)
-                        
-                        // Convert SocketAddr back to Address
-                        let addr = match from_addr {
-                            SocketAddr::V4(v4) => Address::IPv4(v4.ip().octets(), v4.port()),
-                            SocketAddr::V6(v6) => Address::IPv6(v6.ip().octets(), v6.port()),
-                        };
-                        
-                        // Create UDP packet
-                        let udp_packet = UdpPacket {
-                            addr,
-                            length: data.len() as u16,
-                            payload: data,
-                        };
-                        
-                        // Send back to WebSocket client
-                        let encoded = udp_packet.encode();
-                        if let Err(e) = ws_write.send(Message::Binary(encoded)).await {
-                            println!("Failed to send UDP packet back to WebSocket: {}", e);
+                    match udp_msg {
+                        Some((from_addr, data)) => {
+                            // Convert SocketAddr back to Address
+                            let addr = match from_addr {
+                                SocketAddr::V4(v4) => Address::IPv4(v4.ip().octets(), v4.port()),
+                                SocketAddr::V6(v6) => Address::IPv6(v6.ip().octets(), v6.port()),
+                            };
+                            
+                            // Create UDP packet
+                            let udp_packet = UdpPacket {
+                                addr,
+                                length: data.len() as u16,
+                                payload: data,
+                            };
+                            
+                            // Send back to WebSocket client
+                            let encoded = udp_packet.encode();
+                            if let Err(e) = ws_write.send(Message::Binary(encoded)).await {
+                                println!("Failed to send UDP packet back to WebSocket: {}", e);
+                                break;
+                            } else {
+                                println!("Sent UDP packet back to WebSocket client from {}", from_addr);
+                            }
+                        }
+                        None => {
+                            println!("UDP channel closed");
                             break;
-                        } else {
-                            println!("Sent UDP packet back to WebSocket client from {}", from_addr);
                         }
                     }
                 }
@@ -576,13 +593,41 @@ async fn handle_udp_associate(
         Ok::<(), anyhow::Error>(())
     }.await;
 
-    // Cleanup: remove this association when connection ends
+    // Critical cleanup section - ensure all resources are properly released
+    println!("Starting cleanup for UDP association: {}", socket_key);
+    
+    // 1. Cancel the UDP receiver task
+    let _ = cancel_tx.send(());
+    
+    // 2. Wait for the UDP receiver task to complete (with timeout)
+    match tokio::time::timeout(std::time::Duration::from_secs(5), udp_recv_handle).await {
+        Ok(join_result) => {
+            if let Err(e) = join_result {
+                println!("UDP receiver task join error: {}", e);
+            } else {
+                println!("UDP receiver task successfully terminated");
+            }
+        }
+        Err(_) => {
+            println!("Warning: UDP receiver task did not terminate within timeout");
+        }
+    }
+    
+    // 3. Drop channels to ensure no more messages can be sent
+    drop(udp_tx);
+    drop(udp_rx);
+    
+    // 4. Remove association from the map (socket will be closed when Arc count reaches 0)
     {
         let mut associations = server.udp_associations.lock().await;
-        associations.remove(&socket_key);
-        println!("Cleaned up UDP association: {} for client: {}", socket_key, client_info);
+        if associations.remove(&socket_key).is_some() {
+            println!("Successfully removed UDP association: {} for client: {}", socket_key, client_info);
+        } else {
+            println!("Warning: UDP association {} was already removed", socket_key);
+        }
     }
 
+    println!("Cleanup complete for UDP association: {}", socket_key);
     result
 }
 
@@ -614,62 +659,57 @@ async fn handle_websocket(server: Arc<Server>, stream: TcpStream) -> Result<()> 
 
     match request.cmd {
         TrojanCmd::Connect => {
-            println!("Handling TCP CONNECT command");
+            println!("Handling TCP CONNECT command to {}", request.addr.to_key());
             
             // Connect to remote server
             let remote_addr = request.addr.to_socket_addr().await?;
             let remote_stream = TcpStream::connect(remote_addr).await?;
+            println!("Connected to remote server: {}", remote_addr);
+
+            let (remote_read, mut remote_write) = tokio::io::split(remote_stream);
 
             // Write any payload data from the initial request
             if !request.payload.is_empty() {
-                let (remote_read, mut remote_write) = tokio::io::split(remote_stream);
-                remote_write.write_all(&request.payload).await?;
-
-                println!("Starting TCP bidirectional forwarding");
-
-                // Start bidirectional forwarding
-                tokio::select! {
-                    result = websocket_to_tcp(ws_read, remote_write) => {
-                        if let Err(e) = result {
-                            println!("WebSocket to TCP forwarding error: {}", e);
-                        }
-                    },
-                    result = tcp_to_websocket(remote_read, ws_write) => {
-                        if let Err(e) = result {
-                            println!("TCP to WebSocket forwarding error: {}", e);
-                        }
-                    },
+                if let Err(e) = remote_write.write_all(&request.payload).await {
+                    println!("Failed to write initial payload: {}", e);
+                    return Err(e.into());
                 }
-
-            } else {
-                let (remote_read, remote_write) = tokio::io::split(remote_stream);
-
-                println!("Starting TCP bidirectional forwarding");
-
-                // Start bidirectional forwarding
-                tokio::select! {
-                    result = websocket_to_tcp(ws_read, remote_write) => {
-                        if let Err(e) = result {
-                            println!("WebSocket to TCP forwarding error: {}", e);
-                        }
-                    }
-                    result = tcp_to_websocket(remote_read, ws_write) => {
-                        if let Err(e) = result {
-                            println!("TCP to WebSocket forwarding error: {}", e);
-                        }
-                    }
-                }
+                println!("Wrote initial payload of {} bytes", request.payload.len());
             }
+
+            println!("Starting TCP bidirectional forwarding");
+
+            // Start bidirectional forwarding
+            tokio::select! {
+                result = websocket_to_tcp(ws_read, remote_write) => {
+                    if let Err(e) = result {
+                        println!("WebSocket to TCP forwarding error: {}", e);
+                    } else {
+                        println!("WebSocket to TCP forwarding completed");
+                    }
+                },
+                result = tcp_to_websocket(remote_read, ws_write) => {
+                    if let Err(e) = result {
+                        println!("TCP to WebSocket forwarding error: {}", e);
+                    } else {
+                        println!("TCP to WebSocket forwarding completed");
+                    }
+                },
+            }
+            
+            println!("TCP connection closed for {}", peer_addr);
         }
         
         TrojanCmd::UdpAssociate => {
             println!("Handling UDP ASSOCIATE command for target: {}", request.addr.to_key());
             
-            // Handle UDP Associate - pass client info for unique socket creation
-            if let Err(e) = handle_udp_associate(server, ws_read, ws_write, request.addr, peer_addr).await {
-                println!("UDP Associate error: {}", e);
+            // Handle UDP Associate
+            if let Err(e) = handle_udp_associate(server, ws_read, ws_write, request.addr, peer_addr.clone()).await {
+                println!("UDP Associate error for {}: {}", peer_addr, e);
                 return Err(e);
             }
+            
+            println!("UDP Associate session ended for {}", peer_addr);
         }
     }
 
@@ -693,14 +733,16 @@ impl Server {
                 
                 for (key, association) in associations.iter() {
                     if association.is_inactive(UDP_TIMEOUT).await {
-                        println!("Cleaning up inactive UDP association: {}", key);
+                        println!("Marking inactive UDP association for removal: {}", key);
                         keys_to_remove.push(key.clone());
                     }
                 }
                 
                 // Remove inactive associations
                 for key in keys_to_remove {
-                    associations.remove(&key);
+                    if associations.remove(&key).is_some() {
+                        println!("Removed inactive UDP association: {}", key);
+                    }
                 }
                 
                 if !associations.is_empty() {
@@ -726,7 +768,9 @@ impl Server {
                     let server_clone = Arc::clone(&server);
                     tokio::spawn(async move {
                         if let Err(e) = handle_websocket(server_clone, stream).await {
-                            println!("Connection error: {}", e);
+                            println!("Connection error from {}: {}", addr, e);
+                        } else {
+                            println!("Connection from {} closed successfully", addr);
                         }
                     });
                 }
