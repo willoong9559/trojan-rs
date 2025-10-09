@@ -1,4 +1,6 @@
 mod utils;
+mod udp;
+mod socks5;
 
 use clap::Parser;
 use std::collections::HashMap;
@@ -10,74 +12,11 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{accept_async, WebSocketStream};
-use tokio_tungstenite::tungstenite::{Message, Result as WsResult};
+use tokio_tungstenite::tungstenite::{Message};
 use futures_util::{SinkExt, StreamExt, stream::{SplitSink, SplitStream}};
 use anyhow::{Result, anyhow};
 
 const BUF_SIZE: usize = 8192;
-const UDP_TIMEOUT: u64 = 60; // UDP association timeout in seconds;
-
-// UDP Association info
-#[derive(Debug, Clone)]
-struct UdpAssociation {
-    socket: Arc<UdpSocket>,
-    last_activity: Arc<Mutex<u64>>, // Unix timestamp
-    client_count: Arc<Mutex<u32>>,  // Number of active clients using this socket
-}
-
-impl UdpAssociation {
-    fn new(socket: UdpSocket) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        
-        Self {
-            socket: Arc::new(socket),
-            last_activity: Arc::new(Mutex::new(now)),
-            client_count: Arc::new(Mutex::new(1)),
-        }
-    }
-    
-    async fn update_activity(&self) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        *self.last_activity.lock().await = now;
-    }
-    
-    async fn increment_clients(&self) {
-        *self.client_count.lock().await += 1;
-    }
-    
-    async fn decrement_clients(&self) {
-        let mut count = self.client_count.lock().await;
-        if *count > 0 {
-            *count -= 1;
-        }
-    }
-    
-    async fn get_client_count(&self) -> u32 {
-        *self.client_count.lock().await
-    }
-    
-    async fn get_last_activity(&self) -> u64 {
-        *self.last_activity.lock().await
-    }
-    
-    async fn is_inactive(&self, timeout_secs: u64) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let last_activity = self.get_last_activity().await;
-        let client_count = self.get_client_count().await;
-        
-        // Clean up if no clients and inactive for timeout period
-        client_count == 0 && (now - last_activity) > timeout_secs
-    }
-}
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Trojan WS Server")]
@@ -99,7 +38,7 @@ struct ServerConfig {
 pub struct Server {
     pub listener: TcpListener,
     pub password: [u8; 56], // Hex SHA224 hash
-    pub udp_associations: Arc<Mutex<HashMap<String, UdpAssociation>>>,
+    pub udp_associations: Arc<Mutex<HashMap<String, udp::UdpAssociation>>>,
 }
 
 // Error codes
@@ -112,14 +51,6 @@ pub enum ErrorCode {
     MoreData = 4,
 }
 
-// SOCKS5 Address types
-#[derive(Debug, Clone, Copy)]
-pub enum AddressType {
-    IPv4 = 1,
-    FQDN = 3,
-    IPv6 = 4,
-}
-
 // Trojan Command types
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TrojanCmd {
@@ -127,64 +58,12 @@ pub enum TrojanCmd {
     UdpAssociate = 3,
 }
 
-// SOCKS5 Address
-#[derive(Debug, Clone)]
-pub enum Address {
-    IPv4([u8; 4], u16),
-    IPv6([u8; 16], u16),
-    Domain(String, u16),
-}
-
-impl Address {
-    pub fn port(&self) -> u16 {
-        match self {
-            Address::IPv4(_, port) => *port,
-            Address::IPv6(_, port) => *port,
-            Address::Domain(_, port) => *port,
-        }
-    }
-
-    pub async fn to_socket_addr(&self) -> Result<SocketAddr> {
-        match self {
-            Address::IPv4(ip, port) => {
-                let addr = IpAddr::V4(std::net::Ipv4Addr::from(*ip));
-                Ok(SocketAddr::new(addr, *port))
-            }
-            Address::IPv6(ip, port) => {
-                let addr = IpAddr::V6(std::net::Ipv6Addr::from(*ip));
-                Ok(SocketAddr::new(addr, *port))
-            }
-            Address::Domain(domain, port) => {
-                let addrs = tokio::net::lookup_host((domain.as_str(), *port)).await?;
-                addrs.into_iter().next()
-                    .ok_or_else(|| anyhow!("Failed to resolve domain: {}", domain))
-            }
-        }
-    }
-
-    // For UDP associations, we don't use the target address as the key
-    // Instead, we could use connection info or just create unique sockets
-    pub fn to_association_key(&self, client_info: &str) -> String {
-        format!("{}_{}", client_info, self.to_key())
-    }
-    
-    pub fn to_key(&self) -> String {
-        match self {
-            Address::IPv4(ip, port) => format!("{}:{}", 
-                std::net::Ipv4Addr::from(*ip), port),
-            Address::IPv6(ip, port) => format!("[{}]:{}", 
-                std::net::Ipv6Addr::from(*ip), port),
-            Address::Domain(domain, port) => format!("{}:{}", domain, port),
-        }
-    }
-}
-
 // Trojan Request
 #[derive(Debug)]
 pub struct TrojanRequest {
     pub password: [u8; 56], // hex password
     pub cmd: TrojanCmd,
-    pub addr: Address,
+    pub addr: socks5::Address,
     pub payload: Vec<u8>,
 }
 
@@ -230,7 +109,7 @@ impl TrojanRequest {
                 cursor += 4;
                 let port = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
                 cursor += 2;
-                Address::IPv4(ip, port)
+                socks5::Address::IPv4(ip, port)
             }
             3 => { // Domain
                 if buf.len() <= cursor {
@@ -245,7 +124,7 @@ impl TrojanRequest {
                 cursor += domain_len;
                 let port = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
                 cursor += 2;
-                Address::Domain(domain, port)
+                socks5::Address::Domain(domain, port)
             }
             4 => { // IPv6
                 if buf.len() < cursor + 18 {
@@ -256,7 +135,7 @@ impl TrojanRequest {
                 cursor += 16;
                 let port = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
                 cursor += 2;
-                Address::IPv6(ip, port)
+                socks5::Address::IPv6(ip, port)
             }
             _ => return Err(anyhow!("Invalid address type")),
         };
@@ -276,122 +155,6 @@ impl TrojanRequest {
             addr,
             payload,
         }, cursor))
-    }
-}
-
-// UDP Packet for Trojan UDP Associate
-#[derive(Debug)]
-pub struct UdpPacket {
-    pub addr: Address,
-    pub length: u16,
-    pub payload: Vec<u8>,
-}
-
-impl UdpPacket {
-    pub fn decode(buf: &[u8]) -> Result<(Self, usize)> {
-        if buf.len() < 4 {
-            return Err(anyhow!("Buffer too small"));
-        }
-
-        let mut cursor = 0;
-        let atyp = buf[cursor];
-        cursor += 1;
-
-        let addr = match atyp {
-            1 => { // IPv4
-                if buf.len() < cursor + 6 {
-                    return Err(anyhow!("Buffer too small for IPv4"));
-                }
-                let mut ip = [0u8; 4];
-                ip.copy_from_slice(&buf[cursor..cursor + 4]);
-                cursor += 4;
-                let port = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
-                cursor += 2;
-                Address::IPv4(ip, port)
-            }
-            3 => { // Domain
-                if buf.len() <= cursor {
-                    return Err(anyhow!("Buffer too small for domain length"));
-                }
-                let domain_len = buf[cursor] as usize;
-                cursor += 1;
-                if buf.len() < cursor + domain_len + 2 {
-                    return Err(anyhow!("Buffer too small for domain"));
-                }
-                let domain = String::from_utf8(buf[cursor..cursor + domain_len].to_vec())?;
-                cursor += domain_len;
-                let port = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
-                cursor += 2;
-                Address::Domain(domain, port)
-            }
-            4 => { // IPv6
-                if buf.len() < cursor + 18 {
-                    return Err(anyhow!("Buffer too small for IPv6"));
-                }
-                let mut ip = [0u8; 16];
-                ip.copy_from_slice(&buf[cursor..cursor + 16]);
-                cursor += 16;
-                let port = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
-                cursor += 2;
-                Address::IPv6(ip, port)
-            }
-            _ => return Err(anyhow!("Invalid address type")),
-        };
-
-        // Read length
-        if buf.len() < cursor + 2 {
-            return Err(anyhow!("Buffer too small for length"));
-        }
-        let length = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
-        cursor += 2;
-
-        // Read CRLF
-        if buf.len() < cursor + 2 || buf[cursor] != b'\r' || buf[cursor + 1] != b'\n' {
-            return Err(anyhow!("Invalid CRLF"));
-        }
-        cursor += 2;
-
-        // Read payload
-        if buf.len() < cursor + length as usize {
-            return Err(anyhow!("Buffer too small for payload"));
-        }
-        let payload = buf[cursor..cursor + length as usize].to_vec();
-        cursor += length as usize;
-
-        Ok((UdpPacket {
-            addr,
-            length,
-            payload,
-        }, cursor))
-    }
-
-    pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-
-        match &self.addr {
-            Address::IPv4(ip, port) => {
-                buf.push(1); // IPv4
-                buf.extend_from_slice(ip);
-                buf.extend_from_slice(&port.to_be_bytes());
-            }
-            Address::Domain(domain, port) => {
-                buf.push(3); // Domain
-                buf.push(domain.len() as u8);
-                buf.extend_from_slice(domain.as_bytes());
-                buf.extend_from_slice(&port.to_be_bytes());
-            }
-            Address::IPv6(ip, port) => {
-                buf.push(4); // IPv6
-                buf.extend_from_slice(ip);
-                buf.extend_from_slice(&port.to_be_bytes());
-            }
-        }
-
-        buf.extend_from_slice(&self.length.to_be_bytes());
-        buf.extend_from_slice(b"\r\n");
-        buf.extend_from_slice(&self.payload);
-
-        buf
     }
 }
 
@@ -433,7 +196,7 @@ async fn handle_udp_associate(
     server: Arc<Server>,
     mut ws_read: SplitStream<WebSocketStream<TcpStream>>,
     mut ws_write: SplitSink<WebSocketStream<TcpStream>, Message>,
-    bind_addr: Address,
+    bind_addr: socks5::Address,
     client_info: String,
 ) -> Result<()> {
     println!("Starting UDP Associate mode for client: {}", client_info);
@@ -457,7 +220,7 @@ async fn handle_udp_associate(
             .map_err(|e| anyhow!("Failed to bind UDP socket to {}: {}", bind_socket_addr, e))?;
             
         println!("Created new UDP socket bound to: {} for client: {}", socket.local_addr()?, client_info);
-        let association = UdpAssociation::new(socket);
+        let association = udp::UdpAssociation::new(socket);
         associations.insert(socket_key.clone(), association.clone());
         association
     };
@@ -516,7 +279,7 @@ async fn handle_udp_associate(
                 ws_msg = ws_read.next() => {
                     match ws_msg {
                         Some(Ok(Message::Binary(data))) => {
-                            match UdpPacket::decode(&data) {
+                            match udp::UdpPacket::decode(&data) {
                                 Ok((udp_packet, _)) => {
                                     // Update activity
                                     udp_association.update_activity().await;
@@ -562,12 +325,12 @@ async fn handle_udp_associate(
                         Some((from_addr, data)) => {
                             // Convert SocketAddr back to Address
                             let addr = match from_addr {
-                                SocketAddr::V4(v4) => Address::IPv4(v4.ip().octets(), v4.port()),
-                                SocketAddr::V6(v6) => Address::IPv6(v6.ip().octets(), v6.port()),
+                                SocketAddr::V4(v4) => socks5::Address::IPv4(v4.ip().octets(), v4.port()),
+                                SocketAddr::V6(v6) => socks5::Address::IPv6(v6.ip().octets(), v6.port()),
                             };
                             
                             // Create UDP packet
-                            let udp_packet = UdpPacket {
+                            let udp_packet =udp::UdpPacket {
                                 addr,
                                 length: data.len() as u16,
                                 payload: data,
@@ -725,14 +488,14 @@ impl Server {
         // Cleanup task for UDP associations (remove inactive ones periodically)
         let server_cleanup = Arc::clone(&server);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(UDP_TIMEOUT / 2));
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(udp::UDP_TIMEOUT / 2));
             loop {
                 interval.tick().await;
                 let mut associations = server_cleanup.udp_associations.lock().await;
                 let mut keys_to_remove = Vec::new();
                 
                 for (key, association) in associations.iter() {
-                    if association.is_inactive(UDP_TIMEOUT).await {
+                    if association.is_inactive(udp::UDP_TIMEOUT).await {
                         println!("Marking inactive UDP association for removal: {}", key);
                         keys_to_remove.push(key.clone());
                     }
