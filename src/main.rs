@@ -7,13 +7,13 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{accept_async, WebSocketStream};
 use tokio_tungstenite::tungstenite::Message;
-use futures_util::{SinkExt, StreamExt, stream::{SplitSink, SplitStream}};
+use futures_util::{StreamExt, stream::{SplitSink, SplitStream}};
 use anyhow::{Result, anyhow};
 
 // TLS support
@@ -26,7 +26,7 @@ const BUF_SIZE: usize = 8192;
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Trojan WS Server")]
-struct ServerConfig {
+pub struct ServerConfig {
     /// Host address
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
@@ -46,21 +46,6 @@ struct ServerConfig {
     /// TLS private key file path (optional)
     #[arg(long)]
     key: Option<String>,
-}
-
-// Enum to handle both TLS and non-TLS connections
-enum Connection {
-    Plain(TcpStream),
-    Tls(TlsStream<TcpStream>),
-}
-
-impl Connection {
-    fn peer_addr(&self) -> Result<SocketAddr> {
-        match self {
-            Connection::Plain(stream) => Ok(stream.peer_addr()?),
-            Connection::Tls(stream) => Ok(stream.get_ref().0.peer_addr()?),
-        }
-    }
 }
 
 pub struct Server {
@@ -177,10 +162,14 @@ impl TrojanRequest {
     }
 }
 
-async fn websocket_to_tcp(
-    mut ws_read: SplitStream<WebSocketStream<TcpStream>>,
+async fn websocket_to_tcp<S: AsyncWriteExt + Unpin + 'static>(
+    mut ws_read: SplitStream<WebSocketStream<S>>,
     mut tcp_write: tokio::io::WriteHalf<TcpStream>,
-) -> Result<()> {
+) -> Result<()> 
+where 
+    S: AsyncRead + AsyncWrite + Unpin + 'static,
+{
+    use futures_util::StreamExt;
     while let Some(msg) = ws_read.next().await {
         match msg? {
             Message::Binary(data) => {
@@ -193,10 +182,11 @@ async fn websocket_to_tcp(
     Ok(())
 }
 
-async fn tcp_to_websocket(
+async fn tcp_to_websocket<S: AsyncReadExt + AsyncWriteExt + Unpin + 'static>(
     mut tcp_read: tokio::io::ReadHalf<TcpStream>,
-    mut ws_write: SplitSink<WebSocketStream<TcpStream>, Message>,
+    mut ws_write: SplitSink<WebSocketStream<S>, Message>,
 ) -> Result<()> {
+    use futures_util::SinkExt;
     let mut buf = vec![0u8; BUF_SIZE];
     loop {
         let n = tcp_read.read(&mut buf).await?;
@@ -208,14 +198,14 @@ async fn tcp_to_websocket(
     Ok(())
 }
 
-async fn handle_udp_associate(
+async fn handle_udp_associate<S: AsyncReadExt + AsyncWriteExt + Unpin + 'static>(
     server: Arc<Server>,
-    mut ws_read: SplitStream<WebSocketStream<TcpStream>>,
-    mut ws_write: SplitSink<WebSocketStream<TcpStream>, Message>,
-    bind_addr: socks5::Address,
+    mut ws_read: SplitStream<WebSocketStream<S>>,
+    mut ws_write: SplitSink<WebSocketStream<S>, Message>,
+    _bind_addr: socks5::Address,
     client_info: String,
 ) -> Result<()> {
-    println!("Starting UDP Associate mode for client: {}", client_info);
+    use futures_util::{StreamExt, SinkExt};
     
     let socket_key = format!("client_{}_{}", client_info, 
         std::time::SystemTime::now()
@@ -389,13 +379,15 @@ async fn handle_udp_associate(
     result
 }
 
-async fn handle_websocket(server: Arc<Server>, stream: TcpStream) -> Result<()> {
-    let peer_addr = stream.peer_addr().ok().map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string());
-    let ws_stream = accept_async(stream).await?;
-    println!("WebSocket connection established from {}", peer_addr);
-
-    let (ws_write, mut ws_read) = ws_stream.split();
-
+async fn process_trojan_request<S: AsyncReadExt + AsyncWriteExt + Unpin + 'static>(
+    server: Arc<Server>,
+    mut ws_read: SplitStream<WebSocketStream<S>>,
+    ws_write: SplitSink<WebSocketStream<S>, Message>,
+    peer_addr: String,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + 'static,
+{
     let msg = match ws_read.next().await {
         Some(Ok(Message::Binary(data))) => data,
         Some(Ok(Message::Close(_))) => return Ok(()),
@@ -464,6 +456,24 @@ async fn handle_websocket(server: Arc<Server>, stream: TcpStream) -> Result<()> 
     }
 
     Ok(())
+}
+
+async fn handle_websocket_tls(server: Arc<Server>, stream: TlsStream<TcpStream>) -> Result<()> {
+    let peer_addr = stream.get_ref().0.peer_addr().ok().map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string());
+    let ws_stream = accept_async(stream).await?;
+    println!("WebSocket connection established from {}", peer_addr);
+    
+    let (ws_write, ws_read) = ws_stream.split();
+    process_trojan_request(server, ws_read, ws_write, peer_addr).await
+}
+
+async fn handle_websocket(server: Arc<Server>, stream: TcpStream) -> Result<()> {
+    let peer_addr = stream.peer_addr().ok().map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string());
+    let ws_stream = accept_async(stream).await?;
+    println!("WebSocket connection established from {}", peer_addr);
+    
+    let (ws_write, ws_read) = ws_stream.split();
+    process_trojan_request(server, ws_read, ws_write, peer_addr).await
 }
 
 fn load_tls_config(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
@@ -543,18 +553,23 @@ impl Server {
                     println!("New connection from: {}", addr);
                     let server_clone = Arc::clone(&server);
                     tokio::spawn(async move {
-                        if let Err(e) = async {
-                            let final_stream = if let Some(ref tls_acceptor) = server_clone.tls_acceptor {
-                                let tls_stream = tls_acceptor.accept(stream).await?;
-                                let (tx, rx) = tokio::io::split(tls_stream);
-                                let tcp_stream = TcpStream::connect("0.0.0.0:0").await?;
-                                tcp_stream
+                        let result = async {
+                            if let Some(ref tls_acceptor) = server_clone.tls_acceptor {
+                                match tls_acceptor.accept(stream).await {
+                                    Ok(tls_stream) => {
+                                        println!("TLS handshake successful from {}", addr);
+                                        handle_websocket_tls(server_clone, tls_stream).await
+                                    }
+                                    Err(e) => {
+                                        return Err(anyhow!("TLS handshake failed: {}", e));
+                                    }
+                                }
                             } else {
-                                stream
-                            };
-                            
-                            handle_websocket(server_clone, final_stream).await
-                        }.await {
+                                handle_websocket(server_clone, stream).await
+                            }
+                        }.await;
+
+                        if let Err(e) = result {
                             println!("Connection error from {}: {}", addr, e);
                         } else {
                             println!("Connection from {} closed successfully", addr);

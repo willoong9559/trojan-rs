@@ -3,7 +3,7 @@ use anyhow::{Result, anyhow};
 
 // SOCKS5 Address types
 #[derive(Debug, Clone, Copy)]
-pub enum AddressType {
+pub enum _AddressType {
     IPv4 = 1,
     FQDN = 3,
     IPv6 = 4,
