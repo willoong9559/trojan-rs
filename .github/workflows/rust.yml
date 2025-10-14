@@ -13,6 +13,7 @@ jobs:
   build:
     name: Build (${{ matrix.os }} - ${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       matrix:
         include:
@@ -25,9 +26,6 @@ jobs:
           # Windows x86_64
           - os: windows-latest
             target: x86_64-pc-windows-gnu
-          # FreeBSD (交叉编译)
-          - os: ubuntu-latest
-            target: x86_64-unknown-freebsd
 
     steps:
       - name: Checkout source
@@ -44,11 +42,11 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} --verbose
 
       - name: Run tests (only on native builds)
-        if: matrix.target != 'x86_64-unknown-freebsd'
         run: cargo test --verbose
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: rust-build-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/
+          path: |
+            target/${{ matrix.target }}/release/trojan-rs*
