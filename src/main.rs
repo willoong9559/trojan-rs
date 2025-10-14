@@ -12,9 +12,15 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{accept_async, WebSocketStream};
-use tokio_tungstenite::tungstenite::{Message};
+use tokio_tungstenite::tungstenite::Message;
 use futures_util::{SinkExt, StreamExt, stream::{SplitSink, SplitStream}};
 use anyhow::{Result, anyhow};
+
+// TLS support
+use tokio_rustls::{TlsAcceptor, server::TlsStream};
+use rustls_pemfile::certs;
+use std::fs::File;
+use std::io::BufReader;
 
 const BUF_SIZE: usize = 8192;
 
@@ -32,16 +38,38 @@ struct ServerConfig {
     /// Password
     #[arg(long)]
     password: String,
+
+    /// TLS certificate file path (optional)
+    #[arg(long)]
+    cert: Option<String>,
+
+    /// TLS private key file path (optional)
+    #[arg(long)]
+    key: Option<String>,
 }
 
-#[derive(Debug)]
+// Enum to handle both TLS and non-TLS connections
+enum Connection {
+    Plain(TcpStream),
+    Tls(TlsStream<TcpStream>),
+}
+
+impl Connection {
+    fn peer_addr(&self) -> Result<SocketAddr> {
+        match self {
+            Connection::Plain(stream) => Ok(stream.peer_addr()?),
+            Connection::Tls(stream) => Ok(stream.get_ref().0.peer_addr()?),
+        }
+    }
+}
+
 pub struct Server {
     pub listener: TcpListener,
-    pub password: [u8; 56], // Hex SHA224 hash
+    pub password: [u8; 56],
     pub udp_associations: Arc<Mutex<HashMap<String, udp::UdpAssociation>>>,
+    pub tls_acceptor: Option<TlsAcceptor>,
 }
 
-// Error codes
 #[derive(Debug, Clone, Copy)]
 pub enum ErrorCode {
     Ok = 0,
@@ -51,17 +79,15 @@ pub enum ErrorCode {
     MoreData = 4,
 }
 
-// Trojan Command types
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TrojanCmd {
     Connect = 1,
     UdpAssociate = 3,
 }
 
-// Trojan Request
 #[derive(Debug)]
 pub struct TrojanRequest {
-    pub password: [u8; 56], // hex password
+    pub password: [u8; 56],
     pub cmd: TrojanCmd,
     pub addr: socks5::Address,
     pub payload: Vec<u8>,
@@ -69,24 +95,21 @@ pub struct TrojanRequest {
 
 impl TrojanRequest {
     pub fn decode(buf: &[u8]) -> Result<(Self, usize)> {
-        if buf.len() < 59 { // min: 56 + 1 + 1 + 1 (password + cmd + atyp + minimal addr)
+        if buf.len() < 59 {
             return Err(anyhow!("Buffer too small"));
         }
 
         let mut cursor = 0;
 
-        // Read password (56 bytes hex)
         let mut password = [0u8; 56];
         password.copy_from_slice(&buf[cursor..cursor + 56]);
         cursor += 56;
 
-        // Read CRLF after password
         if buf[cursor] != b'\r' || buf[cursor + 1] != b'\n' {
             return Err(anyhow!("Invalid CRLF after password"));
         }
         cursor += 2;
 
-        // Read command
         let cmd = match buf[cursor] {
             1 => TrojanCmd::Connect,
             3 => TrojanCmd::UdpAssociate,
@@ -94,13 +117,11 @@ impl TrojanRequest {
         };
         cursor += 1;
 
-        // Read address type
         let atyp = buf[cursor];
         cursor += 1;
 
-        // Read address based on type
         let addr = match atyp {
-            1 => { // IPv4
+            1 => {
                 if buf.len() < cursor + 6 {
                     return Err(anyhow!("Buffer too small for IPv4"));
                 }
@@ -111,7 +132,7 @@ impl TrojanRequest {
                 cursor += 2;
                 socks5::Address::IPv4(ip, port)
             }
-            3 => { // Domain
+            3 => {
                 if buf.len() <= cursor {
                     return Err(anyhow!("Buffer too small for domain length"));
                 }
@@ -126,7 +147,7 @@ impl TrojanRequest {
                 cursor += 2;
                 socks5::Address::Domain(domain, port)
             }
-            4 => { // IPv6
+            4 => {
                 if buf.len() < cursor + 18 {
                     return Err(anyhow!("Buffer too small for IPv6"));
                 }
@@ -140,13 +161,11 @@ impl TrojanRequest {
             _ => return Err(anyhow!("Invalid address type")),
         };
 
-        // Read CRLF after address
         if buf.len() < cursor + 2 || buf[cursor] != b'\r' || buf[cursor + 1] != b'\n' {
             return Err(anyhow!("Invalid CRLF after address"));
         }
         cursor += 2;
 
-        // Remaining data is payload
         let payload = buf[cursor..].to_vec();
 
         Ok((TrojanRequest {
@@ -158,7 +177,6 @@ impl TrojanRequest {
     }
 }
 
-// WebSocket to TCP forwarding
 async fn websocket_to_tcp(
     mut ws_read: SplitStream<WebSocketStream<TcpStream>>,
     mut tcp_write: tokio::io::WriteHalf<TcpStream>,
@@ -175,7 +193,6 @@ async fn websocket_to_tcp(
     Ok(())
 }
 
-// TCP to WebSocket forwarding
 async fn tcp_to_websocket(
     mut tcp_read: tokio::io::ReadHalf<TcpStream>,
     mut ws_write: SplitSink<WebSocketStream<TcpStream>, Message>,
@@ -191,7 +208,6 @@ async fn tcp_to_websocket(
     Ok(())
 }
 
-// Handle UDP Associate over WebSocket
 async fn handle_udp_associate(
     server: Arc<Server>,
     mut ws_read: SplitStream<WebSocketStream<TcpStream>>,
@@ -201,7 +217,6 @@ async fn handle_udp_associate(
 ) -> Result<()> {
     println!("Starting UDP Associate mode for client: {}", client_info);
     
-    // Create a unique key for this client's UDP association
     let socket_key = format!("client_{}_{}", client_info, 
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -213,7 +228,7 @@ async fn handle_udp_associate(
         
         let bind_socket_addr = SocketAddr::new(
             IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 
-            0  // Let OS choose an available port
+            0
         );
         
         let socket = UdpSocket::bind(bind_socket_addr).await
@@ -225,13 +240,9 @@ async fn handle_udp_associate(
         association
     };
 
-    // Create channels for UDP packet forwarding
     let (udp_tx, mut udp_rx) = mpsc::unbounded_channel::<(SocketAddr, Vec<u8>)>();
-    
-    // Create cancellation channel for UDP receiver task
     let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
-    // Spawn UDP receiver task with proper cancellation
     let socket_clone = Arc::clone(&udp_association.socket);
     let udp_tx_clone = udp_tx.clone();
     let activity_tracker = Arc::clone(&udp_association.last_activity);
@@ -240,16 +251,13 @@ async fn handle_udp_associate(
         let mut buf = vec![0u8; BUF_SIZE];
         loop {
             tokio::select! {
-                // Listen for cancellation signal
                 _ = &mut cancel_rx => {
                     println!("UDP receiver task cancelled for socket");
                     break;
                 }
-                // Receive UDP packets
                 result = socket_clone.recv_from(&mut buf) => {
                     match result {
                         Ok((len, from_addr)) => {
-                            // Update activity time
                             let now = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap()
@@ -275,16 +283,13 @@ async fn handle_udp_associate(
     let result = async {
         loop {
             tokio::select! {
-                // Handle incoming WebSocket messages (UDP packets from client)
                 ws_msg = ws_read.next() => {
                     match ws_msg {
                         Some(Ok(Message::Binary(data))) => {
                             match udp::UdpPacket::decode(&data) {
                                 Ok((udp_packet, _)) => {
-                                    // Update activity
                                     udp_association.update_activity().await;
                                     
-                                    // Forward UDP packet to remote address
                                     match udp_packet.addr.to_socket_addr().await {
                                         Ok(remote_addr) => {
                                             if let Err(e) = udp_association.socket.send_to(&udp_packet.payload, remote_addr).await {
@@ -319,24 +324,20 @@ async fn handle_udp_associate(
                     }
                 }
                 
-                // Handle incoming UDP packets (from remote servers)
                 udp_msg = udp_rx.recv() => {
                     match udp_msg {
                         Some((from_addr, data)) => {
-                            // Convert SocketAddr back to Address
                             let addr = match from_addr {
                                 SocketAddr::V4(v4) => socks5::Address::IPv4(v4.ip().octets(), v4.port()),
                                 SocketAddr::V6(v6) => socks5::Address::IPv6(v6.ip().octets(), v6.port()),
                             };
                             
-                            // Create UDP packet
-                            let udp_packet =udp::UdpPacket {
+                            let udp_packet = udp::UdpPacket {
                                 addr,
                                 length: data.len() as u16,
                                 payload: data,
                             };
                             
-                            // Send back to WebSocket client
                             let encoded = udp_packet.encode();
                             if let Err(e) = ws_write.send(Message::Binary(encoded)).await {
                                 println!("Failed to send UDP packet back to WebSocket: {}", e);
@@ -356,13 +357,9 @@ async fn handle_udp_associate(
         Ok::<(), anyhow::Error>(())
     }.await;
 
-    // Critical cleanup section - ensure all resources are properly released
     println!("Starting cleanup for UDP association: {}", socket_key);
-    
-    // 1. Cancel the UDP receiver task
     let _ = cancel_tx.send(());
     
-    // 2. Wait for the UDP receiver task to complete (with timeout)
     match tokio::time::timeout(std::time::Duration::from_secs(5), udp_recv_handle).await {
         Ok(join_result) => {
             if let Err(e) = join_result {
@@ -376,11 +373,9 @@ async fn handle_udp_associate(
         }
     }
     
-    // 3. Drop channels to ensure no more messages can be sent
     drop(udp_tx);
     drop(udp_rx);
     
-    // 4. Remove association from the map (socket will be closed when Arc count reaches 0)
     {
         let mut associations = server.udp_associations.lock().await;
         if associations.remove(&socket_key).is_some() {
@@ -394,7 +389,6 @@ async fn handle_udp_associate(
     result
 }
 
-// Handle WebSocket connection
 async fn handle_websocket(server: Arc<Server>, stream: TcpStream) -> Result<()> {
     let peer_addr = stream.peer_addr().ok().map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string());
     let ws_stream = accept_async(stream).await?;
@@ -402,7 +396,6 @@ async fn handle_websocket(server: Arc<Server>, stream: TcpStream) -> Result<()> 
 
     let (ws_write, mut ws_read) = ws_stream.split();
 
-    // Read initial message containing Trojan request
     let msg = match ws_read.next().await {
         Some(Ok(Message::Binary(data))) => data,
         Some(Ok(Message::Close(_))) => return Ok(()),
@@ -410,10 +403,8 @@ async fn handle_websocket(server: Arc<Server>, stream: TcpStream) -> Result<()> 
         _ => return Err(anyhow!("Expected binary message")),
     };
 
-    // Parse Trojan request
     let (request, _consumed) = TrojanRequest::decode(&msg)?;
 
-    // Verify password
     let expected_password: [u8; 56] = server.password;
     if request.password != expected_password {
         println!("Incorrect password from WebSocket client");
@@ -424,14 +415,12 @@ async fn handle_websocket(server: Arc<Server>, stream: TcpStream) -> Result<()> 
         TrojanCmd::Connect => {
             println!("Handling TCP CONNECT command to {}", request.addr.to_key());
             
-            // Connect to remote server
             let remote_addr = request.addr.to_socket_addr().await?;
             let remote_stream = TcpStream::connect(remote_addr).await?;
             println!("Connected to remote server: {}", remote_addr);
 
             let (remote_read, mut remote_write) = tokio::io::split(remote_stream);
 
-            // Write any payload data from the initial request
             if !request.payload.is_empty() {
                 if let Err(e) = remote_write.write_all(&request.payload).await {
                     println!("Failed to write initial payload: {}", e);
@@ -442,7 +431,6 @@ async fn handle_websocket(server: Arc<Server>, stream: TcpStream) -> Result<()> 
 
             println!("Starting TCP bidirectional forwarding");
 
-            // Start bidirectional forwarding
             tokio::select! {
                 result = websocket_to_tcp(ws_read, remote_write) => {
                     if let Err(e) = result {
@@ -466,7 +454,6 @@ async fn handle_websocket(server: Arc<Server>, stream: TcpStream) -> Result<()> 
         TrojanCmd::UdpAssociate => {
             println!("Handling UDP ASSOCIATE command for target: {}", request.addr.to_key());
             
-            // Handle UDP Associate
             if let Err(e) = handle_udp_associate(server, ws_read, ws_write, request.addr, peer_addr.clone()).await {
                 println!("UDP Associate error for {}: {}", peer_addr, e);
                 return Err(e);
@@ -479,13 +466,40 @@ async fn handle_websocket(server: Arc<Server>, stream: TcpStream) -> Result<()> 
     Ok(())
 }
 
-// Main server implementation
+fn load_tls_config(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
+    let cert_file = File::open(cert_path)?;
+    let mut reader = BufReader::new(cert_file);
+    let certs = certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if certs.is_empty() {
+        return Err(anyhow!("No certificates found in {}", cert_path));
+    }
+
+    let key_file = File::open(key_path)?;
+    let mut reader = BufReader::new(key_file);
+    let key = rustls_pemfile::private_key(&mut reader)?;
+
+    let key = key.ok_or_else(|| anyhow!("No private key found in {}", key_path))?;
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
 impl Server {
     pub async fn run(self) -> Result<()> {
         let server = Arc::new(self);
         println!("Server started, listening on {}", server.listener.local_addr()?);
+        
+        if server.tls_acceptor.is_some() {
+            println!("TLS enabled");
+        } else {
+            println!("TLS disabled (running in plain mode)");
+        }
 
-        // Cleanup task for UDP associations (remove inactive ones periodically)
         let server_cleanup = Arc::clone(&server);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(udp::UDP_TIMEOUT / 2));
@@ -501,7 +515,6 @@ impl Server {
                     }
                 }
                 
-                // Remove inactive associations
                 for key in keys_to_remove {
                     if associations.remove(&key).is_some() {
                         println!("Removed inactive UDP association: {}", key);
@@ -530,7 +543,18 @@ impl Server {
                     println!("New connection from: {}", addr);
                     let server_clone = Arc::clone(&server);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_websocket(server_clone, stream).await {
+                        if let Err(e) = async {
+                            let final_stream = if let Some(ref tls_acceptor) = server_clone.tls_acceptor {
+                                let tls_stream = tls_acceptor.accept(stream).await?;
+                                let (tx, rx) = tokio::io::split(tls_stream);
+                                let tcp_stream = TcpStream::connect("0.0.0.0:0").await?;
+                                tcp_stream
+                            } else {
+                                stream
+                            };
+                            
+                            handle_websocket(server_clone, final_stream).await
+                        }.await {
                             println!("Connection error from {}: {}", addr, e);
                         } else {
                             println!("Connection from {} closed successfully", addr);
@@ -548,25 +572,37 @@ impl Server {
     }
 }
 
-// Build server from config
 pub async fn build_server(config: ServerConfig) -> Result<Server> {
     let addr: String = format!("{}:{}", config.host, config.port);
     let listener = TcpListener::bind(addr).await?;
 
     let password = utils::password_to_hex(&config.password);
 
+    let tls_acceptor = match (&config.cert, &config.key) {
+        (Some(cert_path), Some(key_path)) => {
+            println!("Loading TLS certificates from: {}, {}", cert_path, key_path);
+            Some(load_tls_config(cert_path, key_path)?)
+        }
+        (None, None) => {
+            println!("No TLS certificates provided, running in plain mode");
+            None
+        }
+        _ => {
+            return Err(anyhow!("Both --cert and --key must be provided together, or neither"));
+        }
+    };
+
     Ok(Server {
         listener,
         password,
         udp_associations: Arc::new(Mutex::new(HashMap::new())),
+        tls_acceptor,
     })
 }
 
-// usage
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = ServerConfig::parse();
-
     let server = build_server(config).await?;
     server.run().await
 }
