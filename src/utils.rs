@@ -1,7 +1,7 @@
-use sha2::{Sha224, Digest};
-use hex;  
+use hex;
+use sha2::{Digest, Sha224};
 
-// Hash password using SHA224
+// 使用 SHA224 计算密码散列
 pub fn hash_password(password: &str) -> [u8; 28] {
     let mut hasher = Sha224::new();
     hasher.update(password.as_bytes());
@@ -11,7 +11,7 @@ pub fn hash_password(password: &str) -> [u8; 28] {
     hash
 }
 
-// Convert password to hex
+// 将散列后的密码转换为十六进制表示
 pub fn password_to_hex(password: &str) -> [u8; 56] {
     let hash = hash_password(password);
     let hex_string = hex::encode(hash);
