@@ -3,7 +3,7 @@ mod udp;
 mod utils;
 
 use anyhow::{Result, anyhow};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use futures_util::{
     StreamExt,
     stream::{SplitSink, SplitStream},
@@ -35,6 +35,21 @@ macro_rules! log_if {
     };
 }
 
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkMode {
+    #[value(alias = "ws", alias = "websocket")]
+    Websocket,
+    Tcp,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpHeaderMode {
+    #[value(alias = "none")]
+    None,
+    #[value(alias = "http")]
+    Http,
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Trojan WS 服务端", long_about = None)]
 pub struct ServerConfig {
@@ -61,6 +76,14 @@ pub struct ServerConfig {
     /// 静默模式（部署时关闭所有控制台输出）
     #[arg(short = 'q', long = "quiet")]
     quiet: bool,
+
+    /// 传输网络
+    #[arg(long, default_value = "websocket")]
+    network: NetworkMode,
+
+    /// TCP 伪装头部类型（仅当 network=tcp 时生效）
+    #[arg(long = "tcp-header", default_value = "none")]
+    tcp_header: TcpHeaderMode,
 }
 
 pub struct Server {
@@ -69,6 +92,8 @@ pub struct Server {
     pub udp_associations: Arc<Mutex<HashMap<String, udp::UdpAssociation>>>,
     pub tls_acceptor: Option<TlsAcceptor>,
     pub quiet: bool,
+    pub network: NetworkMode,
+    pub tcp_header: TcpHeaderMode,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -179,6 +204,10 @@ impl TrojanRequest {
             cursor,
         ))
     }
+}
+
+fn is_incomplete_error(error: &anyhow::Error) -> bool {
+    error.to_string().contains("缓冲区长度不足")
 }
 
 async fn websocket_to_tcp<S: AsyncWriteExt + Unpin + 'static>(
@@ -541,6 +570,402 @@ where
     Ok(())
 }
 
+async fn perform_http_header<S>(server: &Server, stream: &mut S, peer_addr: &str) -> Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut buffer = Vec::new();
+    let mut temp = vec![0u8; BUF_SIZE];
+
+    loop {
+        let n = stream
+            .read(&mut temp)
+            .await
+            .map_err(|e| anyhow!("读取 HTTP 伪装头部失败: {}", utils::describe_io_error(&e)))?;
+
+        if n == 0 {
+            return Err(anyhow!("{} 在发送 HTTP 伪装头部前就关闭了连接", peer_addr));
+        }
+
+        buffer.extend_from_slice(&temp[..n]);
+
+        if let Some(idx) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header_bytes = &buffer[..idx + 4];
+            let header_text = String::from_utf8_lossy(header_bytes);
+            if !server.quiet {
+                println!(
+                    "收到来自 {} 的 HTTP 伪装请求:\n{}",
+                    peer_addr,
+                    header_text.trim_end()
+                );
+            }
+
+            let response =
+                b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+            stream
+                .write_all(response)
+                .await
+                .map_err(|e| anyhow!("返回 HTTP 伪装响应失败: {}", utils::describe_io_error(&e)))?;
+            stream.flush().await.map_err(|e| {
+                anyhow!("刷新 HTTP 响应缓冲区失败: {}", utils::describe_io_error(&e))
+            })?;
+
+            return Ok(buffer[idx + 4..].to_vec());
+        }
+
+        if buffer.len() > 16 * 1024 {
+            return Err(anyhow!("HTTP 伪装头部超过 16KB，拒绝处理"));
+        }
+    }
+}
+
+async fn handle_udp_associate_over_tcp<S>(
+    server: Arc<Server>,
+    stream: S,
+    _bind_addr: socks5::Address,
+    client_info: String,
+    mut pending: Vec<u8>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
+    let socket_key = format!(
+        "client_{}_{}",
+        client_info,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+
+    let udp_association = {
+        let mut associations = server.udp_associations.lock().await;
+        let bind_socket_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0);
+
+        let socket = UdpSocket::bind(bind_socket_addr)
+            .await
+            .map_err(|e| anyhow!("无法绑定 UDP 套接字到 {}: {}", bind_socket_addr, e))?;
+
+        log_if!(
+            server,
+            "已为客户端 {} 创建新的 UDP 套接字: {}",
+            client_info,
+            socket.local_addr()?
+        );
+
+        let association = udp::UdpAssociation::new(socket);
+        associations.insert(socket_key.clone(), association.clone());
+        association
+    };
+
+    let (udp_tx, mut udp_rx) = mpsc::unbounded_channel::<(SocketAddr, Vec<u8>)>();
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+
+    let socket_clone = Arc::clone(&udp_association.socket);
+    let udp_tx_clone = udp_tx.clone();
+    let activity_tracker = Arc::clone(&udp_association.last_activity);
+    let quiet = server.quiet;
+
+    let udp_recv_handle: JoinHandle<()> = tokio::spawn(async move {
+        let mut buf = vec![0u8; BUF_SIZE];
+        let mut cancel_rx = cancel_rx;
+        loop {
+            tokio::select! {
+                _ = &mut cancel_rx => {
+                    if !quiet {
+                        println!("UDP 接收任务已取消");
+                    }
+                    break;
+                }
+                result = socket_clone.recv_from(&mut buf) => {
+                    match result {
+                        Ok((len, from_addr)) => {
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs();
+                            *activity_tracker.lock().await = now;
+
+                            if udp_tx_clone.send((from_addr, buf[..len].to_vec())).is_err() {
+                                if !quiet {
+                                    println!("UDP 通道已关闭，停止接收任务");
+                                }
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            if !quiet {
+                                let reason = utils::describe_io_error(&e);
+                                println!("UDP 接收数据出错: {}", reason);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !quiet {
+            println!("UDP 接收任务已结束");
+        }
+    });
+
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let mut read_buf = vec![0u8; BUF_SIZE];
+
+    let result = async {
+        loop {
+            loop {
+                match udp::UdpPacket::decode(&pending) {
+                    Ok((udp_packet, consumed)) => {
+                        udp_association.update_activity().await;
+                        match udp_packet.addr.to_socket_addr().await {
+                            Ok(remote_addr) => {
+                                if let Err(e) = udp_association
+                                    .socket
+                                    .send_to(&udp_packet.payload, remote_addr)
+                                    .await
+                                {
+                                    let reason = utils::describe_io_error(&e);
+                                    log_if!(
+                                        server,
+                                        "向 {} 发送 UDP 数据报失败: {}",
+                                        remote_addr,
+                                        reason
+                                    );
+                                } else {
+                                    log_if!(server, "已转发 UDP 数据报至 {}", remote_addr);
+                                }
+                            }
+                            Err(e) => {
+                                log_if!(server, "解析远端地址失败: {}", e);
+                            }
+                        }
+
+                        pending.drain(..consumed);
+                        continue;
+                    }
+                    Err(e) => {
+                        if is_incomplete_error(&e) {
+                            break;
+                        } else {
+                            log_if!(server, "解码 UDP 数据报失败: {}", e);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+
+            tokio::select! {
+                read_result = reader.read(&mut read_buf) => {
+                    match read_result {
+                        Ok(0) => {
+                            log_if!(server, "客户端 TCP 流已关闭");
+                            break;
+                        }
+                        Ok(n) => {
+                            pending.extend_from_slice(&read_buf[..n]);
+                        }
+                        Err(e) => {
+                            let reason = utils::describe_io_error(&e);
+                            log_if!(server, "从客户端读取 UDP 负载失败: {}", reason);
+                            return Err(anyhow!("从客户端读取 UDP 负载失败: {}", reason));
+                        }
+                    }
+                }
+                udp_msg = udp_rx.recv() => {
+                    match udp_msg {
+                        Some((from_addr, data)) => {
+                            let addr = match from_addr {
+                                SocketAddr::V4(v4) => socks5::Address::IPv4(v4.ip().octets(), v4.port()),
+                                SocketAddr::V6(v6) => socks5::Address::IPv6(v6.ip().octets(), v6.port()),
+                            };
+
+                            let udp_packet = udp::UdpPacket {
+                                addr,
+                                length: data.len() as u16,
+                                payload: data,
+                            };
+
+                            let encoded = udp_packet.encode();
+                            if let Err(e) = writer.write_all(&encoded).await {
+                                let reason = utils::describe_io_error(&e);
+                                log_if!(server, "向客户端写回 UDP 数据报失败: {}", reason);
+                                return Err(anyhow!("向客户端写回 UDP 数据报失败: {}", reason));
+                            } else {
+                                log_if!(
+                                    server,
+                                    "已将来自 {} 的 UDP 数据报回传给客户端",
+                                    from_addr
+                                );
+                            }
+                        }
+                        None => {
+                            log_if!(server, "UDP 通道已关闭");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    log_if!(server, "开始清理 UDP 会话: {}", socket_key);
+    let _ = cancel_tx.send(());
+
+    match tokio::time::timeout(std::time::Duration::from_secs(5), udp_recv_handle).await {
+        Ok(join_result) => {
+            if let Err(e) = join_result {
+                log_if!(server, "UDP 接收任务回收失败: {}", e);
+            } else {
+                log_if!(server, "UDP 接收任务已安全结束");
+            }
+        }
+        Err(_) => {
+            log_if!(server, "警告: UDP 接收任务未在超时时间内结束");
+        }
+    }
+
+    drop(udp_tx);
+    drop(udp_rx);
+
+    {
+        let mut associations = server.udp_associations.lock().await;
+        if associations.remove(&socket_key).is_some() {
+            log_if!(
+                server,
+                "已移除客户端 {} 的 UDP 会话: {}",
+                client_info,
+                socket_key
+            );
+        } else {
+            log_if!(server, "警告: UDP 会话 {} 已被移除", socket_key);
+        }
+    }
+
+    log_if!(server, "UDP 会话 {} 清理完成", socket_key);
+    result
+}
+
+async fn handle_tcp_stream<S>(server: Arc<Server>, mut stream: S, peer_addr: String) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
+    log_if!(server, "来自 {} 的 TCP 连接已建立", peer_addr);
+
+    let mut buffer = if server.tcp_header == TcpHeaderMode::Http {
+        perform_http_header(&server, &mut stream, &peer_addr).await?
+    } else {
+        Vec::new()
+    };
+
+    let mut temp = vec![0u8; BUF_SIZE];
+    let request = loop {
+        match TrojanRequest::decode(&buffer) {
+            Ok((request, consumed)) => {
+                buffer.drain(..consumed + request.payload.len());
+                break request;
+            }
+            Err(e) => {
+                if is_incomplete_error(&e) {
+                    let n = stream.read(&mut temp).await.map_err(|ioe| {
+                        anyhow!(
+                            "读取 Trojan 握手数据失败: {}",
+                            utils::describe_io_error(&ioe)
+                        )
+                    })?;
+                    if n == 0 {
+                        return Err(anyhow!("{} 在发送完整握手数据前关闭了连接", peer_addr));
+                    }
+                    buffer.extend_from_slice(&temp[..n]);
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    };
+
+    if request.password != server.password {
+        log_if!(server, "TCP 客户端提供了错误的密码");
+        return Err(anyhow!("认证密码不正确"));
+    }
+
+    let TrojanRequest {
+        password: _,
+        cmd,
+        addr,
+        payload,
+    } = request;
+
+    match cmd {
+        TrojanCmd::Connect => {
+            log_if!(server, "开始处理到 {} 的 TCP CONNECT 请求", addr.to_key());
+
+            let remote_addr = addr.to_socket_addr().await?;
+            let mut remote_stream = TcpStream::connect(remote_addr).await.map_err(|e| {
+                let reason = utils::describe_io_error(&e);
+                anyhow!("无法连接到远端服务器 {}: {}", remote_addr, reason)
+            })?;
+            log_if!(server, "已连接到远端服务器 {}", remote_addr);
+
+            if !payload.is_empty() {
+                if let Err(e) = remote_stream.write_all(&payload).await {
+                    let reason = utils::describe_io_error(&e);
+                    log_if!(server, "写入初始负载失败: {}", reason);
+                    return Err(anyhow!(
+                        "向远端服务器 {} 写入初始负载失败: {}",
+                        remote_addr,
+                        reason
+                    ));
+                }
+                log_if!(server, "已写入 {} 字节的初始负载", payload.len());
+            }
+
+            log_if!(server, "开始建立 TCP 双向转发");
+
+            match tokio::io::copy_bidirectional(&mut stream, &mut remote_stream).await {
+                Ok((_from_client, _from_server)) => {
+                    log_if!(server, "TCP 双向转发已结束");
+                }
+                Err(e) => {
+                    let reason = utils::describe_io_error(&e);
+                    log_if!(server, "TCP 双向转发出错: {}", reason);
+                }
+            }
+
+            log_if!(server, "{} 的 TCP 连接已关闭", peer_addr);
+            Ok(())
+        }
+        TrojanCmd::UdpAssociate => {
+            log_if!(
+                server,
+                "开始处理目标 {} 的 UDP ASSOCIATE 请求",
+                addr.to_key()
+            );
+
+            handle_udp_associate_over_tcp(
+                Arc::clone(&server),
+                stream,
+                addr,
+                peer_addr.clone(),
+                payload,
+            )
+            .await?;
+            log_if!(server, "{} 的 UDP 会话已结束", peer_addr);
+            Ok(())
+        }
+    }
+}
+
 async fn handle_websocket_tls(server: Arc<Server>, stream: TlsStream<TcpStream>) -> Result<()> {
     let peer_addr = stream
         .get_ref()
@@ -665,20 +1090,47 @@ impl Server {
                     tokio::spawn(async move {
                         let quiet = server_clone.quiet;
                         let result = async {
-                            if let Some(ref tls_acceptor) = server_clone.tls_acceptor {
-                                match tls_acceptor.accept(stream).await {
-                                    Ok(tls_stream) => {
-                                        if !quiet {
-                                            println!("来自 {} 的 TLS 握手成功", addr);
+                            match server_clone.network {
+                                NetworkMode::Websocket => {
+                                    if let Some(ref tls_acceptor) = server_clone.tls_acceptor {
+                                        match tls_acceptor.accept(stream).await {
+                                            Ok(tls_stream) => {
+                                                if !quiet {
+                                                    println!("来自 {} 的 TLS 握手成功", addr);
+                                                }
+                                                handle_websocket_tls(server_clone, tls_stream).await
+                                            }
+                                            Err(e) => {
+                                                return Err(anyhow!("TLS 握手失败: {}", e));
+                                            }
                                         }
-                                        handle_websocket_tls(server_clone, tls_stream).await
-                                    }
-                                    Err(e) => {
-                                        return Err(anyhow!("TLS 握手失败: {}", e));
+                                    } else {
+                                        handle_websocket(server_clone, stream).await
                                     }
                                 }
-                            } else {
-                                handle_websocket(server_clone, stream).await
+                                NetworkMode::Tcp => {
+                                    if let Some(ref tls_acceptor) = server_clone.tls_acceptor {
+                                        match tls_acceptor.accept(stream).await {
+                                            Ok(tls_stream) => {
+                                                if !quiet {
+                                                    println!("来自 {} 的 TLS 握手成功", addr);
+                                                }
+                                                handle_tcp_stream(
+                                                    server_clone,
+                                                    tls_stream,
+                                                    addr.to_string(),
+                                                )
+                                                .await
+                                            }
+                                            Err(e) => {
+                                                return Err(anyhow!("TLS 握手失败: {}", e));
+                                            }
+                                        }
+                                    } else {
+                                        handle_tcp_stream(server_clone, stream, addr.to_string())
+                                            .await
+                                    }
+                                }
                             }
                         }
                         .await;
@@ -735,6 +1187,8 @@ pub async fn build_server(config: ServerConfig) -> Result<Server> {
         udp_associations: Arc::new(Mutex::new(HashMap::new())),
         tls_acceptor,
         quiet: config.quiet,
+        network: config.network,
+        tcp_header: config.tcp_header,
     })
 }
 
