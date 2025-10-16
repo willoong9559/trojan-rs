@@ -10,6 +10,7 @@
 - **全中文命令行参数与运行日志**，部署体验更友好。
 - 新增 `-q/--quiet` 静默模式，便于在自动化部署时关闭控制台输出。
 - 新增 `--network` 与 `--tcp-header` 参数，兼容 Trojan `network="tcp"` + `header="http"` 的传输配置。
+- 自动识别 Trojan `mux.cool` 多路复用请求，在单条 TCP 连接上复用多路 TCP / XUDP 子连接。
 
 ## 快速开始
 
@@ -49,6 +50,10 @@ cargo run -- --password 我的超级密码 --network tcp --tcp-header http
 | `--tcp-header`       | TCP 伪装头类型：`none` 或 `http`（仅 TCP） | 字符串 | `none`      |
 
 > **提示**：`--cert` 与 `--key` 必须同时提供，缺一则视为无效，会提示错误。
+
+## Mux 多路复用支持
+
+当客户端在 Xray 等实现中启用 Trojan `mux.cool` 功能（可选配置 `mux` / `xudpConcurrency` 等参数）时，本服务端会自动识别目标地址 `v1.mux.cool:9527`，在单条物理 TCP 连接上复用多个逻辑 TCP 子连接或 XUDP 数据流，无需额外配置。保持 `--network tcp` 传输模式即可完成对 Mux 的适配。
 
 ## 静态编译
 
