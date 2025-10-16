@@ -192,7 +192,10 @@ where
     while let Some(msg) = ws_read.next().await {
         match msg? {
             Message::Binary(data) => {
-                tcp_write.write_all(&data).await?;
+                if let Err(e) = tcp_write.write_all(&data).await {
+                    let reason = utils::describe_io_error(&e);
+                    return Err(anyhow!("向远端服务器写入数据失败: {}", reason));
+                }
             }
             Message::Close(_) => break,
             _ => continue,
@@ -208,11 +211,17 @@ async fn tcp_to_websocket<S: AsyncReadExt + AsyncWriteExt + Unpin + 'static>(
     use futures_util::SinkExt;
     let mut buf = vec![0u8; BUF_SIZE];
     loop {
-        let n = tcp_read.read(&mut buf).await?;
+        let n = tcp_read.read(&mut buf).await.map_err(|e| {
+            let reason = utils::describe_io_error(&e);
+            anyhow!("从远端服务器读取数据失败: {}", reason)
+        })?;
         if n == 0 {
             break;
         }
-        ws_write.send(Message::Binary(buf[..n].to_vec())).await?;
+        ws_write
+            .send(Message::Binary(buf[..n].to_vec()))
+            .await
+            .map_err(|e| anyhow!("向 WebSocket 客户端发送数据失败: {}", e))?;
     }
     Ok(())
 }
@@ -291,7 +300,8 @@ async fn handle_udp_associate<S: AsyncReadExt + AsyncWriteExt + Unpin + 'static>
                         }
                         Err(e) => {
                             if !quiet {
-                                println!("UDP 接收数据出错: {}", e);
+                                let reason = utils::describe_io_error(&e);
+                                println!("UDP 接收数据出错: {}", reason);
                             }
                             break;
                         }
@@ -316,8 +326,18 @@ async fn handle_udp_associate<S: AsyncReadExt + AsyncWriteExt + Unpin + 'static>
 
                                     match udp_packet.addr.to_socket_addr().await {
                                         Ok(remote_addr) => {
-                                            if let Err(e) = udp_association.socket.send_to(&udp_packet.payload, remote_addr).await {
-                                                log_if!(server, "向 {} 发送 UDP 数据报失败: {}", remote_addr, e);
+                                            if let Err(e) = udp_association
+                                                .socket
+                                                .send_to(&udp_packet.payload, remote_addr)
+                                                .await
+                                            {
+                                                let reason = utils::describe_io_error(&e);
+                                                log_if!(
+                                                    server,
+                                                    "向 {} 发送 UDP 数据报失败: {}",
+                                                    remote_addr,
+                                                    reason
+                                                );
                                             } else {
                                                 log_if!(server, "已转发 UDP 数据报至 {}", remote_addr);
                                             }
@@ -451,15 +471,23 @@ where
             );
 
             let remote_addr = request.addr.to_socket_addr().await?;
-            let remote_stream = TcpStream::connect(remote_addr).await?;
+            let remote_stream = TcpStream::connect(remote_addr).await.map_err(|e| {
+                let reason = utils::describe_io_error(&e);
+                anyhow!("无法连接到远端服务器 {}: {}", remote_addr, reason)
+            })?;
             log_if!(server, "已连接到远端服务器 {}", remote_addr);
 
             let (remote_read, mut remote_write) = tokio::io::split(remote_stream);
 
             if !request.payload.is_empty() {
                 if let Err(e) = remote_write.write_all(&request.payload).await {
-                    log_if!(server, "写入初始负载失败: {}", e);
-                    return Err(e.into());
+                    let reason = utils::describe_io_error(&e);
+                    log_if!(server, "写入初始负载失败: {}", reason);
+                    return Err(anyhow!(
+                        "向远端服务器 {} 写入初始负载失败: {}",
+                        remote_addr,
+                        reason
+                    ));
                 }
                 log_if!(server, "已写入 {} 字节的初始负载", request.payload.len());
             }
