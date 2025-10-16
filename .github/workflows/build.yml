@@ -125,7 +125,7 @@ jobs:
           cd artifacts
           tar -czf ${{ github.event.repository.name }}-${{ matrix.target }}.tar.gz ${{ matrix.binary_name }}*
           ls -la
-          rm -f ${{ matrix.binary_name }}*
+          rm -f "${{ matrix.binary_name }}" "${{ matrix.binary_name }}.exe"
           cd ..
 
       - name: Verify artifacts before upload
