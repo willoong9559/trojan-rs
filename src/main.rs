@@ -1,3 +1,4 @@
+mod mux;
 mod socks5;
 mod udp;
 mod utils;
@@ -908,6 +909,13 @@ where
 
     match cmd {
         TrojanCmd::Connect => {
+            if let socks5::Address::Domain(domain, port) = &addr {
+                if domain == mux::MUX_COOL_ADDRESS && *port == mux::MUX_COOL_PORT {
+                    log_if!(server, "检测到 Trojan Mux 请求，目标为 {}:{}", domain, port);
+                    return mux::handle_mux(Arc::clone(&server), stream, peer_addr, payload).await;
+                }
+            }
+
             log_if!(server, "开始处理到 {} 的 TCP CONNECT 请求", addr.to_key());
 
             let remote_addr = addr.to_socket_addr().await?;
