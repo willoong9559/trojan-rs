@@ -1,8 +1,8 @@
 mod utils;
 mod udp;
 mod socks5;
+mod config;
 
-use clap::Parser;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -23,30 +23,6 @@ use std::fs::File;
 use std::io::BufReader;
 
 const BUF_SIZE: usize = 8192;
-
-#[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "Trojan WS Server")]
-pub struct ServerConfig {
-    /// Host address
-    #[arg(long, default_value = "127.0.0.1")]
-    host: String,
-
-    /// Port number
-    #[arg(long, default_value = "35537")]
-    port: String,
-
-    /// Password
-    #[arg(long)]
-    password: String,
-
-    /// TLS certificate file path (optional)
-    #[arg(long)]
-    cert: Option<String>,
-
-    /// TLS private key file path (optional)
-    #[arg(long)]
-    key: Option<String>,
-}
 
 pub struct Server {
     pub listener: TcpListener,
@@ -587,7 +563,7 @@ impl Server {
     }
 }
 
-pub async fn build_server(config: ServerConfig) -> Result<Server> {
+pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
     let addr: String = format!("{}:{}", config.host, config.port);
     let listener = TcpListener::bind(addr).await?;
 
@@ -617,7 +593,7 @@ pub async fn build_server(config: ServerConfig) -> Result<Server> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = ServerConfig::parse();
+    let config = config::ServerConfig::load()?;
     let server = build_server(config).await?;
     server.run().await
 }

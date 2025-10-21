@@ -1,35 +1,80 @@
 # Trojan WS Server
 
-A simple **Trojan WebSocket (WS)** server configuration using Rust.
-
-This server allows you to run a Trojan WS server with configurable host, port, and password via command line arguments.  
+A simple **Trojan WebSocket (WS/WSS)** server implemented in **Rust**.  
+This server allows you to run a Trojan server with configurable host, port, and password via **command-line arguments**.  
 It also supports **optional TLS encryption**, allowing you to serve secure WebSocket connections over `wss://`.
 
 ---
 
-## Command Line Arguments
+## Command-Line Arguments
 
-The server uses [**clap**](https://crates.io/crates/clap) to parse command line arguments.  
-The available options are:
+The server uses [**clap**](https://crates.io/crates/clap) to parse command-line arguments.  
+Available options:
 
-| Argument         | Description                     | Type   | Default Value   |
-|------------------|----------------------------------|--------|----------------|
-| `--host`         | Host address                     | String | `127.0.0.1`    |
-| `--port`         | Port number                      | String | `35537`        |
-| `--password`     | Password for server               | String | *(required)*   |
-| `--cert <FILE>`  | TLS certificate file path (PEM)   | String | *(optional)*   |
-| `--key <FILE>`   | TLS private key file path (PEM)   | String | *(optional)*   |
+| Argument                    | Description                               | Type   | Default Value   |
+|------------------------------|-------------------------------------------|--------|----------------|
+| `--host <HOST>`             | Host address                               | String | `127.0.0.1`    |
+| `--port <PORT>`             | Port number                                | String | `35537`        |
+| `--password <PASSWORD>`     | Password for the server                    | String | *(required)*   |
+| `--cert <FILE>`             | TLS certificate file path (PEM)           | String | *(optional)*   |
+| `--key <FILE>`              | TLS private key file path (PEM)           | String | *(optional)*   |
+| `-c, --config-file <FILE>`  | Load configuration from TOML file         | String | *(optional)*   |
+| `--generate-config <FILE>`  | Generate example TOML configuration file | String | *(optional)*   |
+| `-h, --help`                | Print help                                 | -      | -              |
+| `-V, --version`             | Print version                              | -      | -              |
 
 > **Note:**  
-> If both `--cert` and `--key` are provided, the server automatically enables **TLS mode** and listens for secure WebSocket (`wss://`) connections.  
-> If they are omitted, the server runs in plain WS mode (`ws://`).
+> - If both `--cert` and `--key` are provided, the server automatically enables **TLS mode** (`wss://`).  
+> - If omitted, the server runs in plain WebSocket mode (`ws://`).  
+> - CLI arguments override configuration file values.
 
 ---
 
 ## Example Usage
 
 ### Run without TLS
-Run the server with the default host and port, specifying only a password:
+
+Run the server with default host and port, specifying only a password:
 
 ```bash
 cargo run -- --password mysecretpassword
+```
+### Run with TLS
+```bash
+cargo run -- --host 0.0.0.0 --port 443 \
+           --password mysecretpassword \
+           --cert ./cert.pem --key ./key.pem
+```
+### Run using a Configuration File
+#### Generate an example TOML config:
+```bash
+cargo run -- --generate-config server.toml
+```
+#### Edit server.toml to set your password and TLS paths:
+```toml
+[server]
+host = "0.0.0.0"
+port = "443"
+password = "mysecretpassword"
+
+[tls]
+cert = "/path/to/cert.pem"
+key  = "/path/to/key.pem"
+```
+#### Start the server using the config file:
+```bash
+cargo run -- --config-file server.toml
+```
+#### You can still override values via CLI:
+```bash
+cargo run -- --config-file server.toml --port 8443
+```
+
+## Installation
+### Build and run locally:
+```bash
+git clone <repo_url>
+cd trojan-rs
+cargo build --release
+./target/release/trojan-rs --help
+```
