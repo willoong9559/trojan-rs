@@ -2,6 +2,7 @@ mod utils;
 mod udp;
 mod socks5;
 mod config;
+mod tls;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -15,12 +16,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use futures_util::{StreamExt, stream::{SplitSink, SplitStream}};
 use anyhow::{Result, anyhow};
-
-// TLS support
 use tokio_rustls::{TlsAcceptor};
-use rustls_pemfile::certs;
-use std::fs::File;
-use std::io::BufReader;
 
 const BUF_SIZE: usize = 8192;
 
@@ -617,29 +613,6 @@ where S: AsyncRead + AsyncWrite + Unpin + 'static,
 }
 
 
-fn load_tls_config(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
-    let cert_file = File::open(cert_path)?;
-    let mut reader = BufReader::new(cert_file);
-    let certs = certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()?;
-
-    if certs.is_empty() {
-        return Err(anyhow!("No certificates found in {}", cert_path));
-    }
-
-    let key_file = File::open(key_path)?;
-    let mut reader = BufReader::new(key_file);
-    let key = rustls_pemfile::private_key(&mut reader)?;
-
-    let key = key.ok_or_else(|| anyhow!("No private key found in {}", key_path))?;
-
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-
-    Ok(TlsAcceptor::from(Arc::new(config)))
-}
-
 impl Server {
     pub async fn run(self) -> Result<()> {
         let server = Arc::new(self);
@@ -726,19 +699,7 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
     let password = utils::password_to_hex(&config.password);
     let enable_ws = config.enable_ws;
 
-    let tls_acceptor = match (&config.cert, &config.key) {
-        (Some(cert_path), Some(key_path)) => {
-            println!("Loading TLS certificates from: {}, {}", cert_path, key_path);
-            Some(load_tls_config(cert_path, key_path)?)
-        }
-        (None, None) => {
-            println!("No TLS certificates provided, running in plain mode");
-            None
-        }
-        _ => {
-            return Err(anyhow!("Both --cert and --key must be provided together, or neither"));
-        }
-    };
+    let tls_acceptor = Some(tls::get_tls_acceptor(config.cert, config.key)?);
 
     Ok(Server {
         listener,
