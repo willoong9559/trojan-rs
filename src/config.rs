@@ -1,8 +1,7 @@
-use serde::{Deserialize, Serialize};
 use clap::Parser;
-use std::fs;
-use std::path::Path;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
+use std::{fs, path::Path};
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Trojan Server")]
@@ -18,6 +17,10 @@ pub struct ServerConfig {
     /// Password
     #[arg(long, default_value = "")]
     pub password: String,
+
+    /// Enable WebSocket mode
+    #[arg(long, default_value_t = false)]
+    pub enable_ws: bool,
 
     /// TLS certificate file path (optional)
     #[arg(long)]
@@ -52,11 +55,11 @@ impl ServerConfig {
         if let Some(ref config_path) = config.config_file {
             println!("Loading configuration from: {}", config_path);
             let toml_config = TomlConfig::from_file(config_path)?;
-            
-            // 配置文件优先，但命令行参数可以覆盖
+
+            // 转换成 ServerConfig
             let file_config = toml_config.to_server_config();
-            
-            // 只有当命令行参数是默认值时才使用文件配置
+
+            // 只有命令行参数为默认值时才使用文件配置
             if config.host == "127.0.0.1" {
                 config.host = file_config.host;
             }
@@ -65,6 +68,9 @@ impl ServerConfig {
             }
             if config.password.is_empty() {
                 config.password = file_config.password;
+            }
+            if !config.enable_ws {
+                config.enable_ws = file_config.enable_ws;
             }
             if config.cert.is_none() {
                 config.cert = file_config.cert;
@@ -83,7 +89,8 @@ impl ServerConfig {
     }
 }
 
-// TOML 配置结构
+// =============== TOML 配置部分 ==================
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TomlConfig {
     pub server: ServerSettings,
@@ -96,6 +103,9 @@ pub struct ServerSettings {
     pub host: String,
     pub port: String,
     pub password: String,
+
+    #[serde(default)]
+    pub enable_ws: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +129,7 @@ impl TomlConfig {
                 host: "127.0.0.1".to_string(),
                 port: "35537".to_string(),
                 password: "your_password_here".to_string(),
+                enable_ws: true,
             },
             tls: Some(TlsSettings {
                 cert: "/path/to/cert.pem".to_string(),
@@ -137,6 +148,7 @@ impl TomlConfig {
             host: self.server.host,
             port: self.server.port,
             password: self.server.password,
+            enable_ws: self.server.enable_ws,
             cert: self.tls.as_ref().map(|t| t.cert.clone()),
             key: self.tls.as_ref().map(|t| t.key.clone()),
             config_file: None,
