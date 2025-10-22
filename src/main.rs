@@ -699,7 +699,7 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
     let password = utils::password_to_hex(&config.password);
     let enable_ws = config.enable_ws;
 
-    let tls_acceptor = Some(tls::get_tls_acceptor(config.cert, config.key)?);
+    let tls_acceptor = tls::get_tls_acceptor(config.cert, config.key);
 
     Ok(Server {
         listener,

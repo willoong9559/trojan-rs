@@ -5,17 +5,17 @@ use std::fs::File;
 use std::io::BufReader;
 use anyhow::{anyhow, Result};
 
-pub fn get_tls_acceptor(cert_path: Option<String>, key_path: Option<String>) -> Result<TlsAcceptor> {
+pub fn get_tls_acceptor(cert_path: Option<String>, key_path: Option<String>) -> Option<TlsAcceptor> {
     match (cert_path, key_path) {
         (Some(cert_path_str), Some(key_path_str)) => {
             println!("Loading TLS certificates from: {}, {}", cert_path_str, key_path_str);
-            load_tls_config(&cert_path_str, &key_path_str)
+            Some(load_tls_config(&cert_path_str, &key_path_str).unwrap())
         }
         (None, None) => {
-            Err(anyhow!("No TLS certificates provided, running in plain mode"))
+            None
         }
         _ => {
-            Err(anyhow!("No TLS certificates provided, running in plain mode"))
+            None
         }
     }
 }
