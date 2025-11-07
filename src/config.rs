@@ -92,6 +92,10 @@ impl ServerConfig {
             return Err(anyhow!("Password must be provided either via --password or config file"));
         }
 
+        if config.enable_ws && config.enable_grpc {
+            return Err(anyhow!("WebSocket mode and gRPC mode cannot be enabled simultaneously"));
+        }
+
         Ok(config)
     }
 }
