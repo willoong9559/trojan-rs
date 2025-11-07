@@ -22,6 +22,10 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = false)]
     pub enable_ws: bool,
 
+    /// Enable gRPC mode
+    #[arg(long, default_value_t = false)]
+    pub enable_grpc: bool,
+
     /// TLS certificate file path (optional)
     #[arg(long)]
     pub cert: Option<String>,
@@ -72,6 +76,9 @@ impl ServerConfig {
             if !config.enable_ws {
                 config.enable_ws = file_config.enable_ws;
             }
+            if !config.enable_grpc {
+                config.enable_grpc = file_config.enable_grpc;
+            }
             if config.cert.is_none() {
                 config.cert = file_config.cert;
             }
@@ -106,6 +113,9 @@ pub struct ServerSettings {
 
     #[serde(default)]
     pub enable_ws: bool,
+
+    #[serde(default)]
+    pub enable_grpc: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +140,7 @@ impl TomlConfig {
                 port: "35537".to_string(),
                 password: "your_password_here".to_string(),
                 enable_ws: true,
+                enable_grpc: false,
             },
             tls: Some(TlsSettings {
                 cert: "/path/to/cert.pem".to_string(),
@@ -149,6 +160,7 @@ impl TomlConfig {
             port: self.server.port,
             password: self.server.password,
             enable_ws: self.server.enable_ws,
+            enable_grpc: self.server.enable_grpc,
             cert: self.tls.as_ref().map(|t| t.cert.clone()),
             key: self.tls.as_ref().map(|t| t.key.clone()),
             config_file: None,
