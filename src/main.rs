@@ -140,7 +140,7 @@ async fn handle_connection<S>(
     peer_addr: String,
 ) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     // 只需要一套 Trojan 协议处理逻辑
     process_trojan(server, stream, peer_addr).await
@@ -371,7 +371,10 @@ pub async fn accept_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    if server.enable_ws {
+    if server.enable_grpc {
+        let grpc_transport = grpc::GrpcH2cTransport::new(stream, "GunService").await?;
+        handle_connection(server, grpc_transport, peer_addr).await
+    } else if server.enable_ws {
         let ws_stream = tokio_tungstenite::accept_async(stream).await?;
         let ws_transport = ws::WebSocketTransport::new(ws_stream);
         handle_connection(server, ws_transport, peer_addr).await
@@ -461,10 +464,6 @@ impl Server {
 
 pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
     let addr: String = format!("{}:{}", config.host, config.port);
-    // if config.enable_grpc {
-    //     // 直接进入 gRPC 模式
-    //     return grpc::run_grpc_server(Arc::clone(&server), ).await;
-    // }
     let listener = TcpListener::bind(addr).await?;
     let password = utils::password_to_hex(&config.password);
     let enable_ws = config.enable_ws;
@@ -485,6 +484,6 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = config::ServerConfig::load()?;
-     let server = build_server(config).await?;
+    let server = build_server(config).await?;
     server.run().await
 }
