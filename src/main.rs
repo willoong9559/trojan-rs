@@ -4,6 +4,7 @@ mod socks5;
 mod config;
 mod tls;
 mod ws;
+mod grpc;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -21,6 +22,7 @@ pub struct Server {
     pub listener: TcpListener,
     pub password: [u8; 56],
     pub enable_ws: bool,
+    pub enable_grpc: bool,
     pub udp_associations: Arc<Mutex<HashMap<String, udp::UdpAssociation>>>,
     pub tls_acceptor: Option<TlsAcceptor>,
 }
@@ -162,8 +164,7 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + 'static>(
     // 验证密码
     if request.password != server.password {
         println!("[{}] Incorrect password from {}", 
-            if server.enable_ws { "WS" } else { "TCP" }, 
-            peer_addr);
+            if server.enable_ws {"WS"} else if server.enable_grpc{"gRPC"} else {"TCP"}, peer_addr);
         return Err(anyhow!("Incorrect password"));
     }
 
@@ -460,10 +461,14 @@ impl Server {
 
 pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
     let addr: String = format!("{}:{}", config.host, config.port);
+    // if config.enable_grpc {
+    //     // 直接进入 gRPC 模式
+    //     return grpc::run_grpc_server(Arc::clone(&server), ).await;
+    // }
     let listener = TcpListener::bind(addr).await?;
-
     let password = utils::password_to_hex(&config.password);
     let enable_ws = config.enable_ws;
+    let enable_grpc = config.enable_grpc;
 
     let tls_acceptor = tls::get_tls_acceptor(config.cert, config.key);
 
@@ -471,6 +476,7 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         listener,
         password,
         enable_ws,
+        enable_grpc,
         udp_associations: Arc::new(Mutex::new(HashMap::new())),
         tls_acceptor,
     })
@@ -479,6 +485,6 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = config::ServerConfig::load()?;
-    let server = build_server(config).await?;
+     let server = build_server(config).await?;
     server.run().await
 }
