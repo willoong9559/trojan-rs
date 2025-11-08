@@ -2,7 +2,7 @@
 
 A simple **Trojan** server implemented in **Rust**.  
 This server allows you to run a Trojan server with configurable host, port, and password via **command-line arguments**.  
-It also supports **optional TLS encryption** and **WebSocket mode**, allowing you to serve secure or plain WebSocket connections over `wss://` or `ws://`.
+It also supports **optional TLS encryption**, **WebSocket mode** and **gRPC mode (Compatible with v2ray format)** allowing you to serve secure onnections.
 
 ---
 
@@ -19,14 +19,16 @@ Available options:
 | `--cert <FILE>`              | TLS certificate file path (PEM)           | String  | *(optional)*   |
 | `--key <FILE>`               | TLS private key file path (PEM)           | String  | *(optional)*   |
 | `--enable-ws`                | Enable WebSocket mode (TCP/TLS)           | Flag    | disabled       |
+| `--enable-grpc`              | Enable gRPC mode (TCP/TLS)           | Flag    | disabled       |
 | `-c, --config-file <FILE>`   | Load configuration from TOML file         | String  | *(optional)*   |
 | `--generate-config <FILE>`   | Generate example TOML configuration file | String  | *(optional)*   |
 | `-h, --help`                 | Print help                                 | -       | -              |
 | `-V, --version`              | Print version                              | -       | -              |
 
 > **Note:**  
-> - If both `--cert` and `--key` are provided, the server automatically enables **TLS mode** (`wss://`).  
-> - If `--enable-ws` is set, the server will accept WebSocket connections; otherwise it runs in plain TCP mode.  
+> - If both `--cert` and `--key` are provided, the server automatically enables **TLS mode**.  
+> - If `--enable-ws` is set, the server will accept WebSocket connections;
+> - If `--enable-grpc` is set, the server will accept WebSocket connections;
 > - CLI arguments override configuration file values.
 
 ---
@@ -58,6 +60,7 @@ host = "0.0.0.0"
 port = "443"
 password = "mysecretpassword"
 enable_ws = true
+enable_grcp = false
 
 [tls]
 cert = "/path/to/cert.pem"
