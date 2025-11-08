@@ -4,8 +4,10 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+
 env:
   CARGO_TERM_COLOR: always
+
 jobs:
   build:
     name: Build (${{ matrix.os }} - ${{ matrix.target }})
@@ -14,21 +16,30 @@ jobs:
     strategy:
       matrix:
         include:
-          # Linux x86_64
+          # Linux x86_64 (glibc)
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+
+          # Linux x86_64 (musl, 静态构建)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+
           # macOS x86_64
           - os: macos-latest
             target: x86_64-apple-darwin
+
           # macOS ARM64 (Apple Silicon)
           - os: macos-latest
             target: aarch64-apple-darwin
+
           # Linux ARM64 (cross compile)
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
+
           # Windows x86_64
           - os: windows-latest
             target: x86_64-pc-windows-gnu
+
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -38,52 +49,61 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       
-      # ARM64 交叉编译的依赖安装
+      # ARM64 交叉编译工具
       - name: Install cross-compilation tools for ARM64
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
       
-      # 创建 cargo 配置目录
-      - name: Create cargo config directory
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: mkdir -p .cargo
+      # 为 musl 安装构建依赖
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
       
-      # 配置 ARM64 链接器
+      # 为 ARM64 设置链接器
       - name: Configure ARM64 linker
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
+          mkdir -p .cargo
           cat > .cargo/config.toml << EOF
           [target.aarch64-unknown-linux-gnu]
           linker = "aarch64-linux-gnu-gcc"
           EOF
       
+      # 缓存 cargo registry
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
       
+      # 缓存 cargo git 索引
       - name: Cache cargo index
         uses: actions/cache@v4
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
       
+      # 缓存 target 目录
       - name: Cache target directory
         uses: actions/cache@v4
         with:
           path: target
           key: ${{ runner.os }}-${{ matrix.target }}-target-${{ hashFiles('**/Cargo.lock') }}
       
+      # 构建 release 版本
       - name: Build in release mode
         run: cargo build --release --target ${{ matrix.target }} --verbose
       
+      # 仅在本机环境运行测试
       - name: Run tests (only on native builds)
         if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'x86_64-apple-darwin'
         run: cargo test --verbose --target ${{ matrix.target }}
       
+      # 上传构建产物
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
