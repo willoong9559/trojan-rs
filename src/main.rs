@@ -372,8 +372,17 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     if server.enable_grpc {
-        let grpc_transport = grpc::GrpcH2cTransport::new(stream, "GunService").await?;
-        handle_connection(server, grpc_transport, peer_addr).await
+        // 创建 gRPC 连接管理器，支持多路复用（兼容 v2ray）
+        let grpc_conn = grpc::GrpcH2cConnection::new(stream).await?;
+        // 运行连接管理器，为每个流启动独立的处理任务
+        grpc_conn.run(move |transport| {
+            let server = Arc::clone(&server);
+            let peer_addr = peer_addr.clone();
+            async move {
+                handle_connection(server, transport, peer_addr).await
+            }
+        }).await?;
+        Ok(())
     } else if server.enable_ws {
         let ws_stream = tokio_tungstenite::accept_async(stream).await?;
         let ws_transport = ws::WebSocketTransport::new(ws_stream);
@@ -388,8 +397,9 @@ impl Server {
         let server = Arc::new(self);
         println!("Server started, listening on {}", server.listener.local_addr()?);
         println!("Mode: {} mode", {
-                if server.enable_ws {"websocket"}
-                else {"tcp"}
+                if server.enable_ws {"WebSocket"}
+                else if server.enable_grpc {"gRPC"}
+                else {"TCP"}
             }
         );
         
