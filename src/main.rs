@@ -18,11 +18,17 @@ use tokio_rustls::{TlsAcceptor};
 
 const BUF_SIZE: usize = 8192;
 
+#[derive(Debug, Clone, Copy)]
+pub enum TransportMode {
+    Tcp,
+    WebSocket,
+    Grpc,
+}
+
 pub struct Server {
     pub listener: TcpListener,
     pub password: [u8; 56],
-    pub enable_ws: bool,
-    pub enable_grpc: bool,
+    pub transport_mode: TransportMode,
     pub udp_associations: Arc<Mutex<HashMap<String, udp::UdpAssociation>>>,
     pub tls_acceptor: Option<TlsAcceptor>,
 }
@@ -164,7 +170,11 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + 'static>(
     // 验证密码
     if request.password != server.password {
         println!("[{}] Incorrect password from {}", 
-            if server.enable_ws {"WS"} else if server.enable_grpc{"gRPC"} else {"TCP"}, peer_addr);
+            match server.transport_mode {
+                TransportMode::Tcp => "TCP",
+                TransportMode::WebSocket => "WS",
+                TransportMode::Grpc => "gRPC",
+            }, peer_addr);
         return Err(anyhow!("Incorrect password"));
     }
 
@@ -371,24 +381,28 @@ pub async fn accept_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    if server.enable_grpc {
-        // 创建 gRPC 连接管理器，支持多路复用（兼容 v2ray）
-        let grpc_conn = grpc::GrpcH2cConnection::new(stream).await?;
-        // 运行连接管理器，为每个流启动独立的处理任务
-        grpc_conn.run(move |transport| {
-            let server = Arc::clone(&server);
-            let peer_addr = peer_addr.clone();
-            async move {
-                handle_connection(server, transport, peer_addr).await
-            }
-        }).await?;
-        Ok(())
-    } else if server.enable_ws {
-        let ws_stream = tokio_tungstenite::accept_async(stream).await?;
-        let ws_transport = ws::WebSocketTransport::new(ws_stream);
-        handle_connection(server, ws_transport, peer_addr).await
-    } else {
-        handle_connection(server, stream, peer_addr).await
+    match server.transport_mode {
+        TransportMode::Grpc => {
+            // 创建 gRPC 连接管理器，支持多路复用（兼容 v2ray）
+            let grpc_conn = grpc::GrpcH2cConnection::new(stream).await?;
+            // 运行连接管理器，为每个流启动独立的处理任务
+            grpc_conn.run(move |transport| {
+                let server = Arc::clone(&server);
+                let peer_addr = peer_addr.clone();
+                async move {
+                    handle_connection(server, transport, peer_addr).await
+                }
+            }).await?;
+            Ok(())
+        }
+        TransportMode::WebSocket => {
+            let ws_stream = tokio_tungstenite::accept_async(stream).await?;
+            let ws_transport = ws::WebSocketTransport::new(ws_stream);
+            handle_connection(server, ws_transport, peer_addr).await
+        }
+        TransportMode::Tcp => {
+            handle_connection(server, stream, peer_addr).await
+        }
     }
 }
 
@@ -397,9 +411,11 @@ impl Server {
         let server = Arc::new(self);
         println!("Server started, listening on {}", server.listener.local_addr()?);
         println!("Mode: {} mode", {
-                if server.enable_ws {"WebSocket"}
-                else if server.enable_grpc {"gRPC"}
-                else {"TCP"}
+                match server.transport_mode {
+                    TransportMode::Tcp => "TCP",
+                    TransportMode::WebSocket => "WebSocket",
+                    TransportMode::Grpc => "gRPC",
+                }
             }
         );
         
@@ -478,14 +494,20 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
     let password = utils::password_to_hex(&config.password);
     let enable_ws = config.enable_ws;
     let enable_grpc = config.enable_grpc;
+    let transport_mode = if enable_grpc {
+        TransportMode::Grpc
+    } else if enable_ws {
+        TransportMode::WebSocket
+    } else {
+        TransportMode::Tcp
+    };
 
-    let tls_acceptor = tls::get_tls_acceptor(config.cert, config.key);
+    let tls_acceptor = tls::get_tls_acceptor(config.cert, config.key, transport_mode);
 
     Ok(Server {
         listener,
         password,
-        enable_ws,
-        enable_grpc,
+        transport_mode,
         udp_associations: Arc::new(Mutex::new(HashMap::new())),
         tls_acceptor,
     })
