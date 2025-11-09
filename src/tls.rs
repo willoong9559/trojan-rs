@@ -36,7 +36,7 @@ fn load_tls_config(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
 
     let key = key.ok_or_else(|| anyhow!("No private key found in {}", key_path))?;
 
-    let config = rustls::ServerConfig::builder()
+    let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
 
