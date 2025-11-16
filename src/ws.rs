@@ -7,11 +7,9 @@ const CHANNEL_BUFFER_SIZE: usize = 32;
 
 pub struct WebSocketTransport {
     read_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    write_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    write_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     read_buffer: Vec<u8>,
     read_pos: usize,
-    // 用于背压处理：当通道满时暂存的数据
-    pending_write: Option<Vec<u8>>,
 }
 
 impl WebSocketTransport {
@@ -20,21 +18,25 @@ impl WebSocketTransport {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (mut ws_write, mut ws_read) = ws_stream.split();
+        // 接收客户端请求的通道：有界 + 背压（限制内存占用）
         let (read_tx, read_rx) = tokio::sync::mpsc::channel(CHANNEL_BUFFER_SIZE);
-        let (write_tx, mut write_rx) = tokio::sync::mpsc::channel(CHANNEL_BUFFER_SIZE);
+        // 发送给客户端的通道：无界（不做限制，保证响应及时）
+        let (write_tx, mut write_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        // WebSocket 读取任务
+        // WebSocket 读取任务（接收客户端请求，有背压处理）
         let read_tx_clone = read_tx.clone();
         tokio::spawn(async move {
             while let Some(msg) = ws_read.next().await {
                 match msg {
                     Ok(Message::Binary(data)) => {
-                        // 如果通道满了，丢弃新消息以避免内存溢出
+                        // 如果通道满了，等待而不是丢弃（客户端请求不应该丢失）
                         match read_tx_clone.try_send(data) {
                             Ok(_) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                // 通道满了，丢弃这个 WebSocket 消息以避免内存溢出
-                                eprintln!("[WebSocket] Read channel full, dropping message");
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
+                                // 通道满了，使用阻塞发送等待空间（背压）
+                                if read_tx_clone.send(data).await.is_err() {
+                                    break;
+                                }
                             }
                             Err(_) => break,
                         }
@@ -60,7 +62,6 @@ impl WebSocketTransport {
             write_tx,
             read_buffer: Vec::new(),
             read_pos: 0,
-            pending_write: None,
         }
     }
 }
@@ -110,43 +111,13 @@ impl AsyncRead for WebSocketTransport {
 
 impl AsyncWrite for WebSocketTransport {
     fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        // 如果有待发送的数据，先尝试发送
-        if let Some(pending) = self.pending_write.take() {
-            match self.write_tx.try_send(pending) {
-                Ok(_) => {
-                    // 待发送数据已发送，继续处理新数据
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
-                    // 通道还是满的，把数据放回去
-                    self.pending_write = Some(data);
-                    // 不立即唤醒，等待接收端消费数据后自然唤醒
-                    // 这样可以避免忙等待，减少 CPU 占用
-                    return std::task::Poll::Pending;
-                }
-                Err(_) => {
-                    return std::task::Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "WebSocket write channel closed",
-                    )));
-                }
-            }
-        }
-
-        // 尝试发送新数据
-        match self.write_tx.try_send(buf.to_vec()) {
+        // 发送给客户端的通道是无界的，直接发送，不做限制
+        match self.write_tx.send(buf.to_vec()) {
             Ok(_) => std::task::Poll::Ready(Ok(buf.len())),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
-                // 通道满了，保存数据等待下次重试
-                // 对于 TCP 传输，我们应该等待而不是丢弃数据
-                self.pending_write = Some(data);
-                // 不立即唤醒，等待接收端消费数据后自然唤醒
-                // 当接收端从通道接收数据后，会触发下一次 poll，此时可以重试
-                std::task::Poll::Pending
-            }
             Err(_) => std::task::Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "WebSocket write channel closed",
