@@ -9,8 +9,10 @@ use h2::{server};
 use http::{Response, StatusCode};
 use anyhow::Result;
 
-// 通道缓冲区大小，限制内存占用
-const CHANNEL_BUFFER_SIZE: usize = 32;
+// 接收客户端请求的通道缓冲区大小
+const READ_CHANNEL_BUFFER_SIZE: usize = 32;
+// 发送给客户端的通道缓冲区大小（响应数据较多，需要更大的缓冲）
+const WRITE_CHANNEL_BUFFER_SIZE: usize = 128;
 // gRPC pending 缓冲区最大大小（约 1MB）
 const MAX_PENDING_SIZE: usize = 1024 * 1024;
 
@@ -98,10 +100,10 @@ where
 
                     let mut recv_stream = request.into_body();
 
-                    // 接收客户端请求的通道：有界 + 背压（限制内存占用）
-                    let (read_tx, read_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_BUFFER_SIZE);
-                    // 发送给客户端的通道：无界（不做限制，保证响应及时）
-                    let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                    // 接收客户端请求的通道：有界 + 背压
+                    let (read_tx, read_rx) = mpsc::channel::<Vec<u8>>(READ_CHANNEL_BUFFER_SIZE);
+                    // 发送给客户端的通道：有界 + 背压
+                    let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(WRITE_CHANNEL_BUFFER_SIZE);
 
                     // 读取任务：从 gRPC 流中解析数据
                     tokio::spawn(async move {
@@ -193,6 +195,7 @@ where
                         read_buf: Vec::new(),
                         read_pos: 0,
                         closed: false,
+                        pending_write: None,
                     };
 
                     let transport_clone = transport;
@@ -231,10 +234,12 @@ where
 /// 每个实例对应一个 HTTP/2 流，支持多路复用
 pub struct GrpcH2cTransport {
     read_rx: mpsc::Receiver<Vec<u8>>,
-    write_tx: mpsc::UnboundedSender<Vec<u8>>,
+    write_tx: mpsc::Sender<Vec<u8>>,
     read_buf: Vec<u8>,
     read_pos: usize,
     closed: bool,
+    // 用于背压处理：当发送通道满时暂存的数据
+    pending_write: Option<Vec<u8>>,
 }
 
 impl GrpcH2cTransport {
@@ -409,8 +414,8 @@ impl AsyncRead for GrpcH2cTransport {
 
 impl AsyncWrite for GrpcH2cTransport {
     fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         if self.closed {
@@ -420,9 +425,39 @@ impl AsyncWrite for GrpcH2cTransport {
             )));
         }
 
-        // 发送给客户端的通道是无界的，直接发送，不做限制
-        match self.write_tx.send(buf.to_vec()) {
+        // 如果有待发送的数据，先尝试发送
+        if let Some(pending) = self.pending_write.take() {
+            match self.write_tx.try_send(pending) {
+                Ok(_) => {
+                    // 待发送数据已发送，继续处理新数据
+                }
+                Err(mpsc::error::TrySendError::Full(data)) => {
+                    // 通道还是满的，把数据放回去
+                    self.pending_write = Some(data);
+                    // 注册 waker，等待通道有空间
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Err(_) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "write channel closed"
+                    )));
+                }
+            }
+        }
+
+        // 尝试发送新数据
+        match self.write_tx.try_send(buf.to_vec()) {
             Ok(_) => Poll::Ready(Ok(buf.len())),
+            Err(mpsc::error::TrySendError::Full(data)) => {
+                // 通道满了，保存数据等待下次重试（背压处理）
+                // 防止内存无限增长
+                self.pending_write = Some(data);
+                // 注册 waker，等待通道有空间
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
             Err(_) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "write channel closed"

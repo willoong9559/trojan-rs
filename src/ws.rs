@@ -2,14 +2,18 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::{WebSocketStream as TungsteniteStream, tungstenite::Message};
 use futures_util::{StreamExt, SinkExt};
 
-// 通道缓冲区大小，限制内存占用
-const CHANNEL_BUFFER_SIZE: usize = 32;
+// 接收客户端请求的通道缓冲区大小
+const READ_CHANNEL_BUFFER_SIZE: usize = 32;
+// 发送给客户端的通道缓冲区大小（响应数据较多，需要更大的缓冲）
+const WRITE_CHANNEL_BUFFER_SIZE: usize = 128;
 
 pub struct WebSocketTransport {
     read_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    write_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    write_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     read_buffer: Vec<u8>,
     read_pos: usize,
+    // 用于背压处理：当发送通道满时暂存的数据
+    pending_write: Option<Vec<u8>>,
 }
 
 impl WebSocketTransport {
@@ -19,9 +23,9 @@ impl WebSocketTransport {
     {
         let (mut ws_write, mut ws_read) = ws_stream.split();
         // 接收客户端请求的通道：有界 + 背压（限制内存占用）
-        let (read_tx, read_rx) = tokio::sync::mpsc::channel(CHANNEL_BUFFER_SIZE);
-        // 发送给客户端的通道：无界（不做限制，保证响应及时）
-        let (write_tx, mut write_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (read_tx, read_rx) = tokio::sync::mpsc::channel(READ_CHANNEL_BUFFER_SIZE);
+        // 发送给客户端的通道：有界 + 背压（防止 speedtest 等场景下内存无限增长）
+        let (write_tx, mut write_rx) = tokio::sync::mpsc::channel(WRITE_CHANNEL_BUFFER_SIZE);
 
         // WebSocket 读取任务（接收客户端请求，有背压处理）
         let read_tx_clone = read_tx.clone();
@@ -62,6 +66,7 @@ impl WebSocketTransport {
             write_tx,
             read_buffer: Vec::new(),
             read_pos: 0,
+            pending_write: None,
         }
     }
 }
@@ -111,13 +116,43 @@ impl AsyncRead for WebSocketTransport {
 
 impl AsyncWrite for WebSocketTransport {
     fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        // 发送给客户端的通道是无界的，直接发送，不做限制
-        match self.write_tx.send(buf.to_vec()) {
+        // 如果有待发送的数据，先尝试发送
+        if let Some(pending) = self.pending_write.take() {
+            match self.write_tx.try_send(pending) {
+                Ok(_) => {
+                    // 待发送数据已发送，继续处理新数据
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
+                    // 通道还是满的，把数据放回去
+                    self.pending_write = Some(data);
+                    // 注册 waker，等待通道有空间
+                    cx.waker().wake_by_ref();
+                    return std::task::Poll::Pending;
+                }
+                Err(_) => {
+                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "WebSocket write channel closed",
+                    )));
+                }
+            }
+        }
+
+        // 尝试发送新数据
+        match self.write_tx.try_send(buf.to_vec()) {
             Ok(_) => std::task::Poll::Ready(Ok(buf.len())),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
+                // 通道满了，保存数据等待下次重试（背压处理）
+                // 防止内存无限增长
+                self.pending_write = Some(data);
+                // 注册 waker，等待通道有空间
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
             Err(_) => std::task::Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "WebSocket write channel closed",
