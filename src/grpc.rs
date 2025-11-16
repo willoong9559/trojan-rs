@@ -9,6 +9,11 @@ use h2::{server};
 use http::{Response, StatusCode};
 use anyhow::Result;
 
+// 通道缓冲区大小，限制内存占用
+const CHANNEL_BUFFER_SIZE: usize = 32;
+// gRPC pending 缓冲区最大大小（约 1MB）
+const MAX_PENDING_SIZE: usize = 1024 * 1024;
+
 /// gRPC HTTP/2 连接管理器
 /// 
 /// 管理整个 HTTP/2 连接，接受多个流，每个流对应一个独立的 Trojan 隧道
@@ -93,9 +98,9 @@ where
 
                     let mut recv_stream = request.into_body();
 
-                    // 创建数据通道
-                    let (read_tx, read_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-                    let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                    // 创建有界数据通道，限制内存占用
+                    let (read_tx, read_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_BUFFER_SIZE);
+                    let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_BUFFER_SIZE);
 
                     // 读取任务：从 gRPC 流中解析数据
                     tokio::spawn(async move {
@@ -109,16 +114,36 @@ where
                                             eprintln!("[gRPC] Failed to release capacity: {}", e);
                                         });
                                     
+                                    // 限制 pending 缓冲区大小，防止内存溢出
+                                    if pending.len() + chunk.len() > MAX_PENDING_SIZE {
+                                        eprintln!("[gRPC] Pending buffer too large ({}), dropping connection", pending.len());
+                                        break;
+                                    }
+                                    
                                     pending.extend_from_slice(&chunk);
                                     
                                     // 循环解析完整的 gRPC 消息
                                     loop {
                                         match parse_grpc_message(&pending) {
                                             Ok(Some((consumed, payload))) => {
-                                                if read_tx.send(payload).is_err() {
-                                                    return;
+                                                // 如果通道满了，等待空间或丢弃
+                                                match read_tx.try_send(payload) {
+                                                    Ok(_) => {
+                                                        pending.advance(consumed);
+                                                    }
+                                                    Err(mpsc::error::TrySendError::Full(payload)) => {
+                                                        // 通道满了，等待一下再试
+                                                        tokio::task::yield_now().await;
+                                                        // 如果还是满的，丢弃这个包以避免内存溢出
+                                                        if read_tx.try_send(payload).is_err() {
+                                                            eprintln!("[gRPC] Channel full, dropping message");
+                                                            pending.advance(consumed);
+                                                        }
+                                                    }
+                                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                        return;
+                                                    }
                                                 }
-                                                pending.advance(consumed);
                                             }
                                             Ok(None) => {
                                                 // 数据不足，等待更多数据
@@ -169,6 +194,7 @@ where
                         read_buf: Vec::new(),
                         read_pos: 0,
                         closed: false,
+                        pending_write: None,
                     };
 
                     let transport_clone = transport;
@@ -206,11 +232,13 @@ where
 /// 实现 AsyncRead + AsyncWrite，可以像普通 TCP 流一样使用
 /// 每个实例对应一个 HTTP/2 流，支持多路复用
 pub struct GrpcH2cTransport {
-    read_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    write_tx: mpsc::UnboundedSender<Vec<u8>>,
+    read_rx: mpsc::Receiver<Vec<u8>>,
+    write_tx: mpsc::Sender<Vec<u8>>,
     read_buf: Vec<u8>,
     read_pos: usize,
     closed: bool,
+    // 用于背压处理：当通道满时暂存的数据
+    pending_write: Option<Vec<u8>>,
 }
 
 impl GrpcH2cTransport {
@@ -385,7 +413,7 @@ impl AsyncRead for GrpcH2cTransport {
 
 impl AsyncWrite for GrpcH2cTransport {
     fn poll_write(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
@@ -396,8 +424,39 @@ impl AsyncWrite for GrpcH2cTransport {
             )));
         }
 
-        match self.write_tx.send(buf.to_vec()) {
+        // 如果有待发送的数据，先尝试发送
+        if let Some(pending) = self.pending_write.take() {
+            match self.write_tx.try_send(pending) {
+                Ok(_) => {
+                    // 待发送数据已发送，继续处理新数据
+                }
+                Err(mpsc::error::TrySendError::Full(data)) => {
+                    // 通道还是满的，把数据放回去
+                    self.pending_write = Some(data);
+                    // 不立即唤醒，等待接收端消费数据后自然唤醒
+                    // 这样可以避免忙等待，减少 CPU 占用
+                    return Poll::Pending;
+                }
+                Err(_) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "write channel closed"
+                    )));
+                }
+            }
+        }
+
+        // 尝试发送新数据
+        match self.write_tx.try_send(buf.to_vec()) {
             Ok(_) => Poll::Ready(Ok(buf.len())),
+            Err(mpsc::error::TrySendError::Full(data)) => {
+                // 通道满了，保存数据等待下次重试
+                // 对于 TCP 传输，我们应该等待而不是丢弃数据
+                self.pending_write = Some(data);
+                // 不立即唤醒，等待接收端消费数据后自然唤醒
+                // 当接收端从通道接收数据后，会触发下一次 poll，此时可以重试
+                Poll::Pending
+            }
             Err(_) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "write channel closed"

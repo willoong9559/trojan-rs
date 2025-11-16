@@ -6,7 +6,7 @@ mod tls;
 mod ws;
 mod grpc;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,6 +17,8 @@ use anyhow::{Result, anyhow};
 use tokio_rustls::{TlsAcceptor};
 
 const BUF_SIZE: usize = 8192;
+// UDP 通道缓冲区大小（更大，因为 UDP 用于实时应用如视频/游戏，需要更大的缓冲）
+const UDP_CHANNEL_BUFFER_SIZE: usize = 128;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TransportMode {
@@ -216,7 +218,10 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         loop {
             let n = client_read.read(&mut buf).await?;
             if n == 0 { break; }
+            // 使用 write_all 确保数据完整写入，避免部分写入导致的数据堆积
             remote_write.write_all(&buf[..n]).await?;
+            // 刷新缓冲区，减少内存占用
+            remote_write.flush().await?;
         }
         Ok::<(), anyhow::Error>(())
     };
@@ -226,7 +231,10 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         loop {
             let n = remote_read.read(&mut buf).await?;
             if n == 0 { break; }
+            // 使用 write_all 确保数据完整写入
             client_write.write_all(&buf[..n]).await?;
+            // 刷新缓冲区，减少内存占用
+            client_write.flush().await?;
         }
         Ok::<(), anyhow::Error>(())
     };
@@ -274,12 +282,16 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
         association
     };
 
-    let (udp_tx, mut udp_rx) = mpsc::unbounded_channel::<(SocketAddr, Vec<u8>)>();
+    let (udp_tx, mut udp_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(UDP_CHANNEL_BUFFER_SIZE);
     let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
     let socket_clone = Arc::clone(&udp_association.socket);
     let udp_tx_clone = udp_tx.clone();
     let activity_tracker = Arc::clone(&udp_association.last_activity);
+    
+    // 使用循环缓冲区实现丢弃旧数据保留新数据的逻辑
+    let udp_buffer = Arc::new(Mutex::new(VecDeque::<(SocketAddr, Vec<u8>)>::with_capacity(UDP_CHANNEL_BUFFER_SIZE)));
+    let udp_buffer_clone = Arc::clone(&udp_buffer);
     
     let udp_recv_handle = tokio::spawn(async move {
         let mut buf = vec![0u8; BUF_SIZE];
@@ -295,11 +307,63 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
                                 .as_secs();
                             *activity_tracker.lock().await = now;
                             
-                            if udp_tx_clone.send((from_addr, buf[..len].to_vec())).is_err() {
-                                break;
+                            let data = buf[..len].to_vec();
+                            
+                            // 先尝试直接发送到通道
+                            match udp_tx_clone.try_send((from_addr.clone(), data.clone())) {
+                                Ok(_) => {
+                                    // 发送成功，清空缓冲区（如果有的话）
+                                    let mut buffer = udp_buffer_clone.lock().await;
+                                    buffer.clear();
+                                }
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    // 通道满了，将数据放入循环缓冲区
+                                    let mut buffer = udp_buffer_clone.lock().await;
+                                    
+                                    // 如果缓冲区也满了，丢弃最旧的数据（FIFO）
+                                    if buffer.len() >= UDP_CHANNEL_BUFFER_SIZE {
+                                        let _ = buffer.pop_front();
+                                    }
+                                    
+                                    // 将新数据添加到缓冲区末尾
+                                    buffer.push_back((from_addr, data));
+                                }
+                                Err(_) => {
+                                    // 通道关闭，退出循环
+                                    break;
+                                }
                             }
                         }
                         Err(_) => break,
+                    }
+                }
+            }
+        }
+    });
+    
+    // 启动一个任务，持续从缓冲区向通道发送数据（丢弃旧数据保留新数据）
+    let udp_buffer_sender = Arc::clone(&udp_buffer);
+    let udp_tx_sender = udp_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+            
+            let mut buffer = udp_buffer_sender.lock().await;
+            // 持续尝试发送缓冲区中的数据
+            while let Some((from_addr, data)) = buffer.pop_front() {
+                match udp_tx_sender.try_send((from_addr, data)) {
+                    Ok(_) => {
+                        // 发送成功，继续处理下一个
+                    }
+                    Err(mpsc::error::TrySendError::Full((from_addr, data))) => {
+                        // 通道还是满的，把数据放回缓冲区前面（这样下次会优先处理）
+                        buffer.push_front((from_addr, data));
+                        break;
+                    }
+                    Err(_) => {
+                        // 通道关闭，清空缓冲区并退出
+                        buffer.clear();
+                        return;
                     }
                 }
             }
