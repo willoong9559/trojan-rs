@@ -5,6 +5,7 @@ mod config;
 mod tls;
 mod ws;
 mod grpc;
+mod buffer_pool;
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -214,28 +215,50 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     let (mut remote_read, mut remote_write) = tokio::io::split(remote_stream);
 
     let client_to_remote = async {
-        let mut buf = vec![0u8; BUF_SIZE];
+        // 使用内存池复用缓冲区
+        let pool = buffer_pool::get_global_pool();
+        let mut buf = pool.acquire();
+        let mut flush_counter = 0u32;
         loop {
             let n = client_read.read(&mut buf).await?;
             if n == 0 { break; }
             // 使用 write_all 确保数据完整写入，避免部分写入导致的数据堆积
             remote_write.write_all(&buf[..n]).await?;
-            // 刷新缓冲区，减少内存占用
-            remote_write.flush().await?;
+            // 每 10 次写入 flush 一次，提高性能
+            flush_counter += 1;
+            if flush_counter >= 10 {
+                remote_write.flush().await?;
+                flush_counter = 0;
+            }
         }
+        // 最后确保所有数据都刷新
+        remote_write.flush().await?;
+        // 归还缓冲区到池中
+        pool.release(buf);
         Ok::<(), anyhow::Error>(())
     };
 
     let remote_to_client = async {
-        let mut buf = vec![0u8; BUF_SIZE];
+        // 使用内存池复用缓冲区
+        let pool = buffer_pool::get_global_pool();
+        let mut buf = pool.acquire();
+        let mut flush_counter = 0u32;
         loop {
             let n = remote_read.read(&mut buf).await?;
             if n == 0 { break; }
             // 使用 write_all 确保数据完整写入
             client_write.write_all(&buf[..n]).await?;
-            // 刷新缓冲区，减少内存占用
-            client_write.flush().await?;
+            // 每 10 次写入 flush 一次
+            flush_counter += 1;
+            if flush_counter >= 10 {
+                client_write.flush().await?;
+                flush_counter = 0;
+            }
         }
+        // 最后确保所有数据都刷新
+        client_write.flush().await?;
+        // 归还缓冲区到池中
+        pool.release(buf);
         Ok::<(), anyhow::Error>(())
     };
 
