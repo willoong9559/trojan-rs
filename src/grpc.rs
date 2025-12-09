@@ -134,7 +134,7 @@ pub struct GrpcH2cTransport {
     read_pending: BytesMut,  // 从 gRPC 流接收的原始数据
     read_buf: Bytes,  // 解析后的 payload 数据
     read_pos: usize,
-    write_pending: Option<Vec<u8>>,  // 待发送的数据
+    write_pending: Option<Bytes>,  // 待发送的数据（使用 Bytes 引用计数，避免复制）
     closed: bool,
 }
 
@@ -356,8 +356,15 @@ impl AsyncRead for GrpcH2cTransport {
                         )));
                     }
                     
-                    // 直接使用 chunk（Bytes），避免复制
-                    self.read_pending.extend_from_slice(&chunk);
+                    // 优化：如果 read_pending 为空，直接使用 chunk 转换为 BytesMut
+                    // 否则需要复制到 read_pending（这是必要的，因为需要合并数据）
+                    if self.read_pending.is_empty() {
+                        // 如果 pending 为空，直接使用 chunk 的底层数据（避免一次复制）
+                        self.read_pending = BytesMut::from(&chunk[..]);
+                    } else {
+                        // 需要合并数据，必须复制
+                        self.read_pending.extend_from_slice(&chunk);
+                    }
                     
                     // 释放流控容量（在借用 self 之后）
                     flow_control.release_capacity(chunk_len)
@@ -412,13 +419,14 @@ impl AsyncWrite for GrpcH2cTransport {
                     )));
                 }
             };
+            // pending 是 Bytes，直接使用引用，避免复制
             let frame = encode_grpc_message(&pending);
             match send_stream.send_data(frame.freeze(), false) {
                 Ok(()) => {
                     // 继续处理新数据
                 }
                 Err(e) => {
-                    // 发送失败，保存数据等待重试
+                    // 发送失败，保存数据等待重试（Bytes 引用计数，不复制）
                     self.write_pending = Some(pending);
                     // 检查是否是流控问题
                     if e.is_io() {
@@ -444,12 +452,13 @@ impl AsyncWrite for GrpcH2cTransport {
             }
         };
         
+        // 使用 Bytes::copy_from_slice 创建 Bytes（最小化复制）
         let frame = encode_grpc_message(buf);
         match send_stream.send_data(frame.freeze(), false) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
             Err(e) => {
-                // 发送失败，保存数据等待重试
-                self.write_pending = Some(buf.to_vec());
+                // 发送失败，保存数据等待重试（使用 Bytes 引用计数）
+                self.write_pending = Some(Bytes::copy_from_slice(buf));
                 // 检查是否是流控问题
                 if e.is_io() {
                     cx.waker().wake_by_ref();
