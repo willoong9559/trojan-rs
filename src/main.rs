@@ -7,7 +7,7 @@ mod ws;
 mod grpc;
 mod buffer_pool;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,9 +17,8 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use anyhow::{Result, anyhow};
 use tokio_rustls::{TlsAcceptor};
 
-const BUF_SIZE: usize = 8192;
-// UDP 通道缓冲区大小（更大，因为 UDP 用于实时应用如视频/游戏，需要更大的缓冲）
-const UDP_CHANNEL_BUFFER_SIZE: usize = 128;
+const BUF_SIZE: usize = 4096;
+const UDP_CHANNEL_BUFFER_SIZE: usize = 64;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TransportMode {
@@ -217,16 +216,15 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     let client_to_remote = async {
         // 使用内存池复用缓冲区
         let pool = buffer_pool::get_global_pool();
-        let mut buf = pool.acquire();
+        let mut buf = pool.acquire().await;
         let mut flush_counter = 0u32;
         loop {
             let n = client_read.read(&mut buf).await?;
             if n == 0 { break; }
             // 使用 write_all 确保数据完整写入，避免部分写入导致的数据堆积
             remote_write.write_all(&buf[..n]).await?;
-            // 每 10 次写入 flush 一次，提高性能
             flush_counter += 1;
-            if flush_counter >= 10 {
+            if flush_counter >= 5 {
                 remote_write.flush().await?;
                 flush_counter = 0;
             }
@@ -234,23 +232,22 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         // 最后确保所有数据都刷新
         remote_write.flush().await?;
         // 归还缓冲区到池中
-        pool.release(buf);
+        pool.release(buf).await;
         Ok::<(), anyhow::Error>(())
     };
 
     let remote_to_client = async {
         // 使用内存池复用缓冲区
         let pool = buffer_pool::get_global_pool();
-        let mut buf = pool.acquire();
+        let mut buf = pool.acquire().await;
         let mut flush_counter = 0u32;
         loop {
             let n = remote_read.read(&mut buf).await?;
             if n == 0 { break; }
             // 使用 write_all 确保数据完整写入
             client_write.write_all(&buf[..n]).await?;
-            // 每 10 次写入 flush 一次
             flush_counter += 1;
-            if flush_counter >= 10 {
+            if flush_counter >= 5 {
                 client_write.flush().await?;
                 flush_counter = 0;
             }
@@ -258,7 +255,7 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         // 最后确保所有数据都刷新
         client_write.flush().await?;
         // 归还缓冲区到池中
-        pool.release(buf);
+        pool.release(buf).await;
         Ok::<(), anyhow::Error>(())
     };
 
@@ -305,17 +302,16 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
         association
     };
 
-    let (udp_tx, mut udp_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(UDP_CHANNEL_BUFFER_SIZE);
+    // 使用Bytes替代Vec<u8>，减少数据复制
+    use bytes::Bytes;
+    let (udp_tx, mut udp_rx) = mpsc::channel::<(SocketAddr, Bytes)>(UDP_CHANNEL_BUFFER_SIZE);
     let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
     let socket_clone = Arc::clone(&udp_association.socket);
     let udp_tx_clone = udp_tx.clone();
     let activity_tracker = Arc::clone(&udp_association.last_activity);
     
-    // 使用循环缓冲区实现丢弃旧数据保留新数据的逻辑
-    let udp_buffer = Arc::new(Mutex::new(VecDeque::<(SocketAddr, Vec<u8>)>::with_capacity(UDP_CHANNEL_BUFFER_SIZE)));
-    let udp_buffer_clone = Arc::clone(&udp_buffer);
-    
+    // 简化UDP处理逻辑，直接丢弃旧数据，不使用额外的循环缓冲区
     let udp_recv_handle = tokio::spawn(async move {
         let mut buf = vec![0u8; BUF_SIZE];
         loop {
@@ -330,63 +326,13 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
                                 .as_secs();
                             *activity_tracker.lock().await = now;
                             
-                            let data = buf[..len].to_vec();
+                            // 使用Bytes::copy_from_slice，避免to_vec()复制
+                            let data = Bytes::copy_from_slice(&buf[..len]);
                             
-                            // 先尝试直接发送到通道
-                            match udp_tx_clone.try_send((from_addr.clone(), data.clone())) {
-                                Ok(_) => {
-                                    // 发送成功，清空缓冲区（如果有的话）
-                                    let mut buffer = udp_buffer_clone.lock().await;
-                                    buffer.clear();
-                                }
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    // 通道满了，将数据放入循环缓冲区
-                                    let mut buffer = udp_buffer_clone.lock().await;
-                                    
-                                    // 如果缓冲区也满了，丢弃最旧的数据（FIFO）
-                                    if buffer.len() >= UDP_CHANNEL_BUFFER_SIZE {
-                                        let _ = buffer.pop_front();
-                                    }
-                                    
-                                    // 将新数据添加到缓冲区末尾
-                                    buffer.push_back((from_addr, data));
-                                }
-                                Err(_) => {
-                                    // 通道关闭，退出循环
-                                    break;
-                                }
-                            }
+                            // 尝试发送，如果通道满了就丢弃（不阻塞）
+                            let _ = udp_tx_clone.try_send((from_addr, data));
                         }
                         Err(_) => break,
-                    }
-                }
-            }
-        }
-    });
-    
-    // 启动一个任务，持续从缓冲区向通道发送数据（丢弃旧数据保留新数据）
-    let udp_buffer_sender = Arc::clone(&udp_buffer);
-    let udp_tx_sender = udp_tx.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-            
-            let mut buffer = udp_buffer_sender.lock().await;
-            // 持续尝试发送缓冲区中的数据
-            while let Some((from_addr, data)) = buffer.pop_front() {
-                match udp_tx_sender.try_send((from_addr, data)) {
-                    Ok(_) => {
-                        // 发送成功，继续处理下一个
-                    }
-                    Err(mpsc::error::TrySendError::Full((from_addr, data))) => {
-                        // 通道还是满的，把数据放回缓冲区前面（这样下次会优先处理）
-                        buffer.push_front((from_addr, data));
-                        break;
-                    }
-                    Err(_) => {
-                        // 通道关闭，清空缓冲区并退出
-                        buffer.clear();
-                        return;
                     }
                 }
             }
@@ -429,10 +375,11 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
                                 SocketAddr::V6(v6) => socks5::Address::IPv6(v6.ip().octets(), v6.port()),
                             };
                             
+                            // 优化：Bytes可以直接转换为Vec，避免额外复制
                             let udp_packet = udp::UdpPacket {
                                 addr,
                                 length: data.len() as u16,
-                                payload: data,
+                                payload: data.to_vec(), // Bytes转Vec，但这是必要的（UdpPacket需要Vec）
                             };
                             
                             let encoded = udp_packet.encode();

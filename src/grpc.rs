@@ -8,8 +8,7 @@ use h2::{server, RecvStream, SendStream};
 use http::{Response, StatusCode};
 use anyhow::Result;
 
-// gRPC pending 缓冲区最大大小（约 1MB）
-const MAX_PENDING_SIZE: usize = 1024 * 1024;
+const MAX_PENDING_SIZE: usize = 256 * 1024;
 
 /// gRPC HTTP/2 连接管理器
 /// 
