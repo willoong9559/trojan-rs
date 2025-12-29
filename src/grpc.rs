@@ -7,6 +7,8 @@ use std::sync::Arc;
 use h2::{server, SendStream, RecvStream};
 use http::{Response, StatusCode};
 use anyhow::Result;
+use futures_util::Future;
+use crate::logger::log;
 
 const MAX_PENDING_SIZE: usize = 1024 * 1024;
 const MAX_WRITE_BUFFER_SIZE: usize = 512 * 1024;
@@ -85,21 +87,21 @@ where
                     let handler_clone = Arc::clone(&handler);
                     tokio::spawn(async move {
                         if let Err(e) = handler_clone(transport).await {
-                            eprintln!("[gRPC] Stream handler error: {}", e);
+                            log::error!(transport = "gRPC", error = %e, "Stream handler error");
                         }
                     });
                 }
                 Some(Err(e)) => {
                     let error_str = e.to_string();
                     if error_str.contains("connection reset") || error_str.contains("broken pipe") {
-                        eprintln!("[gRPC] Connection error (likely closed): {}", e);
+                        log::debug!(transport = "gRPC", error = %e, "Connection error (likely closed)");
                         break;
                     } else {
-                        eprintln!("[gRPC] Error accepting stream: {}", e);
+                        log::error!(transport = "gRPC", error = %e, "Error accepting stream");
                     }
                 }
                 None => {
-                    eprintln!("[gRPC] Connection closed normally");
+                    log::debug!(transport = "gRPC", "Connection closed normally");
                     break;
                 }
             }
@@ -248,7 +250,7 @@ impl AsyncRead for GrpcH2cTransport {
             match parse_grpc_message(&self.read_pending) {
                 Ok(Some((consumed, payload))) => {
                     if let Err(e) = self.recv_stream.flow_control().release_capacity(consumed) {
-                        eprintln!("[gRPC] Failed to release capacity: {}", e);
+                        log::warn!(transport = "gRPC", error = %e, "Failed to release capacity");
                     }
                     
                     self.read_pending.advance(consumed);
@@ -264,7 +266,7 @@ impl AsyncRead for GrpcH2cTransport {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    eprintln!("[gRPC] Parse error: {}", e);
+                    log::protocol("gRPC parse", Some(&e.to_string()));
                     if !self.read_pending.is_empty() {
                         self.read_pending.advance(1);
                         continue;
@@ -285,7 +287,11 @@ impl AsyncRead for GrpcH2cTransport {
             match poll_result {
                 Poll::Ready(Some(Ok(chunk))) => {
                     if self.read_pending.len() + chunk.len() > MAX_PENDING_SIZE {
-                        eprintln!("[gRPC] Pending buffer too large ({}), dropping connection", self.read_pending.len());
+                        log::error!(
+                            transport = "gRPC",
+                            pending_size = self.read_pending.len(),
+                            "Pending buffer too large, dropping connection"
+                        );
                         self.closed = true;
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::OutOfMemory,
@@ -297,7 +303,7 @@ impl AsyncRead for GrpcH2cTransport {
                 }
                 Poll::Ready(Some(Err(e))) => {
                     if !e.to_string().contains("not a result of an error") {
-                        eprintln!("[gRPC] Recv error: {}", e);
+                        log::debug!(transport = "gRPC", error = %e, "Recv error");
                     }
                     self.closed = true;
                     return Poll::Ready(Ok(()));

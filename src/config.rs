@@ -41,6 +41,10 @@ pub struct ServerConfig {
     /// Generate example configuration file
     #[arg(long)]
     pub generate_config: Option<String>,
+
+    /// Log level (trace, debug, info, warn, error)
+    #[arg(long)]
+    pub log_level: Option<String>,
 }
 
 impl ServerConfig {
@@ -85,6 +89,9 @@ impl ServerConfig {
             if config.key.is_none() {
                 config.key = file_config.key;
             }
+            if config.log_level.is_none() {
+                config.log_level = file_config.log_level;
+            }
         }
 
         // 验证密码不为空
@@ -107,6 +114,8 @@ pub struct TomlConfig {
     pub server: ServerSettings,
     #[serde(default)]
     pub tls: Option<TlsSettings>,
+    #[serde(default)]
+    pub log: Option<LogSettings>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +135,17 @@ pub struct ServerSettings {
 pub struct TlsSettings {
     pub cert: String,
     pub key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogSettings {
+    /// Log level: trace, debug, info, warn, error
+    #[serde(default = "default_log_level")]
+    pub level: String,
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
 }
 
 impl TomlConfig {
@@ -150,6 +170,9 @@ impl TomlConfig {
                 cert: "/path/to/cert.pem".to_string(),
                 key: "/path/to/key.pem".to_string(),
             }),
+            log: Some(LogSettings {
+                level: "info".to_string(),
+            }),
         };
 
         let toml_str = toml::to_string_pretty(&example)?;
@@ -169,6 +192,7 @@ impl TomlConfig {
             key: self.tls.as_ref().map(|t| t.key.clone()),
             config_file: None,
             generate_config: None,
+            log_level: self.log.map(|l| l.level),
         }
     }
 }

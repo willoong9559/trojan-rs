@@ -7,11 +7,12 @@ use std::io::BufReader;
 use anyhow::{anyhow, Result};
 
 use crate::TransportMode;
+use crate::logger::log;
 
 pub fn get_tls_acceptor(cert_path: Option<String>, key_path: Option<String>, transport_mode: TransportMode) -> Option<TlsAcceptor> {
     match (cert_path, key_path) {
         (Some(cert_path_str), Some(key_path_str)) => {
-            println!("Loading TLS certificates from: {}, {}", cert_path_str, key_path_str);
+            log::info!(cert = %cert_path_str, key = %key_path_str, "Loading TLS certificates");
             Some(load_tls_config_with_transport_mode(&cert_path_str, &key_path_str, transport_mode).unwrap())
         }
         _ => {

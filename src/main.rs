@@ -5,8 +5,13 @@ mod config;
 mod tls;
 mod ws;
 mod grpc;
+mod error;
+mod logger;
+
+use logger::log;
 
 use std::collections::HashMap;
+use toml;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -171,14 +176,17 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + 'static>(
 
     // 验证密码
     if request.password != server.password {
-        println!("[{}] Incorrect password from {}", 
-            match server.transport_mode {
-                TransportMode::Tcp => "TCP",
-                TransportMode::WebSocket => "WS",
-                TransportMode::Grpc => "gRPC",
-            }, peer_addr);
+        let transport = match server.transport_mode {
+            TransportMode::Tcp => "TCP",
+            TransportMode::WebSocket => "WS",
+            TransportMode::Grpc => "gRPC",
+        };
+        log::authentication(&peer_addr, false);
+        log::warn!(peer = %peer_addr, transport = transport, "Incorrect password");
         return Err(anyhow!("Incorrect password"));
     }
+    
+    log::authentication(&peer_addr, true);
 
     match request.cmd {
         TrojanCmd::Connect => {
@@ -198,11 +206,11 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     initial_payload: Vec<u8>,
     peer_addr: String,
 ) -> Result<()> {
-    println!("[CONNECT] Connecting to target: {}", target_addr.to_key());
+    log::info!(peer = %peer_addr, target = %target_addr.to_key(), "Connecting to target");
     
     let remote_addr = target_addr.to_socket_addr().await?;
     let mut remote_stream = TcpStream::connect(remote_addr).await?;
-    println!("[CONNECT] Connected to remote server: {}", remote_addr);
+    log::info!(peer = %peer_addr, remote = %remote_addr, "Connected to remote server");
 
     // 发送初始载荷
     if !initial_payload.is_empty() {
@@ -242,17 +250,17 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     tokio::select! {
         result = client_to_remote => {
             if let Err(e) = result {
-                println!("[CONNECT] Client to remote error: {}", e);
+                log::error!(peer = %peer_addr, error = %e, "Client to remote error");
             }
         },
         result = remote_to_client => {
             if let Err(e) = result {
-                println!("[CONNECT] Remote to client error: {}", e);
+                log::error!(peer = %peer_addr, error = %e, "Remote to client error");
             }
         },
     }
 
-    println!("[CONNECT] Connection closed for {}", peer_addr);
+    log::info!(peer = %peer_addr, "Connection closed");
     Ok(())
 }
 
@@ -262,7 +270,7 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
     _bind_addr: socks5::Address,
     peer_addr: String,
 ) -> Result<()> {
-    println!("[UDP] Starting UDP associate for {}", peer_addr);
+    log::info!(peer = %peer_addr, "Starting UDP associate");
     
     let socket_key = format!("client_{}_{}", peer_addr, 
         SystemTime::now()
@@ -421,21 +429,15 @@ where
 impl Server {
     pub async fn run(self) -> Result<()> {
         let server = Arc::new(self);
-        println!("Server started, listening on {}", server.listener.local_addr()?);
-        println!("Mode: {} mode", {
-                match server.transport_mode {
-                    TransportMode::Tcp => "TCP",
-                    TransportMode::WebSocket => "WebSocket",
-                    TransportMode::Grpc => "gRPC",
-                }
-            }
-        );
+        let addr = server.listener.local_addr()?;
+        let mode = match server.transport_mode {
+            TransportMode::Tcp => "TCP",
+            TransportMode::WebSocket => "WebSocket",
+            TransportMode::Grpc => "gRPC",
+        };
+        let tls_enabled = server.tls_acceptor.is_some();
         
-        if server.tls_acceptor.is_some() {
-            println!("TLS: enabled");
-        } else {
-            println!("TLS: disabled (plain mode)");
-        }
+        log::info!(address = %addr, mode = mode, tls = tls_enabled, "Server started");
 
         // UDP 清理任务
         let server_cleanup = Arc::clone(&server);
@@ -461,7 +463,7 @@ impl Server {
         loop {
             match server.listener.accept().await {
                 Ok((stream, addr)) => {
-                    println!("New connection from: {}", addr);
+                    log::connection(&addr.to_string(), "new");
                     let server_clone = Arc::clone(&server);
                     
                     tokio::spawn(async move {
@@ -470,10 +472,11 @@ impl Server {
                             if let Some(ref tls_acceptor) = server_clone.tls_acceptor {
                                 match tls_acceptor.accept(stream).await {
                                     Ok(tls_stream) => {
-                                        println!("[{}] TLS handshake successful", peer_addr);
+                                        log::info!(peer = %peer_addr, "TLS handshake successful");
                                         accept_connection(server_clone, tls_stream, peer_addr.clone()).await
                                     }
                                     Err(e) => {
+                                        log::error!(peer = %peer_addr, error = %e, "TLS handshake failed");
                                         Err(anyhow!("TLS handshake failed: {}", e))
                                     }
                                 }
@@ -483,14 +486,14 @@ impl Server {
                         }.await;
 
                         if let Err(e) = result {
-                            println!("[{}] Connection error: {}", peer_addr, e);
+                            log::error!(peer = %peer_addr, error = %e, "Connection error");
                         } else {
-                            println!("[{}] Connection closed successfully", peer_addr);
+                            log::connection(&peer_addr, "closed");
                         }
                     });
                 }
                 Err(e) => {
-                    println!("Failed to accept connection: {}", e);
+                    log::error!(error = %e, "Failed to accept connection");
                     break;
                 }
             }
@@ -527,7 +530,36 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let log_level_from_cli = args.iter()
+        .position(|a| a == "--log-level")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| logger::LogLevel::from_str(s));
+    
+    let log_level = if log_level_from_cli.is_some() {
+        log_level_from_cli
+    } else {
+        // 尝试从配置文件读取
+        args.iter()
+            .position(|a| a == "--config-file" || a == "-c")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|config_path| {
+                // 直接读取 TOML 文件获取日志级别
+                std::fs::read_to_string(config_path).ok()
+                    .and_then(|content| {
+                        toml::from_str::<toml::Value>(&content).ok()
+                            .and_then(|v| v.get("log")?.get("level")?.as_str().map(|s| s.to_string()))
+                            .and_then(|s| logger::LogLevel::from_str(&s))
+                    })
+            })
+    };
+    
+    // 初始化日志系统（优先使用命令行参数，然后是配置文件，最后是环境变量或默认值）
+    logger::init_logger(log_level);
+    
+    // 现在加载完整配置
     let config = config::ServerConfig::load()?;
+    
     let server = build_server(config).await?;
     server.run().await
 }
