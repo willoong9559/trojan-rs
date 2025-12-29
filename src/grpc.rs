@@ -273,24 +273,6 @@ fn encode_varint(mut value: u64, buf: &mut BytesMut) {
 
 // AsyncRead + AsyncWrite 实现
 
-impl GrpcH2cTransport {
-    /// 释放流控容量，统一错误处理
-    fn release_flow_control_capacity(recv_stream: &mut RecvStream, capacity: usize, context: &str) {
-        if capacity > 0 {
-            let flow_control = recv_stream.flow_control();
-            if let Err(e) = flow_control.release_capacity(capacity) {
-                eprintln!("[gRPC] Failed to release capacity {}: {}", context, e);
-            }
-        }
-    }
-
-    /// 检查是否是流控错误
-    fn is_flow_control_error(error: &h2::Error) -> bool {
-        let error_str = error.to_string();
-        error_str.contains("user error") || error_str.contains("stream error")
-    }
-}
-
 impl AsyncRead for GrpcH2cTransport {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -321,7 +303,9 @@ impl AsyncRead for GrpcH2cTransport {
             match parse_grpc_message(&self.read_pending) {
                 Ok(Some((consumed, payload))) => {
                     // 释放流控容量
-                    Self::release_flow_control_capacity(&mut self.recv_stream, consumed, "on message parse");
+                    if let Err(e) = self.recv_stream.flow_control().release_capacity(consumed) {
+                        eprintln!("[gRPC] Failed to release capacity: {}", e);
+                    }
                     
                     self.read_pending.advance(consumed);
                     
@@ -341,19 +325,8 @@ impl AsyncRead for GrpcH2cTransport {
                 }
                 Err(e) => {
                     eprintln!("[gRPC] Parse error: {}", e);
-                    // 如果 pending 缓冲区太大，释放一些容量并清理
-                    if self.read_pending.len() > MAX_PENDING_SIZE / 2 {
-                        // 释放已读取的数据的流控容量（即使无法解析）
-                        let to_release = self.read_pending.len() / 2;
-                        Self::release_flow_control_capacity(&mut self.recv_stream, to_release, "on parse error (large buffer)");
-                        self.read_pending.advance(to_release);
-                        // 继续尝试解析剩余数据
-                        continue;
-                    }
                     // 跳过错误字节，尝试恢复
                     if !self.read_pending.is_empty() {
-                        // 释放跳过的字节的流控容量
-                        Self::release_flow_control_capacity(&mut self.recv_stream, 1, "on parse error (skip byte)");
                         self.read_pending.advance(1);
                         continue;
                     } else {
@@ -374,13 +347,9 @@ impl AsyncRead for GrpcH2cTransport {
             
             match poll_result {
                 Poll::Ready(Some(Ok(chunk))) => {
-                    let chunk_len = chunk.len();
                     // 限制 pending 缓冲区大小，防止内存溢出
-                    if self.read_pending.len() + chunk_len > MAX_PENDING_SIZE {
-                        eprintln!("[gRPC] Pending buffer too large ({}), releasing capacity and dropping connection", self.read_pending.len());
-                        // 释放已读取的数据的流控容量
-                        let total_len = self.read_pending.len() + chunk_len;
-                        Self::release_flow_control_capacity(&mut self.recv_stream, total_len, "on buffer overflow");
+                    if self.read_pending.len() + chunk.len() > MAX_PENDING_SIZE {
+                        eprintln!("[gRPC] Pending buffer too large ({}), dropping connection", self.read_pending.len());
                         self.closed = true;
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::OutOfMemory,
@@ -392,9 +361,6 @@ impl AsyncRead for GrpcH2cTransport {
                     // 继续循环，尝试解析
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    // 释放 pending 缓冲区中剩余数据的流控容量
-                    let pending_len = self.read_pending.len();
-                    Self::release_flow_control_capacity(&mut self.recv_stream, pending_len, "on recv error");
                     // 忽略正常的流结束信号
                     if !e.to_string().contains("not a result of an error") {
                         eprintln!("[gRPC] Recv error: {}", e);
@@ -403,9 +369,6 @@ impl AsyncRead for GrpcH2cTransport {
                     return Poll::Ready(Ok(()));
                 }
                 Poll::Ready(None) => {
-                    // 释放 pending 缓冲区中剩余数据的流控容量
-                    let pending_len = self.read_pending.len();
-                    Self::release_flow_control_capacity(&mut self.recv_stream, pending_len, "on stream end");
                     // 流结束
                     self.closed = true;
                     return Poll::Ready(Ok(()));
@@ -434,38 +397,27 @@ impl AsyncWrite for GrpcH2cTransport {
         // 将数据添加到写入缓冲区
         self.write_buf.extend_from_slice(buf);
         
-        // 限制写入缓冲区大小，防止内存溢出
-        if self.write_buf.len() > MAX_PENDING_SIZE {
-            eprintln!("[gRPC] Write buffer too large ({}), dropping connection", self.write_buf.len());
-            self.closed = true;
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "gRPC write buffer too large",
-            )));
-        }
-        
         // 尝试发送缓冲区中的数据
         if !self.write_buf.is_empty() {
             let frame = encode_grpc_message(&self.write_buf);
             let frame_bytes = frame.freeze();
+            self.write_buf.clear();
             
-            match self.send_stream.send_data(frame_bytes.clone(), false) {
+            match self.send_stream.send_data(frame_bytes, false) {
                 Ok(()) => {
-                    // 成功发送，清空缓冲区
-                    self.write_buf.clear();
                     Poll::Ready(Ok(buf.len()))
                 }
                 Err(e) => {
-                    // 检查是否是流控错误
-                    if Self::is_flow_control_error(&e) {
+                    let error_str = e.to_string();
+                    // 检查是否是流控错误（通常是 "user error" 或 "stream error"）
+                    if error_str.contains("user error") || error_str.contains("stream error") {
                         // 流控错误，需要等待
-                        // write_buf 已经包含数据，不需要重新添加
-                        // 等待流控恢复，唤醒任务以便重试
+                        // 将数据放回缓冲区
+                        self.write_buf.extend_from_slice(buf);
                         cx.waker().wake_by_ref();
                         Poll::Pending
                     } else {
                         // 其他错误（如连接关闭）
-                        self.closed = true;
                         Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::BrokenPipe,
                             format!("gRPC send error: {}", e),
@@ -483,24 +435,22 @@ impl AsyncWrite for GrpcH2cTransport {
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
         // 确保所有待发送的数据都已发送
-        while !self.write_buf.is_empty() {
+        if !self.write_buf.is_empty() {
             let frame = encode_grpc_message(&self.write_buf);
             let frame_bytes = frame.freeze();
+            self.write_buf.clear();
             
-            match self.send_stream.send_data(frame_bytes.clone(), false) {
-                Ok(()) => {
-                    // 成功发送，清空缓冲区
-                    self.write_buf.clear();
-                }
+            match self.send_stream.send_data(frame_bytes, false) {
+                Ok(()) => {}
                 Err(e) => {
+                    let error_str = e.to_string();
                     // 检查是否是流控错误
-                    if Self::is_flow_control_error(&e) {
+                    if error_str.contains("user error") || error_str.contains("stream error") {
                         // 流控错误，需要等待
                         cx.waker().wake_by_ref();
                         return Poll::Pending;
                     } else {
                         // 其他错误（如连接关闭）
-                        self.closed = true;
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::BrokenPipe,
                             format!("gRPC send error: {}", e),
