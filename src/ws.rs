@@ -1,82 +1,48 @@
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::{WebSocketStream as TungsteniteStream, tungstenite::Message};
-use futures_util::{StreamExt, SinkExt};
+use futures_util::{Stream, Sink};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::io;
 
-// 接收客户端请求的通道缓冲区大小
-const READ_CHANNEL_BUFFER_SIZE: usize = 32;
-// 发送给客户端的通道缓冲区大小（响应数据较多，需要更大的缓冲）
-const WRITE_CHANNEL_BUFFER_SIZE: usize = 128;
-
-pub struct WebSocketTransport {
-    read_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    write_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+pub struct WebSocketTransport<S> {
+    ws_stream: Pin<Box<TungsteniteStream<S>>>,
     read_buffer: Vec<u8>,
     read_pos: usize,
-    // 用于背压处理：当发送通道满时暂存的数据
-    pending_write: Option<Vec<u8>>,
+    write_buffer: Vec<u8>,
+    write_pending: bool,
+    closed: bool,
 }
 
-impl WebSocketTransport {
-    pub fn new<S>(ws_stream: TungsteniteStream<S>) -> Self 
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    {
-        let (mut ws_write, mut ws_read) = ws_stream.split();
-        // 接收客户端请求的通道：有界 + 背压（限制内存占用）
-        let (read_tx, read_rx) = tokio::sync::mpsc::channel(READ_CHANNEL_BUFFER_SIZE);
-        // 发送给客户端的通道：有界 + 背压（防止 speedtest 等场景下内存无限增长）
-        let (write_tx, mut write_rx) = tokio::sync::mpsc::channel(WRITE_CHANNEL_BUFFER_SIZE);
-
-        // WebSocket 读取任务（接收客户端请求，有背压处理）
-        let read_tx_clone = read_tx.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = ws_read.next().await {
-                match msg {
-                    Ok(Message::Binary(data)) => {
-                        // 如果通道满了，等待而不是丢弃（客户端请求不应该丢失）
-                        match read_tx_clone.try_send(data) {
-                            Ok(_) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
-                                // 通道满了，使用阻塞发送等待空间（背压）
-                                if read_tx_clone.send(data).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    Ok(Message::Close(_)) | Err(_) => break,
-                    _ => continue,
-                }
-            }
-        });
-
-        // WebSocket 写入任务
-        tokio::spawn(async move {
-            while let Some(data) = write_rx.recv().await {
-                if ws_write.send(Message::Binary(data)).await.is_err() {
-                    break;
-                }
-            }
-            let _ = ws_write.close().await;
-        });
-
+impl<S> WebSocketTransport<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    pub fn new(ws_stream: TungsteniteStream<S>) -> Self {
         Self {
-            read_rx,
-            write_tx,
+            ws_stream: Box::pin(ws_stream),
             read_buffer: Vec::new(),
             read_pos: 0,
-            pending_write: None,
+            write_buffer: Vec::new(),
+            write_pending: false,
+            closed: false,
         }
     }
 }
 
-impl AsyncRead for WebSocketTransport {
+impl<S> AsyncRead for WebSocketTransport<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.closed {
+            return Poll::Ready(Ok(()));
+        }
+
         // 如果缓冲区还有数据，先消费缓冲区
         if self.read_pos < self.read_buffer.len() {
             let remaining = &self.read_buffer[self.read_pos..];
@@ -89,12 +55,12 @@ impl AsyncRead for WebSocketTransport {
                 self.read_pos = 0;
             }
 
-            return std::task::Poll::Ready(Ok(()));
+            return Poll::Ready(Ok(()));
         }
 
-        // 尝试接收新数据
-        match self.read_rx.poll_recv(cx) {
-            std::task::Poll::Ready(Some(data)) => {
+        // 直接从 WebSocket 流读取
+        match Stream::poll_next(self.ws_stream.as_mut(), cx) {
+            Poll::Ready(Some(Ok(Message::Binary(data)))) => {
                 let to_copy = data.len().min(buf.remaining());
                 buf.put_slice(&data[..to_copy]);
 
@@ -103,74 +69,150 @@ impl AsyncRead for WebSocketTransport {
                     self.read_pos = to_copy;
                 }
 
-                std::task::Poll::Ready(Ok(()))
+                Poll::Ready(Ok(()))
             }
-            std::task::Poll::Ready(None) => {
-                // 通道关闭，返回 EOF
-                std::task::Poll::Ready(Ok(()))
+            Poll::Ready(Some(Ok(Message::Close(_))) | Some(Err(_))) => {
+                self.closed = true;
+                Poll::Ready(Ok(()))
             }
-            std::task::Poll::Pending => std::task::Poll::Pending,
+            Poll::Ready(Some(Ok(_))) => {
+                // 非二进制消息，跳过
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Poll::Ready(None) => {
+                self.closed = true;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
-impl AsyncWrite for WebSocketTransport {
+impl<S> AsyncWrite for WebSocketTransport<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
+    ) -> Poll<io::Result<usize>> {
+        if self.closed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "WebSocket closed",
+            )));
+        }
+
         // 如果有待发送的数据，先尝试发送
-        if let Some(pending) = self.pending_write.take() {
-            match self.write_tx.try_send(pending) {
-                Ok(_) => {
-                    // 待发送数据已发送，继续处理新数据
+        if self.write_pending {
+            match Sink::poll_ready(self.ws_stream.as_mut(), cx) {
+                Poll::Ready(Ok(())) => {
+                    // 发送缓冲区中的数据
+                    let data = std::mem::take(&mut self.write_buffer);
+                    match Sink::start_send(self.ws_stream.as_mut(), Message::Binary(data)) {
+                        Ok(()) => {
+                            self.write_pending = false;
+                        }
+                        Err(e) => {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                format!("WebSocket send error: {}", e),
+                            )));
+                        }
+                    }
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
-                    // 通道还是满的，把数据放回去
-                    self.pending_write = Some(data);
-                    // 注册 waker，等待通道有空间
-                    cx.waker().wake_by_ref();
-                    return std::task::Poll::Pending;
-                }
-                Err(_) => {
-                    return std::task::Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "WebSocket write channel closed",
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("WebSocket error: {}", e),
                     )));
+                }
+                Poll::Pending => {
+                    return Poll::Pending;
                 }
             }
         }
 
-        // 尝试发送新数据
-        match self.write_tx.try_send(buf.to_vec()) {
-            Ok(_) => std::task::Poll::Ready(Ok(buf.len())),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
-                // 通道满了，保存数据等待下次重试（背压处理）
-                // 防止内存无限增长
-                self.pending_write = Some(data);
-                // 注册 waker，等待通道有空间
-                cx.waker().wake_by_ref();
-                std::task::Poll::Pending
+        // 将新数据添加到缓冲区
+        self.write_buffer.extend_from_slice(buf);
+        
+        // 尝试立即发送
+        match Sink::poll_ready(self.ws_stream.as_mut(), cx) {
+            Poll::Ready(Ok(())) => {
+                let data = std::mem::take(&mut self.write_buffer);
+                match Sink::start_send(self.ws_stream.as_mut(), Message::Binary(data)) {
+                    Ok(()) => {
+                        Poll::Ready(Ok(buf.len()))
+                    }
+                    Err(e) => {
+                        Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("WebSocket send error: {}", e),
+                        )))
+                    }
+                }
             }
-            Err(_) => std::task::Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "WebSocket write channel closed",
-            ))),
+            Poll::Ready(Err(e)) => {
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("WebSocket error: {}", e),
+                )))
+            }
+            Poll::Pending => {
+                self.write_pending = true;
+                Poll::Ready(Ok(buf.len()))
+            }
         }
     }
 
     fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        // 确保所有待发送的数据都已发送
+        if self.write_pending {
+            match Sink::poll_ready(self.ws_stream.as_mut(), cx) {
+                Poll::Ready(Ok(())) => {
+                    if !self.write_buffer.is_empty() {
+                        let data = std::mem::take(&mut self.write_buffer);
+                        match Sink::start_send(self.ws_stream.as_mut(), Message::Binary(data)) {
+                            Ok(()) => {
+                                self.write_pending = false;
+                            }
+                            Err(e) => {
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::Other,
+                                    format!("WebSocket send error: {}", e),
+                                )));
+                            }
+                        }
+                    }
+                }
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("WebSocket error: {}", e),
+                    )));
+                }
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
+            }
+        }
+
+        Sink::poll_flush(self.ws_stream.as_mut(), cx)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("WebSocket flush error: {}", e)))
     }
 
     fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.closed = true;
+        // 刷新所有待发送的数据
+        // WebSocket 连接的关闭由底层流处理，这里只需要确保数据已刷新
+        self.as_mut().poll_flush(cx)
     }
 }

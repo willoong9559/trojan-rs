@@ -15,6 +15,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use anyhow::{Result, anyhow};
 use tokio_rustls::{TlsAcceptor};
+use bytes::Bytes;
 
 const BUF_SIZE: usize = 4096;
 const UDP_CHANNEL_BUFFER_SIZE: usize = 64;
@@ -189,7 +190,7 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + 'static>(
     }
 }
 
-// ============ 统一的 CONNECT 处理 ============
+// 统一的 CONNECT 处理
 
 async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     client_stream: S,
@@ -281,8 +282,6 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
         association
     };
 
-    // 使用Bytes替代Vec<u8>，减少数据复制
-    use bytes::Bytes;
     let (udp_tx, mut udp_rx) = mpsc::channel::<(SocketAddr, Bytes)>(UDP_CHANNEL_BUFFER_SIZE);
     let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 

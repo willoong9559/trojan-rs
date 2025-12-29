@@ -1,18 +1,13 @@
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::mpsc;
 use bytes::{BytesMut, Buf, BufMut, Bytes};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::io;
 use std::sync::Arc;
-use h2::{server};
+use h2::{server, SendStream, RecvStream};
 use http::{Response, StatusCode};
 use anyhow::Result;
 
-// 接收客户端请求的通道缓冲区大小
-const READ_CHANNEL_BUFFER_SIZE: usize = 32;
-// 发送给客户端的通道缓冲区大小（响应数据较多，需要更大的缓冲）
-const WRITE_CHANNEL_BUFFER_SIZE: usize = 128;
 // gRPC pending 缓冲区最大大小（约 1MB）
 const MAX_PENDING_SIZE: usize = 1024 * 1024;
 
@@ -93,109 +88,22 @@ where
                         .body(())
                         .unwrap();
 
-                    let mut send_stream = match respond.send_response(response, false) {
+                    let send_stream = match respond.send_response(response, false) {
                         Ok(stream) => stream,
                         Err(_) => continue,
                     };
 
-                    let mut recv_stream = request.into_body();
-
-                    // 接收客户端请求的通道：有界 + 背压
-                    let (read_tx, read_rx) = mpsc::channel::<Vec<u8>>(READ_CHANNEL_BUFFER_SIZE);
-                    // 发送给客户端的通道：有界 + 背压
-                    let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(WRITE_CHANNEL_BUFFER_SIZE);
-
-                    // 读取任务：从 gRPC 流中解析数据
-                    tokio::spawn(async move {
-                        let mut pending = BytesMut::new();
-                        loop {
-                            match recv_stream.data().await {
-                                Some(Ok(chunk)) => {
-                                    // 释放流控容量
-                                    recv_stream.flow_control().release_capacity(chunk.len())
-                                        .unwrap_or_else(|e| {
-                                            eprintln!("[gRPC] Failed to release capacity: {}", e);
-                                        });
-                                    
-                                    // 限制 pending 缓冲区大小，防止内存溢出
-                                    if pending.len() + chunk.len() > MAX_PENDING_SIZE {
-                                        eprintln!("[gRPC] Pending buffer too large ({}), dropping connection", pending.len());
-                                        break;
-                                    }
-                                    
-                                    pending.extend_from_slice(&chunk);
-                                    
-                                    // 循环解析完整的 gRPC 消息
-                                    loop {
-                                        match parse_grpc_message(&pending) {
-                                            Ok(Some((consumed, payload))) => {
-                                                // 如果通道满了，等待而不是丢弃（客户端请求不应该丢失）
-                                                match read_tx.try_send(payload) {
-                                                    Ok(_) => {
-                                                        pending.advance(consumed);
-                                                    }
-                                                    Err(mpsc::error::TrySendError::Full(payload)) => {
-                                                        // 通道满了，使用阻塞发送等待空间（背压）
-                                                        if read_tx.send(payload).await.is_err() {
-                                                            return;
-                                                        }
-                                                        pending.advance(consumed);
-                                                    }
-                                                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                            Ok(None) => {
-                                                // 数据不足，等待更多数据
-                                                break;
-                                            }
-                                            Err(e) => {
-                                                eprintln!("[gRPC] Parse error: {}", e);
-                                                // 跳过错误字节，尝试恢复
-                                                if !pending.is_empty() {
-                                                    pending.advance(1);
-                                                } else {
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Some(Err(e)) => {
-                                    // 忽略正常的流结束信号
-                                    if !e.to_string().contains("not a result of an error") {
-                                        eprintln!("[gRPC] Recv error: {}", e);
-                                    }
-                                    break;
-                                }
-                                None => break,
-                            }
-                        }
-                    });
-
-                    // 写入任务：将数据编码为 gRPC 格式并发送
-                    tokio::spawn(async move {
-                        while let Some(payload) = write_rx.recv().await {
-                            let frame = encode_grpc_message(&payload);
-                            if send_stream.send_data(frame.freeze(), false).is_err() {
-                                break;
-                            }
-                        }
-                        // 发送 gRPC 状态 trailers
-                        let mut trailers = http::HeaderMap::new();
-                        trailers.insert("grpc-status", "0".parse().unwrap());
-                        let _ = send_stream.send_trailers(trailers);
-                    });
+                    let recv_stream = request.into_body();
 
                     // 为每个流创建传输层并启动处理任务
                     let transport = GrpcH2cTransport {
-                        read_rx,
-                        write_tx,
+                        recv_stream,
+                        send_stream,
+                        read_pending: BytesMut::new(),
                         read_buf: Vec::new(),
                         read_pos: 0,
+                        write_buf: BytesMut::new(),
                         closed: false,
-                        pending_write: None,
                     };
 
                     let transport_clone = transport;
@@ -232,22 +140,18 @@ where
 /// 
 /// 实现 AsyncRead + AsyncWrite，可以像普通 TCP 流一样使用
 /// 每个实例对应一个 HTTP/2 流，支持多路复用
+/// 使用零成本抽象，直接操作 HTTP/2 流，无需通道复制
 pub struct GrpcH2cTransport {
-    read_rx: mpsc::Receiver<Vec<u8>>,
-    write_tx: mpsc::Sender<Vec<u8>>,
-    read_buf: Vec<u8>,
-    read_pos: usize,
+    recv_stream: RecvStream,
+    send_stream: SendStream<Bytes>,
+    read_pending: BytesMut,  // 从 HTTP/2 流接收的原始数据
+    read_buf: Vec<u8>,        // 已解析的 gRPC payload 缓冲区
+    read_pos: usize,          // read_buf 的读取位置
+    write_buf: BytesMut,      // 待写入的 gRPC 帧缓冲区
     closed: bool,
-    // 用于背压处理：当发送通道满时暂存的数据
-    pending_write: Option<Vec<u8>>,
 }
 
-impl GrpcH2cTransport {
-    // GrpcH2cTransport 现在通过 GrpcH2cConnection::accept_next_stream() 创建
-    // 保留这个空实现块以便将来扩展
-}
-
-// ==================== 帧编解码（v2ray gRPC 格式）====================
+// 帧编解码
 
 /// 解析 gRPC 消息帧（兼容 v2ray 格式）
 /// 
@@ -308,7 +212,7 @@ fn parse_grpc_message(buf: &BytesMut) -> io::Result<Option<(usize, Vec<u8>)>> {
     Ok(Some((consumed, payload)))
 }
 
-/// 编码 gRPC 消息帧（兼容 v2ray 格式）
+/// 编码 gRPC 消息帧
 /// 
 /// 格式与解析格式相同
 fn encode_grpc_message(payload: &[u8]) -> BytesMut {
@@ -367,7 +271,7 @@ fn encode_varint(mut value: u64, buf: &mut BytesMut) {
     }
 }
 
-// ==================== AsyncRead + AsyncWrite 实现 ====================
+// AsyncRead + AsyncWrite 实现
 
 impl AsyncRead for GrpcH2cTransport {
     fn poll_read(
@@ -379,6 +283,7 @@ impl AsyncRead for GrpcH2cTransport {
             return Poll::Ready(Ok(()));
         }
 
+        // 如果已解析的缓冲区还有数据，先消费
         if self.read_pos < self.read_buf.len() {
             let remaining = &self.read_buf[self.read_pos..];
             let to_copy = remaining.len().min(buf.remaining());
@@ -392,22 +297,86 @@ impl AsyncRead for GrpcH2cTransport {
             return Poll::Ready(Ok(()));
         }
 
-        match Pin::new(&mut self.read_rx).poll_recv(cx) {
-            Poll::Ready(Some(data)) => {
-                let to_copy = data.len().min(buf.remaining());
-                buf.put_slice(&data[..to_copy]);
-
-                if to_copy < data.len() {
-                    self.read_buf = data;
-                    self.read_pos = to_copy;
+        // 从 HTTP/2 流读取数据并解析 gRPC 帧
+        loop {
+            // 尝试从 pending 缓冲区解析完整的 gRPC 消息
+            match parse_grpc_message(&self.read_pending) {
+                Ok(Some((consumed, payload))) => {
+                    // 释放流控容量
+                    if let Err(e) = self.recv_stream.flow_control().release_capacity(consumed) {
+                        eprintln!("[gRPC] Failed to release capacity: {}", e);
+                    }
+                    
+                    self.read_pending.advance(consumed);
+                    
+                    // 将解析出的 payload 放入 read_buf
+                    let to_copy = payload.len().min(buf.remaining());
+                    buf.put_slice(&payload[..to_copy]);
+                    
+                    if to_copy < payload.len() {
+                        self.read_buf = payload;
+                        self.read_pos = to_copy;
+                    }
+                    
+                    return Poll::Ready(Ok(()));
                 }
-                Poll::Ready(Ok(()))
+                Ok(None) => {
+                    // 数据不足，需要从流中读取更多数据
+                }
+                Err(e) => {
+                    eprintln!("[gRPC] Parse error: {}", e);
+                    // 跳过错误字节，尝试恢复
+                    if !self.read_pending.is_empty() {
+                        self.read_pending.advance(1);
+                        continue;
+                    } else {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("gRPC parse error: {}", e),
+                        )));
+                    }
+                }
             }
-            Poll::Ready(None) => {
-                self.closed = true;
-                Poll::Ready(Ok(()))
+
+            // 从 HTTP/2 流读取数据
+            // 直接创建并轮询 future，不存储它以避免生命周期问题
+            let poll_result = {
+                let data_future = self.recv_stream.data();
+                Pin::new(&mut Box::pin(data_future)).poll(cx)
+            };
+            
+            match poll_result {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    // 限制 pending 缓冲区大小，防止内存溢出
+                    if self.read_pending.len() + chunk.len() > MAX_PENDING_SIZE {
+                        eprintln!("[gRPC] Pending buffer too large ({}), dropping connection", self.read_pending.len());
+                        self.closed = true;
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::OutOfMemory,
+                            "gRPC pending buffer too large",
+                        )));
+                    }
+                    
+                    self.read_pending.extend_from_slice(&chunk);
+                    // 继续循环，尝试解析
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    // 忽略正常的流结束信号
+                    if !e.to_string().contains("not a result of an error") {
+                        eprintln!("[gRPC] Recv error: {}", e);
+                    }
+                    self.closed = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(None) => {
+                    // 流结束
+                    self.closed = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
             }
-            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -425,52 +394,96 @@ impl AsyncWrite for GrpcH2cTransport {
             )));
         }
 
-        // 如果有待发送的数据，先尝试发送
-        if let Some(pending) = self.pending_write.take() {
-            match self.write_tx.try_send(pending) {
-                Ok(_) => {
-                    // 待发送数据已发送，继续处理新数据
+        // 将数据添加到写入缓冲区
+        self.write_buf.extend_from_slice(buf);
+        
+        // 尝试发送缓冲区中的数据
+        if !self.write_buf.is_empty() {
+            let frame = encode_grpc_message(&self.write_buf);
+            let frame_bytes = frame.freeze();
+            self.write_buf.clear();
+            
+            match self.send_stream.send_data(frame_bytes, false) {
+                Ok(()) => {
+                    Poll::Ready(Ok(buf.len()))
                 }
-                Err(mpsc::error::TrySendError::Full(data)) => {
-                    // 通道还是满的，把数据放回去
-                    self.pending_write = Some(data);
-                    // 注册 waker，等待通道有空间
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
-                Err(_) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "write channel closed"
-                    )));
+                Err(e) => {
+                    let error_str = e.to_string();
+                    // 检查是否是流控错误（通常是 "user error" 或 "stream error"）
+                    if error_str.contains("user error") || error_str.contains("stream error") {
+                        // 流控错误，需要等待
+                        // 将数据放回缓冲区
+                        self.write_buf.extend_from_slice(buf);
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    } else {
+                        // 其他错误（如连接关闭）
+                        Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            format!("gRPC send error: {}", e),
+                        )))
+                    }
                 }
             }
-        }
-
-        // 尝试发送新数据
-        match self.write_tx.try_send(buf.to_vec()) {
-            Ok(_) => Poll::Ready(Ok(buf.len())),
-            Err(mpsc::error::TrySendError::Full(data)) => {
-                // 通道满了，保存数据等待下次重试（背压处理）
-                // 防止内存无限增长
-                self.pending_write = Some(data);
-                // 注册 waker，等待通道有空间
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Err(_) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "write channel closed"
-            ))),
+        } else {
+            Poll::Ready(Ok(buf.len()))
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        // 确保所有待发送的数据都已发送
+        if !self.write_buf.is_empty() {
+            let frame = encode_grpc_message(&self.write_buf);
+            let frame_bytes = frame.freeze();
+            self.write_buf.clear();
+            
+            match self.send_stream.send_data(frame_bytes, false) {
+                Ok(()) => {}
+                Err(e) => {
+                    let error_str = e.to_string();
+                    // 检查是否是流控错误
+                    if error_str.contains("user error") || error_str.contains("stream error") {
+                        // 流控错误，需要等待
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    } else {
+                        // 其他错误（如连接关闭）
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            format!("gRPC send error: {}", e),
+                        )));
+                    }
+                }
+            }
+        }
+        
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         self.closed = true;
-        Poll::Ready(Ok(()))
+        
+        // 先刷新所有待发送的数据
+        match self.as_mut().poll_flush(cx) {
+            Poll::Ready(Ok(())) | Poll::Pending => {
+                // 发送 gRPC 状态 trailers
+                let mut trailers = http::HeaderMap::new();
+                trailers.insert("grpc-status", "0".parse().unwrap());
+                match self.send_stream.send_trailers(trailers) {
+                    Ok(()) => Poll::Ready(Ok(())),
+                    Err(e) => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("gRPC send trailers error: {}", e),
+                    ))),
+                }
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+        }
     }
 }
