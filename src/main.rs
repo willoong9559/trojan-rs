@@ -10,7 +10,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc, oneshot};
-use tokio::task::JoinHandle;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use futures_util::{StreamExt, stream::{SplitSink, SplitStream}};
@@ -23,6 +22,251 @@ use std::fs::File;
 use std::io::BufReader;
 
 const BUF_SIZE: usize = 8192;
+
+/// 统一的流抽象，支持 TCP 和 WebSocket 流
+/// 使用泛型实现零成本抽象，避免动态分发
+pub trait TrojanStream: Send + Sync {
+    /// 关联类型：分离后的读取端
+    type ReadSplit: TrojanRead;
+    
+    /// 关联类型：分离后的写入端
+    type WriteSplit: TrojanWrite;
+    
+    /// 异步读取数据到缓冲区，返回读取的字节数
+    fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize>> + Send + 'a>>;
+    
+    /// 异步写入数据
+    fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+    
+    /// 分离读写两端（用于双向转发）
+    fn split(self) -> (Self::ReadSplit, Self::WriteSplit);
+}
+
+pub trait TrojanRead: Send + Sync {
+    fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize>> + Send + 'a>>;
+}
+
+pub trait TrojanWrite: Send + Sync {
+    fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+}
+
+// TCP 流
+pub struct TcpTrojanStream<S: AsyncRead + AsyncWrite + Unpin> {
+    stream: S,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> TcpTrojanStream<S> {
+    pub fn new(stream: S) -> Self {
+        Self { stream }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static> TrojanStream for TcpTrojanStream<S> {
+    type ReadSplit = TcpTrojanRead<S>;
+    type WriteSplit = TcpTrojanWrite<S>;
+    
+    fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            AsyncReadExt::read(&mut self.stream, buf).await
+                .map_err(|e| anyhow!("TCP read error: {}", e))
+        })
+    }
+    
+    fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            AsyncWriteExt::write_all(&mut self.stream, buf).await
+                .map_err(|e| anyhow!("TCP write error: {}", e))
+        })
+    }
+    
+    fn split(self) -> (Self::ReadSplit, Self::WriteSplit) {
+        let (read, write) = tokio::io::split(self.stream);
+        (
+            TcpTrojanRead { read },
+            TcpTrojanWrite { write },
+        )
+    }
+}
+
+pub struct TcpTrojanRead<S: AsyncRead + Unpin> {
+    read: tokio::io::ReadHalf<S>,
+}
+
+impl<S: AsyncRead + Unpin + Send + Sync> TrojanRead for TcpTrojanRead<S> {
+    fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            AsyncReadExt::read(&mut self.read, buf).await
+                .map_err(|e| anyhow!("TCP read error: {}", e))
+        })
+    }
+}
+
+pub struct TcpTrojanWrite<S: AsyncWrite + Unpin> {
+    write: tokio::io::WriteHalf<S>,
+}
+
+impl<S: AsyncWrite + Unpin + Send + Sync> TrojanWrite for TcpTrojanWrite<S> {
+    fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            AsyncWriteExt::write_all(&mut self.write, buf).await
+                .map_err(|e| anyhow!("TCP write error: {}", e))
+        })
+    }
+}
+
+// WebSocket 流
+pub struct WebSocketTrojanStream<S: AsyncRead + AsyncWrite + Unpin> {
+    read: SplitStream<WebSocketStream<S>>,
+    write: SplitSink<WebSocketStream<S>, Message>,
+    read_buffer: Option<Vec<u8>>,
+    read_pos: usize,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static> WebSocketTrojanStream<S> {
+    pub fn new(
+        read: SplitStream<WebSocketStream<S>>,
+        write: SplitSink<WebSocketStream<S>, Message>,
+    ) -> Self {
+        Self {
+            read,
+            write,
+            read_buffer: None,
+            read_pos: 0,
+        }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static> TrojanStream for WebSocketTrojanStream<S> {
+    type ReadSplit = WebSocketTrojanRead<S>;
+    type WriteSplit = WebSocketTrojanWrite<S>;
+    
+    fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            use futures_util::StreamExt;
+            
+            // 如果缓冲区有剩余数据，先返回
+            if let Some(ref buffer) = self.read_buffer {
+                let remaining = &buffer[self.read_pos..];
+                if !remaining.is_empty() {
+                    let copy_len = remaining.len().min(buf.len());
+                    buf[..copy_len].copy_from_slice(&remaining[..copy_len]);
+                    self.read_pos += copy_len;
+                    
+                    // 如果已经读完，清空缓冲区
+                    if self.read_pos >= buffer.len() {
+                        self.read_buffer = None;
+                        self.read_pos = 0;
+                    }
+                    return Ok(copy_len);
+                }
+            }
+            
+            // 读取新的 WebSocket 消息
+            match self.read.next().await {
+                Some(Ok(Message::Binary(data))) => {
+                    let copy_len = data.len().min(buf.len());
+                    buf[..copy_len].copy_from_slice(&data[..copy_len]);
+                    
+                    // 如果还有剩余数据，保存到缓冲区
+                    if data.len() > buf.len() {
+                        self.read_buffer = Some(data[buf.len()..].to_vec());
+                        self.read_pos = 0;
+                    }
+                    
+                    Ok(copy_len)
+                }
+                Some(Ok(Message::Close(_))) => Ok(0),
+                Some(Err(e)) => Err(anyhow!("WebSocket read error: {}", e)),
+                None => Ok(0),
+                _ => Err(anyhow!("Unexpected WebSocket message type")),
+            }
+        })
+    }
+    
+    fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            use futures_util::SinkExt;
+            self.write.send(Message::Binary(buf.to_vec())).await
+                .map_err(|e| anyhow!("WebSocket write error: {}", e))
+        })
+    }
+    
+    fn split(self) -> (Self::ReadSplit, Self::WriteSplit) {
+        (
+            WebSocketTrojanRead {
+                read: self.read,
+                read_buffer: self.read_buffer,
+                read_pos: self.read_pos,
+            },
+            WebSocketTrojanWrite { write: self.write },
+        )
+    }
+}
+
+pub struct WebSocketTrojanRead<S: AsyncRead + AsyncWrite + Unpin> {
+    read: SplitStream<WebSocketStream<S>>,
+    read_buffer: Option<Vec<u8>>,
+    read_pos: usize,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> TrojanRead for WebSocketTrojanRead<S> {
+    fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            use futures_util::StreamExt;
+            
+            // 如果缓冲区有剩余数据，先返回
+            if let Some(ref buffer) = self.read_buffer {
+                let remaining = &buffer[self.read_pos..];
+                if !remaining.is_empty() {
+                    let copy_len = remaining.len().min(buf.len());
+                    buf[..copy_len].copy_from_slice(&remaining[..copy_len]);
+                    self.read_pos += copy_len;
+                    
+                    // 如果已经读完，清空缓冲区
+                    if self.read_pos >= buffer.len() {
+                        self.read_buffer = None;
+                        self.read_pos = 0;
+                    }
+                    return Ok(copy_len);
+                }
+            }
+            
+            // 读取新的 WebSocket 消息
+            match self.read.next().await {
+                Some(Ok(Message::Binary(data))) => {
+                    let copy_len = data.len().min(buf.len());
+                    buf[..copy_len].copy_from_slice(&data[..copy_len]);
+                    
+                    // 如果还有剩余数据，保存到缓冲区
+                    if data.len() > buf.len() {
+                        self.read_buffer = Some(data[buf.len()..].to_vec());
+                        self.read_pos = 0;
+                    }
+                    
+                    Ok(copy_len)
+                }
+                Some(Ok(Message::Close(_))) => Ok(0),
+                Some(Err(e)) => Err(anyhow!("WebSocket read error: {}", e)),
+                None => Ok(0),
+                _ => Err(anyhow!("Unexpected WebSocket message type")),
+            }
+        })
+    }
+}
+
+pub struct WebSocketTrojanWrite<S: AsyncRead + AsyncWrite + Unpin> {
+    write: SplitSink<WebSocketStream<S>, Message>,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> TrojanWrite for WebSocketTrojanWrite<S> {
+    fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            use futures_util::SinkExt;
+            self.write.send(Message::Binary(buf.to_vec())).await
+                .map_err(|e| anyhow!("WebSocket write error: {}", e))
+        })
+    }
+}
 
 pub struct Server {
     pub listener: TcpListener,
@@ -139,31 +383,34 @@ impl TrojanRequest {
     }
 }
 
-// ============ TCP 模式处理函数 ============
+// 统一的处理函数
 
-async fn handle_tcp_connect<S: AsyncRead + AsyncWrite + Unpin>(
+async fn handle_connect<S: TrojanStream>(
     client_stream: S,
     target_addr: socks5::Address,
     initial_payload: Vec<u8>,
     peer_addr: String,
-) -> Result<()> {
-    println!("[TCP] Connecting to target: {}", target_addr.to_key());
+) -> Result<()> 
+where
+    S: 'static,
+{
+    println!("[Stream] Connecting to target: {}", target_addr.to_key());
     
     let remote_addr = target_addr.to_socket_addr().await?;
     let mut remote_stream = TcpStream::connect(remote_addr).await?;
-    println!("[TCP] Connected to remote server: {}", remote_addr);
+    println!("[Stream] Connected to remote server: {}", remote_addr);
 
     // 发送初始载荷
     if !initial_payload.is_empty() {
         remote_stream.write_all(&initial_payload).await?;
-        println!("[TCP] Wrote initial payload of {} bytes", initial_payload.len());
+        println!("[Stream] Wrote initial payload of {} bytes", initial_payload.len());
     }
 
     // 双向转发
-    let (mut client_read, mut client_write) = tokio::io::split(client_stream);
     let (mut remote_read, mut remote_write) = tokio::io::split(remote_stream);
+    let (mut client_read, mut client_write) = client_stream.split();
 
-    let client_to_remote = async {
+    let client_to_remote = async move {
         let mut buf = vec![0u8; BUF_SIZE];
         loop {
             let n = client_read.read(&mut buf).await?;
@@ -175,7 +422,7 @@ async fn handle_tcp_connect<S: AsyncRead + AsyncWrite + Unpin>(
         Ok::<(), anyhow::Error>(())
     };
 
-    let remote_to_client = async {
+    let remote_to_client = async move {
         let mut buf = vec![0u8; BUF_SIZE];
         loop {
             let n = remote_read.read(&mut buf).await?;
@@ -190,29 +437,29 @@ async fn handle_tcp_connect<S: AsyncRead + AsyncWrite + Unpin>(
     tokio::select! {
         result = client_to_remote => {
             if let Err(e) = result {
-                println!("[TCP] Client to remote error: {}", e);
+                println!("[Stream] Client to remote error: {}", e);
             }
         },
         result = remote_to_client => {
             if let Err(e) = result {
-                println!("[TCP] Remote to client error: {}", e);
+                println!("[Stream] Remote to client error: {}", e);
             }
         },
     }
 
-    println!("[TCP] Connection closed for {}", peer_addr);
+    println!("[Stream] Connection closed for {}", peer_addr);
     Ok(())
 }
 
-async fn handle_tcp_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
+async fn handle_udp_associate<S: TrojanStream>(
     server: Arc<Server>,
     mut client_stream: S,
     _bind_addr: socks5::Address,
     peer_addr: String,
 ) -> Result<()> {
-    println!("[TCP-UDP] Starting UDP associate for {}", peer_addr);
+    println!("[Stream-UDP] Starting UDP associate for {}", peer_addr);
     
-    let socket_key = format!("tcp_client_{}_{}", peer_addr, 
+    let socket_key = format!("client_{}_{}", peer_addr, 
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -227,7 +474,7 @@ async fn handle_tcp_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
         );
         
         let socket = UdpSocket::bind(bind_socket_addr).await?;
-        println!("[TCP-UDP] Created UDP socket bound to: {}", socket.local_addr()?);
+        println!("[Stream-UDP] Created UDP socket bound to: {}", socket.local_addr()?);
         
         let association = udp::UdpAssociation::new(socket);
         associations.insert(socket_key.clone(), association.clone());
@@ -274,7 +521,7 @@ async fn handle_tcp_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
                 read_result = client_stream.read(&mut read_buf) => {
                     match read_result {
                         Ok(0) => {
-                            println!("[TCP-UDP] Client closed connection");
+                            println!("[Stream-UDP] Client closed connection");
                             break;
                         }
                         Ok(n) => {
@@ -285,21 +532,21 @@ async fn handle_tcp_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
                                     match udp_packet.addr.to_socket_addr().await {
                                         Ok(remote_addr) => {
                                             if let Err(e) = udp_association.socket.send_to(&udp_packet.payload, remote_addr).await {
-                                                println!("[TCP-UDP] Failed to send UDP: {}", e);
+                                                println!("[Stream-UDP] Failed to send UDP: {}", e);
                                             }
                                         }
                                         Err(e) => {
-                                            println!("[TCP-UDP] Failed to resolve: {}", e);
+                                            println!("[Stream-UDP] Failed to resolve: {}", e);
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    println!("[TCP-UDP] Failed to decode packet: {}", e);
+                                    println!("[Stream-UDP] Failed to decode packet: {}", e);
                                 }
                             }
                         }
                         Err(e) => {
-                            println!("[TCP-UDP] Read error: {}", e);
+                            println!("[Stream-UDP] Read error: {}", e);
                             break;
                         }
                     }
@@ -322,7 +569,7 @@ async fn handle_tcp_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
                             
                             let encoded = udp_packet.encode();
                             if let Err(e) = client_stream.write_all(&encoded).await {
-                                println!("[TCP-UDP] Failed to write response: {}", e);
+                                println!("[Stream-UDP] Failed to write response: {}", e);
                                 break;
                             }
                         }
@@ -345,7 +592,7 @@ async fn handle_tcp_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
     result
 }
 
-async fn process_tcp_trojan<S: AsyncRead + AsyncWrite + Unpin>(
+async fn process_trojan<S: TrojanStream + 'static>(
     server: Arc<Server>,
     mut stream: S,
     peer_addr: String,
@@ -362,257 +609,37 @@ async fn process_tcp_trojan<S: AsyncRead + AsyncWrite + Unpin>(
 
     // 验证密码
     if request.password != server.password {
-        println!("[TCP] Incorrect password from {}", peer_addr);
+        println!("[Stream] Incorrect password from {}", peer_addr);
         return Err(anyhow!("Incorrect password"));
     }
 
     match request.cmd {
         TrojanCmd::Connect => {
-            handle_tcp_connect(stream, request.addr, request.payload, peer_addr).await
+            handle_connect(stream, request.addr, request.payload, peer_addr).await
         }
         TrojanCmd::UdpAssociate => {
-            handle_tcp_udp_associate(server, stream, request.addr, peer_addr).await
+            handle_udp_associate(server, stream, request.addr, peer_addr).await
         }
     }
 }
 
-// ============ WebSocket 模式处理函数 ============
 
-async fn websocket_to_tcp<S: AsyncWriteExt + Unpin + 'static>(
-    mut ws_read: SplitStream<WebSocketStream<S>>,
-    mut tcp_write: tokio::io::WriteHalf<TcpStream>,
-) -> Result<()> 
-where 
-    S: AsyncRead + AsyncWrite + Unpin + 'static,
-{
-    while let Some(msg) = ws_read.next().await {
-        match msg? {
-            Message::Binary(data) => {
-                tcp_write.write_all(&data).await?;
-            }
-            Message::Close(_) => break,
-            _ => continue,
-        }
-    }
-    Ok(())
-}
-
-async fn tcp_to_websocket<S: AsyncReadExt + AsyncWriteExt + Unpin + 'static>(
-    mut tcp_read: tokio::io::ReadHalf<TcpStream>,
-    mut ws_write: SplitSink<WebSocketStream<S>, Message>,
-) -> Result<()> {
-    use futures_util::SinkExt;
-    let mut buf = vec![0u8; BUF_SIZE];
-    loop {
-        let n = tcp_read.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        ws_write.send(Message::Binary(buf[..n].to_vec())).await?;
-    }
-    Ok(())
-}
-
-async fn handle_ws_udp_associate<S: AsyncReadExt + AsyncWriteExt + Unpin + 'static>(
-    server: Arc<Server>,
-    mut ws_read: SplitStream<WebSocketStream<S>>,
-    mut ws_write: SplitSink<WebSocketStream<S>, Message>,
-    _bind_addr: socks5::Address,
-    client_info: String,
-) -> Result<()> {
-    use futures_util::{StreamExt, SinkExt};
-    
-    let socket_key = format!("ws_client_{}_{}", client_info, 
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis());
-    
-    let udp_association = {
-        let mut associations = server.udp_associations.lock().await;
-        
-        let bind_socket_addr = SocketAddr::new(
-            IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 
-            0
-        );
-        
-        let socket = UdpSocket::bind(bind_socket_addr).await?;
-        println!("[WS-UDP] Created UDP socket bound to: {}", socket.local_addr()?);
-        
-        let association = udp::UdpAssociation::new(socket);
-        associations.insert(socket_key.clone(), association.clone());
-        association
-    };
-
-    let (udp_tx, mut udp_rx) = mpsc::unbounded_channel::<(SocketAddr, Vec<u8>)>();
-    let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
-
-    let socket_clone = Arc::clone(&udp_association.socket);
-    let udp_tx_clone = udp_tx.clone();
-    let activity_tracker = Arc::clone(&udp_association.last_activity);
-    
-    let udp_recv_handle: JoinHandle<()> = tokio::spawn(async move {
-        let mut buf = vec![0u8; BUF_SIZE];
-        loop {
-            tokio::select! {
-                _ = &mut cancel_rx => break,
-                result = socket_clone.recv_from(&mut buf) => {
-                    match result {
-                        Ok((len, from_addr)) => {
-                            let now = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs();
-                            *activity_tracker.lock().await = now;
-                            
-                            if udp_tx_clone.send((from_addr, buf[..len].to_vec())).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
-    });
-
-    let result = async {
-        loop {
-            tokio::select! {
-                ws_msg = ws_read.next() => {
-                    match ws_msg {
-                        Some(Ok(Message::Binary(data))) => {
-                            match udp::UdpPacket::decode(&data) {
-                                Ok((udp_packet, _)) => {
-                                    udp_association.update_activity().await;
-                                    
-                                    match udp_packet.addr.to_socket_addr().await {
-                                        Ok(remote_addr) => {
-                                            let _ = udp_association.socket.send_to(&udp_packet.payload, remote_addr).await;
-                                        }
-                                        Err(_) => {}
-                                    }
-                                }
-                                Err(_) => {}
-                            }
-                        }
-                        Some(Ok(Message::Close(_))) | None => break,
-                        Some(Err(_)) => break,
-                        _ => continue,
-                    }
-                }
-                
-                udp_msg = udp_rx.recv() => {
-                    match udp_msg {
-                        Some((from_addr, data)) => {
-                            let addr = match from_addr {
-                                SocketAddr::V4(v4) => socks5::Address::IPv4(v4.ip().octets(), v4.port()),
-                                SocketAddr::V6(v6) => socks5::Address::IPv6(v6.ip().octets(), v6.port()),
-                            };
-                            
-                            let udp_packet = udp::UdpPacket {
-                                addr,
-                                length: data.len() as u16,
-                                payload: data,
-                            };
-                            
-                            let encoded = udp_packet.encode();
-                            if ws_write.send(Message::Binary(encoded)).await.is_err() {
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
-        Ok::<(), anyhow::Error>(())
-    }.await;
-
-    let _ = cancel_tx.send(());
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), udp_recv_handle).await;
-    
-    {
-        let mut associations = server.udp_associations.lock().await;
-        associations.remove(&socket_key);
-    }
-
-    result
-}
-
-async fn process_websocket_trojan<S: AsyncReadExt + AsyncWriteExt + Unpin + 'static>(
-    server: Arc<Server>,
-    mut ws_read: SplitStream<WebSocketStream<S>>,
-    ws_write: SplitSink<WebSocketStream<S>, Message>,
-    peer_addr: String,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + 'static,
-{
-    let msg = match ws_read.next().await {
-        Some(Ok(Message::Binary(data))) => data,
-        Some(Ok(Message::Close(_))) => return Ok(()),
-        Some(Err(e)) => return Err(e.into()),
-        _ => return Err(anyhow!("Expected binary message")),
-    };
-
-    let (request, _consumed) = TrojanRequest::decode(&msg)?;
-
-    if request.password != server.password {
-        println!("[WS] Incorrect password from {}", peer_addr);
-        return Err(anyhow!("Incorrect password"));
-    }
-
-    match request.cmd {
-        TrojanCmd::Connect => {
-            println!("[WS] Handling TCP CONNECT to {}", request.addr.to_key());
-            
-            let remote_addr = request.addr.to_socket_addr().await?;
-            let remote_stream = TcpStream::connect(remote_addr).await?;
-
-            let (remote_read, mut remote_write) = tokio::io::split(remote_stream);
-
-            if !request.payload.is_empty() {
-                remote_write.write_all(&request.payload).await?;
-            }
-
-            tokio::select! {
-                result = websocket_to_tcp(ws_read, remote_write) => {
-                    if let Err(e) = result {
-                        println!("[WS] WS to TCP error: {}", e);
-                    }
-                },
-                result = tcp_to_websocket(remote_read, ws_write) => {
-                    if let Err(e) = result {
-                        println!("[WS] TCP to WS error: {}", e);
-                    }
-                },
-            }
-        }
-        
-        TrojanCmd::UdpAssociate => {
-            println!("[WS] Handling UDP ASSOCIATE for {}", request.addr.to_key());
-            handle_ws_udp_associate(server, ws_read, ws_write, request.addr, peer_addr.clone()).await?;
-        }
-    }
-
-    Ok(())
-}
-
-// ============ 连接检测与分发 ============
+// 连接检测与分发
 async fn detect_and_handle_connection<S>(
     server: Arc<Server>,
     stream: S,
     peer_addr: String,
 ) -> Result<()> 
-where S: AsyncRead + AsyncWrite + Unpin + 'static,
+where S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
 {
     if server.enable_ws {
         let ws_stream = tokio_tungstenite::accept_async(stream).await?;
         let (ws_write, ws_read) = ws_stream.split();
-        process_websocket_trojan(server, ws_read, ws_write, peer_addr).await
+        let trojan_stream = WebSocketTrojanStream::new(ws_read, ws_write);
+        process_trojan(server, trojan_stream, peer_addr).await
     } else {
-        process_tcp_trojan(server, stream, peer_addr).await
+        let trojan_stream = TcpTrojanStream::new(stream);
+        process_trojan(server, trojan_stream, peer_addr).await
     }
 }
 
