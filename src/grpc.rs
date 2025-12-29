@@ -9,6 +9,7 @@ use http::{Response, StatusCode};
 use anyhow::Result;
 
 const MAX_PENDING_SIZE: usize = 1024 * 1024;
+const MAX_WRITE_BUFFER_SIZE: usize = 512 * 1024;
 
 /// gRPC HTTP/2 连接管理器
 /// 
@@ -21,16 +22,12 @@ impl<S> GrpcH2cConnection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    /// 从 TCP 流创建 HTTP/2 连接管理器
     pub async fn new(stream: S) -> io::Result<Self> {
         let h2_conn = server::handshake(stream).await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 handshake: {}", e)))?;
-
         Ok(Self { h2_conn })
     }
 
-
-    /// 运行连接管理器，接受所有流并调用回调函数处理每个流
     pub async fn run<F, Fut>(self, handler: F) -> Result<()>
     where
         F: Fn(GrpcH2cTransport) -> Fut + Send + Sync + 'static,
@@ -81,13 +78,13 @@ where
                         read_buf: Vec::new(),
                         read_pos: 0,
                         write_buf: BytesMut::new(),
+                        write_pending: false, // 标记是否有待发送的数据
                         closed: false,
                     };
 
-                    let transport_clone = transport;
                     let handler_clone = Arc::clone(&handler);
                     tokio::spawn(async move {
-                        if let Err(e) = handler_clone(transport_clone).await {
+                        if let Err(e) = handler_clone(transport).await {
                             eprintln!("[gRPC] Stream handler error: {}", e);
                         }
                     });
@@ -107,7 +104,6 @@ where
                 }
             }
         }
-
         Ok(())
     }
 }
@@ -122,6 +118,7 @@ pub struct GrpcH2cTransport {
     read_buf: Vec<u8>,
     read_pos: usize,
     write_buf: BytesMut,
+    write_pending: bool, // 防止重复写入
     closed: bool,
 }
 
@@ -330,33 +327,40 @@ impl AsyncWrite for GrpcH2cTransport {
             )));
         }
 
-        self.write_buf.extend_from_slice(buf);
-        
-        if !self.write_buf.is_empty() {
-            let frame = encode_grpc_message(&self.write_buf);
-            let frame_bytes = frame.freeze();
-            self.write_buf.clear();
-            
-            match self.send_stream.send_data(frame_bytes, false) {
-                Ok(()) => {
-                    Poll::Ready(Ok(buf.len()))
+        if self.write_pending {
+            match self.try_send_pending(cx) {
+                Poll::Ready(Ok(())) => {
+                    self.write_pending = false;
                 }
-                Err(e) => {
-                    let error_str = e.to_string();
-                    if error_str.contains("user error") || error_str.contains("stream error") {
-                        self.write_buf.extend_from_slice(buf);
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
-                    } else {
-                        Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            format!("gRPC send error: {}", e),
-                        )))
-                    }
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => {
+                    return Poll::Pending;
                 }
             }
-        } else {
-            Poll::Ready(Ok(buf.len()))
+        }
+
+        if self.write_buf.len() + buf.len() > MAX_WRITE_BUFFER_SIZE {
+            // 缓冲区满，返回 WouldBlock
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+
+        self.write_buf.extend_from_slice(buf);
+        
+        match self.try_send_pending(cx) {
+            Poll::Ready(Ok(())) => {
+                Poll::Ready(Ok(buf.len()))
+            }
+            Poll::Ready(Err(e)) => {
+                Poll::Ready(Err(e))
+            }
+            Poll::Pending => {
+                self.write_pending = true;
+                // 虽然发送 Pending，但数据已经被接受到缓冲区
+                Poll::Ready(Ok(buf.len()))
+            }
         }
     }
 
@@ -364,29 +368,21 @@ impl AsyncWrite for GrpcH2cTransport {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        if !self.write_buf.is_empty() {
-            let frame = encode_grpc_message(&self.write_buf);
-            let frame_bytes = frame.freeze();
-            self.write_buf.clear();
-            
-            match self.send_stream.send_data(frame_bytes, false) {
-                Ok(()) => {}
-                Err(e) => {
-                    let error_str = e.to_string();
-                    if error_str.contains("user error") || error_str.contains("stream error") {
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
-                    } else {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            format!("gRPC send error: {}", e),
-                        )));
-                    }
+        if self.write_pending || !self.write_buf.is_empty() {
+            match self.try_send_pending(cx) {
+                Poll::Ready(Ok(())) => {
+                    self.write_pending = false;
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => {
+                    self.write_pending = true;
+                    Poll::Pending
                 }
             }
+        } else {
+            Poll::Ready(Ok(()))
         }
-        
-        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(
@@ -396,7 +392,7 @@ impl AsyncWrite for GrpcH2cTransport {
         self.closed = true;
         
         match self.as_mut().poll_flush(cx) {
-            Poll::Ready(Ok(())) | Poll::Pending => {
+            Poll::Ready(Ok(())) => {
                 let mut trailers = http::HeaderMap::new();
                 trailers.insert("grpc-status", "0".parse().unwrap());
                 match self.send_stream.send_trailers(trailers) {
@@ -408,6 +404,46 @@ impl AsyncWrite for GrpcH2cTransport {
                 }
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl GrpcH2cTransport {
+    fn try_send_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.write_buf.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+
+        let capacity = self.send_stream.capacity();
+        if capacity == 0 {
+            self.send_stream.reserve_capacity(1);
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+
+        let frame = encode_grpc_message(&self.write_buf);
+        let frame_bytes = frame.freeze();
+        
+        match self.send_stream.send_data(frame_bytes, false) {
+            Ok(()) => {
+                self.write_buf.clear();
+                Poll::Ready(Ok(()))
+            }
+            Err(e) => {
+                let error_str = e.to_string();
+                if error_str.contains("user error") || 
+                   error_str.contains("stream error") ||
+                   error_str.contains("capacity") {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        format!("gRPC send error: {}", e),
+                    )))
+                }
+            }
         }
     }
 }
