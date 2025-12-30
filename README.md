@@ -1,85 +1,86 @@
-# Trojan WS Server
+# Trojan-RS
 
-A simple **Trojan** server implemented in **Rust**.  
-This server allows you to run a Trojan server with configurable host, port, and password via **command-line arguments**.  
-It also supports **optional TLS encryption**, **WebSocket mode** and **gRPC mode (Compatible with v2ray format)** allowing you to serve secure onnections.
+一个用 Rust 实现的高性能 Trojan 代理服务器，支持多种传输模式。
 
----
+## 特性
 
-## Command-Line Arguments
+- 🚀 **高性能**：基于 Rust 和 Tokio 异步运行时，提供出色的并发性能
+- 🔒 **TLS 加密**：支持可选的 TLS/SSL 加密传输
+- 🌐 **多种传输模式**：
+  - TCP 模式（原生 Trojan 协议）
+  - WebSocket 模式（支持 WebSocket over TLS）
+  - gRPC 模式（兼容 v2ray， 支持多路复用）
+- 📦 **UDP 代理**：完整支持 UDP 流量转发
 
-The server uses [**clap**](https://crates.io/crates/clap) to parse command-line arguments.  
-Available options:
+## 安装
 
-| Argument                     | Description                               | Type    | Default Value   |
-|-------------------------------|-------------------------------------------|---------|----------------|
-| `--host <HOST>`              | Host address                               | String  | `127.0.0.1`    |
-| `--port <PORT>`              | Port number                                | String  | `35537`        |
-| `--password <PASSWORD>`      | Password for the server                    | String  | *(required)*   |
-| `--cert <FILE>`              | TLS certificate file path (PEM)           | String  | *(optional)*   |
-| `--key <FILE>`               | TLS private key file path (PEM)           | String  | *(optional)*   |
-| `--enable-ws`                | Enable WebSocket mode (TCP/TLS)           | Flag    | disabled       |
-| `--enable-grpc`              | Enable gRPC mode (TCP/TLS)           | Flag    | disabled       |
-| `-c, --config-file <FILE>`   | Load configuration from TOML file         | String  | *(optional)*   |
-| `--generate-config <FILE>`   | Generate example TOML configuration file | String  | *(optional)*   |
-| `-h, --help`                 | Print help                                 | -       | -              |
-| `-V, --version`              | Print version                              | -       | -              |
-
-> **Note:**  
-> - If both `--cert` and `--key` are provided, the server automatically enables **TLS mode**.  
-> - If `--enable-ws` is set, the server will accept WebSocket connections;
-> - If `--enable-grpc` is set, the server will accept WebSocket connections;
-> - CLI arguments override configuration file values.
-
----
-
-## Example Usage
-
-### Run without TLS
-
-Run the server with default host and port, specifying only a password:
+### 从源码构建
 
 ```bash
-cargo run -- --password mysecretpassword
+# 克隆仓库
+git clone <repo_url>
+cd trojan-rs
+
+# 构建发布版本
+cargo build --release
+
+# 可执行文件位于 target/release/trojan-rs
 ```
-### Run with TLS
-```bash
-cargo run -- --host 0.0.0.0 --port 443 \
-           --password mysecretpassword \
-           --cert ./cert.pem --key ./key.pem
-```
-### Run using a Configuration File
-#### Generate an example TOML config:
-```bash
-cargo run -- --generate-config server.toml
-```
-#### Edit server.toml to set your password and TLS paths:
+
+## 使用方法
+
+### 命令行参数
+
+| 参数 | 描述 | 类型 | 默认值 | 必需 |
+|------|------|------|--------|------|
+| `--host <HOST>` | 服务器监听地址 | String | `127.0.0.1` | 否 |
+| `--port <PORT>` | 服务器监听端口 | String | `35537` | 否 |
+| `--password <PASSWORD>` | 服务器密码 | String | - | **是** |
+| `--cert <FILE>` | TLS 证书文件路径 (PEM 格式) | String | - | 否 |
+| `--key <FILE>` | TLS 私钥文件路径 (PEM 格式) | String | - | 否 |
+| `--enable-ws` | 启用 WebSocket 模式 | Flag | 禁用 | 否 |
+| `--enable-grpc` | 启用 gRPC 模式 | Flag | 禁用 | 否 |
+| `-c, --config-file <FILE>` | 从 TOML 文件加载配置 | String | - | 否 |
+| `--generate-config <FILE>` | 生成示例配置文件 | String | - | 否 |
+| `--log-level <LEVEL>` | 日志级别 (trace/debug/info/warn/error) | String | `info` | 否 |
+| `-h, --help` | 显示帮助信息 | - | - | - |
+| `-V, --version` | 显示版本信息 | - | - | - |
+
+> **注意**：
+> - 如果同时提供 `--cert` 和 `--key`，服务器将自动启用 TLS 模式
+> - `--enable-ws` 和 `--enable-grpc` 不能同时启用
+> - 命令行参数会覆盖配置文件中的对应设置
+> - WebSocket 模式不验证 host 和 path
+> - gRPC 模式不验证服务名称
+> - TLS 证书和私钥必须为 PEM 格式（rustls 仅支持 PEM 格式）
+
+#### 配置文件示例
+
+编辑生成的 `server.toml` 文件：
+
 ```toml
 [server]
 host = "0.0.0.0"
 port = "443"
 password = "mysecretpassword"
 enable_ws = true
-enable_grcp = false
+enable_grpc = false
 
 [tls]
 cert = "/path/to/cert.pem"
-key  = "/path/to/key.pem"
-```
-#### Start the server using the config file:
-```bash
-cargo run -- --config-file server.toml
-```
-#### You can still override values via CLI:
-```bash
-cargo run -- --config-file server.toml --port 8443
+key = "/path/to/key.pem"
+
+[log]
+level = "info"
 ```
 
-## Installation
-### Build and run locally:
-```bash
-git clone <repo_url>
-cd trojan-rs
-cargo build --release
-./target/release/trojan-rs --help
-```
+## 协议支持
+
+- ✅ TCP 代理（CONNECT 命令）
+- ✅ UDP 代理（UDP ASSOCIATE 命令，UDP over TCP）
+- ✅ IPv4 和 IPv6 地址
+- ✅ 域名解析
+
+## 许可证
+
+查看 [LICENSE](LICENSE) 文件了解详情。
