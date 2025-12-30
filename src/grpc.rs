@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::io;
 use std::sync::Arc;
-use h2::{server, SendStream, RecvStream};
+use h2::{server, SendStream, RecvStream, Reason};
 use http::{Response, StatusCode};
 use anyhow::Result;
 use futures_util::Future;
@@ -241,6 +241,19 @@ fn encode_varint(mut value: u64, buf: &mut BytesMut) {
     }
 }
 
+fn is_normal_stream_close(error: &h2::Error) -> bool {
+    // 根据 HTTP/2 规范，NO_ERROR (0x0) 和 CANCEL (0x8) 表示正常的流关闭
+    if let Some(reason) = error.reason() {
+        matches!(
+            reason,
+            Reason::NO_ERROR
+                | Reason::CANCEL
+        )
+    } else {
+        false
+    }
+}
+
 impl AsyncRead for GrpcH2cTransport {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -318,6 +331,9 @@ impl AsyncRead for GrpcH2cTransport {
                 }
                 Poll::Ready(Some(Err(e))) => {
                     self.closed = true;
+                    if is_normal_stream_close(&e) {
+                        return Poll::Ready(Ok(()));
+                    }
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::Other,
                         format!("gRPC recv error: {}", e),
