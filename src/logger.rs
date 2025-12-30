@@ -4,6 +4,7 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
     EnvFilter,
 };
+use toml;
 
 /// 日志级别
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,12 +46,35 @@ impl Default for LogLevel {
     }
 }
 
+pub fn get_log_level_from_args() -> Option<LogLevel> {
+    let args: Vec<String> = std::env::args().collect();
+    
+    let log_level_from_cli = args.iter()
+        .position(|a| a == "--log-level")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| LogLevel::from_str(s));
+    
+    if log_level_from_cli.is_some() {
+        return log_level_from_cli;
+    }
+    
+    args.iter()
+        .position(|a| a == "--config-file" || a == "-c")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|config_path| {
+            std::fs::read_to_string(config_path).ok()
+                .and_then(|content| {
+                    toml::from_str::<toml::Value>(&content).ok()
+                        .and_then(|v| v.get("log")?.get("level")?.as_str().map(|s| s.to_string()))
+                        .and_then(|s| LogLevel::from_str(&s))
+                })
+        })
+}
+
 pub fn init_logger(log_level: Option<LogLevel>) {
-    // 首先尝试从环境变量读取
     let filter = if let Ok(env_filter) = EnvFilter::try_from_default_env() {
         env_filter
     } else {
-        // 如果没有环境变量，使用传入的日志级别或默认值
         let level = log_level.unwrap_or_default();
         EnvFilter::new(&format!("trojan_rs={}", level.as_str()))
     };
@@ -98,6 +122,7 @@ pub mod log {
     }
 
     /// 记录协议解析事件
+    #[allow(dead_code)]
     pub fn protocol(event: &str, error: Option<&str>) {
         if let Some(err) = error {
             warn!(event = event, error = err, "Protocol");

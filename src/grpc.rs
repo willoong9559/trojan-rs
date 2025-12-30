@@ -8,8 +8,6 @@ use h2::{server, SendStream, RecvStream};
 use http::{Response, StatusCode};
 use anyhow::Result;
 use futures_util::Future;
-use crate::logger::log;
-
 const MAX_PENDING_SIZE: usize = 1024 * 1024;
 const MAX_WRITE_BUFFER_SIZE: usize = 512 * 1024;
 
@@ -86,22 +84,13 @@ where
 
                     let handler_clone = Arc::clone(&handler);
                     tokio::spawn(async move {
-                        if let Err(e) = handler_clone(transport).await {
-                            log::error!(transport = "gRPC", error = %e, "Stream handler error");
-                        }
+                        let _ = handler_clone(transport).await;
                     });
                 }
                 Some(Err(e)) => {
-                    let error_str = e.to_string();
-                    if error_str.contains("connection reset") || error_str.contains("broken pipe") {
-                        log::debug!(transport = "gRPC", error = %e, "Connection error (likely closed)");
-                        break;
-                    } else {
-                        log::error!(transport = "gRPC", error = %e, "Error accepting stream");
-                    }
+                    return Err(anyhow::anyhow!("gRPC connection error: {}", e));
                 }
                 None => {
-                    log::debug!(transport = "gRPC", "Connection closed normally");
                     break;
                 }
             }
@@ -250,7 +239,10 @@ impl AsyncRead for GrpcH2cTransport {
             match parse_grpc_message(&self.read_pending) {
                 Ok(Some((consumed, payload))) => {
                     if let Err(e) = self.recv_stream.flow_control().release_capacity(consumed) {
-                        log::warn!(transport = "gRPC", error = %e, "Failed to release capacity");
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("Failed to release capacity: {}", e),
+                        )));
                     }
                     
                     self.read_pending.advance(consumed);
@@ -266,16 +258,7 @@ impl AsyncRead for GrpcH2cTransport {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    log::protocol("gRPC parse", Some(&e.to_string()));
-                    if !self.read_pending.is_empty() {
-                        self.read_pending.advance(1);
-                        continue;
-                    } else {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("gRPC parse error: {}", e),
-                        )));
-                    }
+                    return Poll::Ready(Err(e));
                 }
             }
 
@@ -287,11 +270,6 @@ impl AsyncRead for GrpcH2cTransport {
             match poll_result {
                 Poll::Ready(Some(Ok(chunk))) => {
                     if self.read_pending.len() + chunk.len() > MAX_PENDING_SIZE {
-                        log::error!(
-                            transport = "gRPC",
-                            pending_size = self.read_pending.len(),
-                            "Pending buffer too large, dropping connection"
-                        );
                         self.closed = true;
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::OutOfMemory,
@@ -302,11 +280,11 @@ impl AsyncRead for GrpcH2cTransport {
                     self.read_pending.extend_from_slice(&chunk);
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    if !e.to_string().contains("not a result of an error") {
-                        log::debug!(transport = "gRPC", error = %e, "Recv error");
-                    }
                     self.closed = true;
-                    return Poll::Ready(Ok(()));
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("gRPC recv error: {}", e),
+                    )));
                 }
                 Poll::Ready(None) => {
                     self.closed = true;
@@ -437,18 +415,10 @@ impl GrpcH2cTransport {
                 Poll::Ready(Ok(()))
             }
             Err(e) => {
-                let error_str = e.to_string();
-                if error_str.contains("user error") || 
-                   error_str.contains("stream error") ||
-                   error_str.contains("capacity") {
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                } else {
-                    Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        format!("gRPC send error: {}", e),
-                    )))
-                }
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("gRPC send error: {}", e),
+                )))
             }
         }
     }

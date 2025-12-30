@@ -11,7 +11,6 @@ mod logger;
 use logger::log;
 
 use std::collections::HashMap;
-use toml;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -530,34 +529,9 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let log_level_from_cli = args.iter()
-        .position(|a| a == "--log-level")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|s| logger::LogLevel::from_str(s));
-    
-    let log_level = if log_level_from_cli.is_some() {
-        log_level_from_cli
-    } else {
-        // 尝试从配置文件读取
-        args.iter()
-            .position(|a| a == "--config-file" || a == "-c")
-            .and_then(|i| args.get(i + 1))
-            .and_then(|config_path| {
-                // 直接读取 TOML 文件获取日志级别
-                std::fs::read_to_string(config_path).ok()
-                    .and_then(|content| {
-                        toml::from_str::<toml::Value>(&content).ok()
-                            .and_then(|v| v.get("log")?.get("level")?.as_str().map(|s| s.to_string()))
-                            .and_then(|s| logger::LogLevel::from_str(&s))
-                    })
-            })
-    };
-    
-    // 初始化日志系统（优先使用命令行参数，然后是配置文件，最后是环境变量或默认值）
+    let log_level = logger::get_log_level_from_args();
     logger::init_logger(log_level);
     
-    // 现在加载完整配置
     let config = config::ServerConfig::load()?;
     
     let server = build_server(config).await?;
