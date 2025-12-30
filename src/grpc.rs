@@ -8,14 +8,20 @@ use h2::{server, SendStream, RecvStream};
 use http::{Response, StatusCode};
 use anyhow::Result;
 use futures_util::Future;
-const MAX_PENDING_SIZE: usize = 1024 * 1024;
-const MAX_WRITE_BUFFER_SIZE: usize = 512 * 1024;
+use tokio::sync::Semaphore;
+
+const INITIAL_READ_BUFFER_SIZE: usize = 64 * 1024;
+const MAX_PENDING_SIZE: usize = 256 * 1024;
+const MAX_WRITE_BUFFER_SIZE: usize = 128 * 1024;
+// 每个 HTTP/2 连接的最大并发流数量
+const MAX_CONCURRENT_STREAMS: usize = 100;
 
 /// gRPC HTTP/2 连接管理器
 /// 
 /// 管理整个 HTTP/2 连接，接受多个流，每个流对应一个独立的 Trojan 隧道
 pub struct GrpcH2cConnection<S> {
     h2_conn: server::Connection<S, Bytes>,
+    stream_semaphore: Arc<Semaphore>,
 }
 
 impl<S> GrpcH2cConnection<S>
@@ -25,7 +31,14 @@ where
     pub async fn new(stream: S) -> io::Result<Self> {
         let h2_conn = server::handshake(stream).await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 handshake: {}", e)))?;
-        Ok(Self { h2_conn })
+        
+        // 注意：h2 库的并发流限制通过信号量在应用层控制
+        // HTTP/2 协议本身也有流控机制
+        
+        Ok(Self { 
+            h2_conn,
+            stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
+        })
     }
 
     pub async fn run<F, Fut>(self, handler: F) -> Result<()>
@@ -35,6 +48,7 @@ where
     {
         let handler = Arc::new(handler);
         let mut h2_conn = self.h2_conn;
+        let stream_semaphore = self.stream_semaphore;
         
         loop {
             match h2_conn.accept().await {
@@ -71,19 +85,34 @@ where
 
                     let recv_stream = request.into_body();
 
+                    let permit = match stream_semaphore.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            // 流数量已达上限，拒绝请求
+                            let response = Response::builder()
+                                .status(StatusCode::SERVICE_UNAVAILABLE)
+                                .header("grpc-status", "8")  // RESOURCE_EXHAUSTED
+                                .body(())
+                                .unwrap();
+                            let _ = respond.send_response(response, true);
+                            continue;
+                        }
+                    };
+
                     let transport = GrpcH2cTransport {
                         recv_stream,
                         send_stream,
-                        read_pending: BytesMut::new(),
+                        read_pending: BytesMut::with_capacity(INITIAL_READ_BUFFER_SIZE),
                         read_buf: Vec::new(),
                         read_pos: 0,
-                        write_buf: BytesMut::new(),
-                        write_pending: false, // 标记是否有待发送的数据
+                        write_buf: BytesMut::with_capacity(INITIAL_READ_BUFFER_SIZE / 2),
+                        write_pending: false,
                         closed: false,
                     };
 
                     let handler_clone = Arc::clone(&handler);
                     tokio::spawn(async move {
+                        let _permit = permit;
                         let _ = handler_clone(transport).await;
                     });
                 }
@@ -269,12 +298,20 @@ impl AsyncRead for GrpcH2cTransport {
             
             match poll_result {
                 Poll::Ready(Some(Ok(chunk))) => {
+                    // 限制缓冲区大小
                     if self.read_pending.len() + chunk.len() > MAX_PENDING_SIZE {
                         self.closed = true;
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::OutOfMemory,
                             "gRPC pending buffer too large",
                         )));
+                    }
+                    
+                    if self.read_pending.len() < self.read_pending.capacity() / 4 
+                        && self.read_pending.capacity() > MAX_PENDING_SIZE {
+                        let data = self.read_pending.split();
+                        self.read_pending = BytesMut::with_capacity(MAX_PENDING_SIZE);
+                        self.read_pending.extend_from_slice(&data);
                     }
                     
                     self.read_pending.extend_from_slice(&chunk);
@@ -411,7 +448,11 @@ impl GrpcH2cTransport {
         
         match self.send_stream.send_data(frame_bytes, false) {
             Ok(()) => {
+                let old_capacity = self.write_buf.capacity();
                 self.write_buf.clear();
+                if old_capacity > MAX_WRITE_BUFFER_SIZE {
+                    self.write_buf = BytesMut::with_capacity(MAX_WRITE_BUFFER_SIZE / 2);
+                }
                 Poll::Ready(Ok(()))
             }
             Err(e) => {
