@@ -380,7 +380,7 @@ impl AsyncWrite for GrpcH2cTransport {
 
         if self.write_buf.len() + buf.len() > MAX_WRITE_BUFFER_SIZE {
             // 缓冲区满，返回 WouldBlock
-            cx.waker().wake_by_ref();
+            // cx.waker().wake_by_ref();
             return Poll::Pending;
         }
 
@@ -455,7 +455,7 @@ impl GrpcH2cTransport {
         let capacity = self.send_stream.capacity();
         if capacity == 0 {
             self.send_stream.reserve_capacity(1);
-            cx.waker().wake_by_ref();
+            // cx.waker().wake_by_ref();
             return Poll::Pending;
         }
 
