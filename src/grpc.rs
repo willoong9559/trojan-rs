@@ -304,6 +304,10 @@ impl AsyncRead for GrpcH2cTransport {
                 }
             }
 
+            if self.read_pending.len() >= MAX_PENDING_SIZE {
+                return Poll::Pending;
+            }
+
             let poll_result = {
                 let data_future = self.recv_stream.data();
                 Pin::new(&mut Box::pin(data_future)).poll(cx)
@@ -311,13 +315,9 @@ impl AsyncRead for GrpcH2cTransport {
             
             match poll_result {
                 Poll::Ready(Some(Ok(chunk))) => {
-                    // 限制缓冲区大小
                     if self.read_pending.len() + chunk.len() > MAX_PENDING_SIZE {
-                        self.closed = true;
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::OutOfMemory,
-                            "gRPC pending buffer too large",
-                        )));
+                        self.read_pending.extend_from_slice(&chunk);
+                        continue;
                     }
                     
                     if self.read_pending.len() < self.read_pending.capacity() / 4 
