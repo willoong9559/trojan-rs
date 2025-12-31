@@ -13,6 +13,7 @@ use tokio::sync::Semaphore;
 const READ_BUFFER_SIZE: usize = 256 * 1024;
 const WRITE_BUFFER_SIZE: usize = 128 * 1024;
 const MAX_CONCURRENT_STREAMS: usize = 100;
+const MAX_HEADER_LIST_SIZE: u32 = 2 * 1024;
 
 /// gRPC HTTP/2 连接管理器
 /// 
@@ -27,7 +28,10 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     pub async fn new(stream: S) -> io::Result<Self> {
-        let h2_conn = server::handshake(stream).await
+        let h2_conn = server::Builder::new()
+            .max_header_list_size(MAX_HEADER_LIST_SIZE)
+            .handshake(stream)
+            .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 handshake: {}", e)))?;
         
         // 注意：h2 库的并发流限制通过信号量在应用层控制
