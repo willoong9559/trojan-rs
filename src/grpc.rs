@@ -352,9 +352,16 @@ impl AsyncWrite for GrpcH2cTransport {
             }
         }
 
+        if self.write_buf.len() + buf.len() > WRITE_BUFFER_SIZE {
+            match self.try_send_pending(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        
         self.write_buf.extend_from_slice(buf);
         
-        // 尝试立即发送
         match self.try_send_pending(cx) {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -398,18 +405,41 @@ impl AsyncWrite for GrpcH2cTransport {
 }
 
 impl GrpcH2cTransport {
-    fn try_send_pending(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn try_send_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.write_buf.is_empty() {
             return Poll::Ready(Ok(()));
         }
 
         let frame = encode_grpc_message(&self.write_buf);
         let frame_len = frame.len();
-        let capacity = self.send_stream.capacity();
         
-        if capacity < frame_len {
+        loop {
+            let capacity = self.send_stream.capacity();
+            if capacity >= frame_len {
+                break;
+            }
+            
             self.send_stream.reserve_capacity(frame_len);
-            return Poll::Pending;
+            match self.send_stream.poll_capacity(cx) {
+                Poll::Ready(Some(Ok(_))) => {
+                    continue;
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("gRPC capacity error: {}", e),
+                    )));
+                }
+                Poll::Ready(None) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "gRPC stream closed",
+                    )));
+                }
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
+            }
         }
         
         let frame_bytes = frame.freeze();
