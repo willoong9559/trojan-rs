@@ -379,9 +379,19 @@ impl AsyncWrite for GrpcH2cTransport {
         }
 
         if self.write_buf.len() + buf.len() > MAX_WRITE_BUFFER_SIZE {
-            // 缓冲区满，返回 WouldBlock
-            // cx.waker().wake_by_ref();
-            return Poll::Pending;
+            match self.try_send_pending(cx) {
+                Poll::Ready(Ok(())) => {
+                    if self.write_buf.len() + buf.len() > MAX_WRITE_BUFFER_SIZE {
+                        return Poll::Pending;
+                    }
+                }
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
+            }
         }
 
         self.write_buf.extend_from_slice(buf);
@@ -395,7 +405,6 @@ impl AsyncWrite for GrpcH2cTransport {
             }
             Poll::Pending => {
                 self.write_pending = true;
-                // 虽然发送 Pending，但数据已经被接受到缓冲区
                 Poll::Ready(Ok(buf.len()))
             }
         }
@@ -447,19 +456,27 @@ impl AsyncWrite for GrpcH2cTransport {
 }
 
 impl GrpcH2cTransport {
-    fn try_send_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn try_send_pending(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.write_buf.is_empty() {
             return Poll::Ready(Ok(()));
         }
 
         let capacity = self.send_stream.capacity();
+        
         if capacity == 0 {
-            self.send_stream.reserve_capacity(1);
-            // cx.waker().wake_by_ref();
+            let estimated_frame_size = 5 + 10 + self.write_buf.len();
+            self.send_stream.reserve_capacity(estimated_frame_size);
             return Poll::Pending;
         }
 
         let frame = encode_grpc_message(&self.write_buf);
+        let frame_len = frame.len();
+        
+        if capacity < frame_len {
+            self.send_stream.reserve_capacity(frame_len);
+            return Poll::Pending;
+        }
+        
         let frame_bytes = frame.freeze();
         
         match self.send_stream.send_data(frame_bytes, false) {
