@@ -10,7 +10,8 @@ use anyhow::Result;
 use futures_util::Future;
 use tokio::sync::Semaphore;
 
-const BUFFER_SIZE: usize = 64 * 1024;
+const READ_BUFFER_SIZE: usize = 256 * 1024;
+const WRITE_BUFFER_SIZE: usize = 128 * 1024;
 const MAX_CONCURRENT_STREAMS: usize = 100;
 
 /// gRPC HTTP/2 连接管理器
@@ -99,10 +100,10 @@ where
                     let transport = GrpcH2cTransport {
                         recv_stream,
                         send_stream,
-                        read_pending: BytesMut::with_capacity(BUFFER_SIZE),
+                        read_pending: BytesMut::with_capacity(READ_BUFFER_SIZE),
                         read_buf: Vec::new(),
                         read_pos: 0,
-                        write_buf: BytesMut::with_capacity(BUFFER_SIZE),
+                        write_buf: BytesMut::with_capacity(WRITE_BUFFER_SIZE),
                         closed: false,
                     };
 
