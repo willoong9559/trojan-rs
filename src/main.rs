@@ -23,6 +23,7 @@ use bytes::Bytes;
 
 const BUF_SIZE: usize = 4096;
 const UDP_CHANNEL_BUFFER_SIZE: usize = 64;
+const TCP_IDLE_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TransportMode {
@@ -220,46 +221,54 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     let (mut client_read, mut client_write) = tokio::io::split(client_stream);
     let (mut remote_read, mut remote_write) = tokio::io::split(remote_stream);
 
-    let client_to_remote = async {
+    // 活动时间跟踪器，用于超时检测
+    let last_activity = Arc::new(Mutex::new(SystemTime::now()));
+
+    let last_activity_clone1 = Arc::clone(&last_activity);
+    let last_activity_clone2 = Arc::clone(&last_activity);
+
+    let client_to_remote = async move {
         let mut buf = vec![0u8; BUF_SIZE];
         loop {
             let n = client_read.read(&mut buf).await?;
             if n == 0 { break; }
-            // 使用 write_all 确保数据完整写入，避免部分写入导致的数据堆积
+            *last_activity_clone1.lock().await = SystemTime::now();
             remote_write.write_all(&buf[..n]).await?;
-            // 刷新缓冲区，减少内存占用
-            remote_write.flush().await?;
         }
         Ok::<(), anyhow::Error>(())
     };
 
-    let remote_to_client = async {
+    let remote_to_client = async move {
         let mut buf = vec![0u8; BUF_SIZE];
         loop {
             let n = remote_read.read(&mut buf).await?;
             if n == 0 { break; }
-            // 使用 write_all 确保数据完整写入
+            *last_activity_clone2.lock().await = SystemTime::now();
             client_write.write_all(&buf[..n]).await?;
-            // 刷新缓冲区，减少内存占用
-            client_write.flush().await?;
         }
         Ok::<(), anyhow::Error>(())
     };
 
+    // 超时检查任务
+    let timeout_check = async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            let last = *last_activity.lock().await;
+            if let Ok(elapsed) = SystemTime::now().duration_since(last) {
+                if elapsed.as_secs() >= TCP_IDLE_TIMEOUT_SECS {
+                    return Ok::<(), anyhow::Error>(());
+                }
+            }
+        }
+    };
+
     tokio::select! {
-        result = client_to_remote => {
-            if let Err(e) = result {
-                log::error!(peer = %peer_addr, error = %e, "Client to remote error");
-            }
-        },
-        result = remote_to_client => {
-            if let Err(e) = result {
-                log::error!(peer = %peer_addr, error = %e, "Remote to client error");
-            }
-        },
+        _ = client_to_remote => {},
+        _ = remote_to_client => {},
+        _ = timeout_check => {},
     }
 
-    log::info!(peer = %peer_addr, "Connection closed");
     Ok(())
 }
 
