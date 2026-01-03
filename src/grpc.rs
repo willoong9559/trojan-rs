@@ -280,17 +280,23 @@ impl AsyncRead for GrpcH2cTransport {
         loop {
             match parse_grpc_message(&self.read_pending) {
                 Ok(Some((consumed, payload))) => {
-                    let _ = self.recv_stream.flow_control().release_capacity(consumed);
-                    
                     let to_copy = payload.len().min(buf.remaining());
-                    buf.put_slice(&payload[..to_copy]);
+                    let payload_data = Bytes::copy_from_slice(&payload[..to_copy]);
+                    let remaining_data = if to_copy < payload.len() {
+                        Some(Bytes::copy_from_slice(&payload[to_copy..]))
+                    } else {
+                        None
+                    };
                     
-                    if to_copy < payload.len() {
-                        self.read_buf = Bytes::copy_from_slice(&payload[to_copy..]);
+                    let _ = self.recv_stream.flow_control().release_capacity(consumed);
+                    self.read_pending.advance(consumed);
+                    
+                    buf.put_slice(&payload_data);
+                    
+                    if let Some(remaining) = remaining_data {
+                        self.read_buf = remaining;
                         self.read_pos = 0;
                     }
-                    
-                    self.read_pending.advance(consumed);
                     
                     return Poll::Ready(Ok(()));
                 }
