@@ -105,7 +105,7 @@ where
                         recv_stream,
                         send_stream,
                         read_pending: BytesMut::with_capacity(READ_BUFFER_SIZE),
-                        read_buf: Vec::new(),
+                        read_buf: Bytes::new(),
                         read_pos: 0,
                         write_buf: BytesMut::with_capacity(WRITE_BUFFER_SIZE),
                         closed: false,
@@ -136,7 +136,7 @@ pub struct GrpcH2cTransport {
     recv_stream: RecvStream,
     send_stream: SendStream<Bytes>,
     read_pending: BytesMut,
-    read_buf: Vec<u8>,
+    read_buf: Bytes,
     read_pos: usize,
     write_buf: BytesMut,
     closed: bool,
@@ -271,7 +271,7 @@ impl AsyncRead for GrpcH2cTransport {
             self.read_pos += to_copy;
 
             if self.read_pos >= self.read_buf.len() {
-                self.read_buf.clear();
+                self.read_buf = Bytes::new();
                 self.read_pos = 0;
             }
             return Poll::Ready(Ok(()));
@@ -286,7 +286,7 @@ impl AsyncRead for GrpcH2cTransport {
                     buf.put_slice(&payload[..to_copy]);
                     
                     if to_copy < payload.len() {
-                        self.read_buf = payload[to_copy..].to_vec();
+                        self.read_buf = Bytes::copy_from_slice(&payload[to_copy..]);
                         self.read_pos = 0;
                     }
                     

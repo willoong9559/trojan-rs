@@ -4,12 +4,13 @@ use futures_util::{Stream, Sink};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::io;
+use bytes::Bytes;
 
 pub struct WebSocketTransport<S> {
     ws_stream: Pin<Box<TungsteniteStream<S>>>,
-    read_buffer: Vec<u8>,
+    read_buffer: Bytes,
     read_pos: usize,
-    write_buffer: Vec<u8>,
+    write_buffer: Vec<u8>,  // 保持 Vec<u8>， WebSocket 库需要
     write_pending: bool,
     closed: bool,
 }
@@ -21,7 +22,7 @@ where
     pub fn new(ws_stream: TungsteniteStream<S>) -> Self {
         Self {
             ws_stream: Box::pin(ws_stream),
-            read_buffer: Vec::new(),
+            read_buffer: Bytes::new(),
             read_pos: 0,
             write_buffer: Vec::new(),
             write_pending: false,
@@ -51,7 +52,7 @@ where
             self.read_pos += to_copy;
 
             if self.read_pos >= self.read_buffer.len() {
-                self.read_buffer.clear();
+                self.read_buffer = Bytes::new();
                 self.read_pos = 0;
             }
 
@@ -65,8 +66,8 @@ where
                 buf.put_slice(&data[..to_copy]);
 
                 if to_copy < data.len() {
-                    self.read_buffer = data;
-                    self.read_pos = to_copy;
+                    self.read_buffer = Bytes::copy_from_slice(&data[to_copy..]);
+                    self.read_pos = 0;
                 }
 
                 Poll::Ready(Ok(()))

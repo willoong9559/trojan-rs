@@ -60,7 +60,7 @@ pub struct TrojanRequest {
     pub password: [u8; 56],
     pub cmd: TrojanCmd,
     pub addr: socks5::Address,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
 }
 
 impl TrojanRequest {
@@ -111,7 +111,9 @@ impl TrojanRequest {
                 if buf.len() < cursor + domain_len + 2 {
                     return Err(anyhow!("Buffer too small for domain"));
                 }
-                let domain = String::from_utf8(buf[cursor..cursor + domain_len].to_vec())?;
+                let domain = std::str::from_utf8(&buf[cursor..cursor + domain_len])
+                    .map_err(|e| anyhow!("Invalid UTF-8 domain: {}", e))?
+                    .to_string();
                 cursor += domain_len;
                 let port = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
                 cursor += 2;
@@ -136,7 +138,7 @@ impl TrojanRequest {
         }
         cursor += 2;
 
-        let payload = buf[cursor..].to_vec();
+        let payload = Bytes::copy_from_slice(&buf[cursor..]);
 
         Ok((TrojanRequest {
             password,
@@ -203,7 +205,7 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + 'static>(
 async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     client_stream: S,
     target_addr: socks5::Address,
-    initial_payload: Vec<u8>,
+    initial_payload: Bytes,
     peer_addr: String,
 ) -> Result<()> {
     log::info!(peer = %peer_addr, target = %target_addr.to_key(), "Connecting to target");
@@ -212,7 +214,6 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     let mut remote_stream = TcpStream::connect(remote_addr).await?;
     log::info!(peer = %peer_addr, remote = %remote_addr, "Connected to remote server");
 
-    // 发送初始载荷
     if !initial_payload.is_empty() {
         remote_stream.write_all(&initial_payload).await?;
     }
@@ -369,11 +370,10 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
                                 SocketAddr::V6(v6) => socks5::Address::IPv6(v6.ip().octets(), v6.port()),
                             };
                             
-                            // 优化：Bytes可以直接转换为Vec，避免额外复制
                             let udp_packet = udp::UdpPacket {
                                 addr,
                                 length: data.len() as u16,
-                                payload: data.to_vec(), // Bytes转Vec，但这是必要的（UdpPacket需要Vec）
+                                payload: data,
                             };
                             
                             let encoded = udp_packet.encode();

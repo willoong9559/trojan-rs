@@ -25,10 +25,10 @@ fn load_tls_config_with_transport_mode(cert_path: &str, key_path: &str, transpor
     let mut config = load_tls_config(cert_path, key_path)?;
     config.alpn_protocols = match transport_mode {
         TransportMode::Grpc => {
-            vec![b"h2".to_vec()]
+            vec![Vec::from(b"h2")]
         }
         _ => {
-            vec![b"http/1.1".to_vec()]
+            vec![Vec::from(b"http/1.1")]
         }
     };
     Ok(TlsAcceptor::from(Arc::new(config)))

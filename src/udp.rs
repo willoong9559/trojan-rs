@@ -5,6 +5,7 @@ use tokio::sync::{Mutex};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Result, anyhow};
+use bytes::Bytes;
 
 pub const UDP_TIMEOUT: u64 = 60; // UDP association timeout in seconds;
 
@@ -75,7 +76,7 @@ impl UdpAssociation {
 pub struct UdpPacket {
     pub addr: socks5::Address,
     pub length: u16,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
 }
 
 impl UdpPacket {
@@ -109,7 +110,9 @@ impl UdpPacket {
                 if buf.len() < cursor + domain_len + 2 {
                     return Err(anyhow!("Buffer too small for domain"));
                 }
-                let domain = String::from_utf8(buf[cursor..cursor + domain_len].to_vec())?;
+                let domain = std::str::from_utf8(&buf[cursor..cursor + domain_len])
+                    .map_err(|e| anyhow!("Invalid UTF-8 domain: {}", e))?
+                    .to_string();
                 cursor += domain_len;
                 let port = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
                 cursor += 2;
@@ -142,11 +145,10 @@ impl UdpPacket {
         }
         cursor += 2;
 
-        // Read payload
         if buf.len() < cursor + length as usize {
             return Err(anyhow!("Buffer too small for payload"));
         }
-        let payload = buf[cursor..cursor + length as usize].to_vec();
+        let payload = Bytes::copy_from_slice(&buf[cursor..cursor + length as usize]);
         cursor += length as usize;
 
         Ok((UdpPacket {
