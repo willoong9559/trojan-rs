@@ -145,7 +145,7 @@ pub struct GrpcH2cTransport {
 /// 解析 gRPC 消息帧（兼容 v2ray 格式）
 /// 
 /// 格式：5字节 gRPC 头部 + protobuf 头部 + 数据
-fn parse_grpc_message(buf: &BytesMut) -> io::Result<Option<(usize, Vec<u8>)>> {
+fn parse_grpc_message(buf: &BytesMut) -> io::Result<Option<(usize, &[u8])>> {
     if buf.len() < 6 {
         return Ok(None);
     }
@@ -182,7 +182,7 @@ fn parse_grpc_message(buf: &BytesMut) -> io::Result<Option<(usize, Vec<u8>)>> {
         ));
     }
 
-    let payload = buf[data_start..data_end].to_vec();
+    let payload = &buf[data_start..data_end];
     let consumed = 5 + grpc_frame_len;
     
     Ok(Some((consumed, payload)))
@@ -281,15 +281,16 @@ impl AsyncRead for GrpcH2cTransport {
             match parse_grpc_message(&self.read_pending) {
                 Ok(Some((consumed, payload))) => {
                     let _ = self.recv_stream.flow_control().release_capacity(consumed);
-                    self.read_pending.advance(consumed);
                     
                     let to_copy = payload.len().min(buf.remaining());
                     buf.put_slice(&payload[..to_copy]);
                     
                     if to_copy < payload.len() {
-                        self.read_buf = payload;
-                        self.read_pos = to_copy;
+                        self.read_buf = payload[to_copy..].to_vec();
+                        self.read_pos = 0;
                     }
+                    
+                    self.read_pending.advance(consumed);
                     
                     return Poll::Ready(Ok(()));
                 }
