@@ -13,7 +13,8 @@ use logger::log;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -222,18 +223,19 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     let (mut client_read, mut client_write) = tokio::io::split(client_stream);
     let (mut remote_read, mut remote_write) = tokio::io::split(remote_stream);
 
-    // 活动时间跟踪器，用于超时检测
-    let last_activity = Arc::new(Mutex::new(SystemTime::now()));
+    let start_time = Instant::now();
+    let last_activity = Arc::new(AtomicU64::new(0));
 
     let last_activity_clone1 = Arc::clone(&last_activity);
     let last_activity_clone2 = Arc::clone(&last_activity);
+    let start_time_clone = start_time;
 
     let client_to_remote = async move {
         let mut buf = vec![0u8; BUF_SIZE];
         loop {
             let n = client_read.read(&mut buf).await?;
             if n == 0 { break; }
-            *last_activity_clone1.lock().await = SystemTime::now();
+            last_activity_clone1.store(start_time_clone.elapsed().as_nanos() as u64, Ordering::Relaxed);
             remote_write.write_all(&buf[..n]).await?;
         }
         Ok::<(), anyhow::Error>(())
@@ -244,22 +246,21 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         loop {
             let n = remote_read.read(&mut buf).await?;
             if n == 0 { break; }
-            *last_activity_clone2.lock().await = SystemTime::now();
+            last_activity_clone2.store(start_time_clone.elapsed().as_nanos() as u64, Ordering::Relaxed);
             client_write.write_all(&buf[..n]).await?;
         }
         Ok::<(), anyhow::Error>(())
     };
 
-    // 超时检查任务
     let timeout_check = async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+        let timeout_nanos = (TCP_IDLE_TIMEOUT_SECS as u64) * 1_000_000_000;
         loop {
             interval.tick().await;
-            let last = *last_activity.lock().await;
-            if let Ok(elapsed) = SystemTime::now().duration_since(last) {
-                if elapsed.as_secs() >= TCP_IDLE_TIMEOUT_SECS {
-                    return Ok::<(), anyhow::Error>(());
-                }
+            let last_nanos = last_activity.load(Ordering::Relaxed);
+            let elapsed_nanos = start_time.elapsed().as_nanos() as u64;
+            if elapsed_nanos.saturating_sub(last_nanos) >= timeout_nanos {
+                return Ok::<(), anyhow::Error>(());
             }
         }
     };
