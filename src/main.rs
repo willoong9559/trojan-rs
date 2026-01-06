@@ -21,7 +21,7 @@ use anyhow::{Result, anyhow};
 use tokio_rustls::{TlsAcceptor};
 use bytes::Bytes;
 
-const BUF_SIZE: usize = 4096;
+const BUF_SIZE: usize = 32 * 1024;
 const UDP_CHANNEL_BUFFER_SIZE: usize = 64;
 const TCP_IDLE_TIMEOUT_SECS: u64 = 60;
 
