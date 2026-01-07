@@ -26,6 +26,10 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = false)]
     pub enable_grpc: bool,
 
+    /// Enable UDP support
+    #[arg(long, default_value_t = true)]
+    pub enable_udp: bool,
+
     /// TLS certificate file path (optional)
     #[arg(long)]
     pub cert: Option<String>,
@@ -83,6 +87,9 @@ impl ServerConfig {
             if !config.enable_grpc {
                 config.enable_grpc = file_config.enable_grpc;
             }
+            if config.enable_udp {
+                config.enable_udp = file_config.enable_udp;
+            }
             if config.cert.is_none() {
                 config.cert = file_config.cert;
             }
@@ -129,6 +136,13 @@ pub struct ServerSettings {
 
     #[serde(default)]
     pub enable_grpc: bool,
+
+    #[serde(default = "default_enable_udp")]
+    pub enable_udp: bool,
+}
+
+const fn default_enable_udp() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +179,7 @@ impl TomlConfig {
                 password: "your_password_here".to_string(),
                 enable_ws: true,
                 enable_grpc: false,
+                enable_udp: true,
             },
             tls: Some(TlsSettings {
                 cert: "/path/to/cert.pem".to_string(),
@@ -188,6 +203,7 @@ impl TomlConfig {
             password: self.server.password,
             enable_ws: self.server.enable_ws,
             enable_grpc: self.server.enable_grpc,
+            enable_udp: self.server.enable_udp,
             cert: self.tls.as_ref().map(|t| t.cert.clone()),
             key: self.tls.as_ref().map(|t| t.key.clone()),
             config_file: None,

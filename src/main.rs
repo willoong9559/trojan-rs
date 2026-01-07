@@ -37,6 +37,7 @@ pub struct Server {
     pub listener: TcpListener,
     pub password: [u8; 56],
     pub transport_mode: TransportMode,
+    pub enable_udp: bool,
     pub udp_associations: Arc<Mutex<HashMap<String, udp::UdpAssociation>>>,
     pub tls_acceptor: Option<TlsAcceptor>,
 }
@@ -196,6 +197,10 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + 'static>(
             handle_connect(stream, request.addr, request.payload, peer_addr).await
         }
         TrojanCmd::UdpAssociate => {
+            if !server.enable_udp {
+                log::warn!(peer = %peer_addr, "UDP associate request rejected: UDP support is disabled");
+                return Err(anyhow!("UDP support is disabled"));
+            }
             handle_udp_associate(server, stream, request.addr, peer_addr).await
         }
     }
@@ -532,6 +537,7 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         listener,
         password,
         transport_mode,
+        enable_udp: config.enable_udp,
         udp_associations: Arc::new(Mutex::new(HashMap::new())),
         tls_acceptor,
     })
