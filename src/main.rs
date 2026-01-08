@@ -23,7 +23,6 @@ use bytes::Bytes;
 
 const BUF_SIZE: usize = 4 * 1024;
 const UDP_CHANNEL_BUFFER_SIZE: usize = 64;
-const TCP_IDLE_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TransportMode {
@@ -213,6 +212,7 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     initial_payload: Bytes,
     peer_addr: String,
 ) -> Result<()> {
+    const LONG_LIVED_CONNECTION_TIMEOUT_SECS: u64 = 3600; // 1小时
     log::info!(peer = %peer_addr, target = %target_addr.to_key(), "Connecting to target");
     
     let remote_addr = target_addr.to_socket_addr().await?;
@@ -259,13 +259,15 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     };
 
     let timeout_check = async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
         interval.tick().await;
-        let timeout_duration = tokio::time::Duration::from_secs(TCP_IDLE_TIMEOUT_SECS);
+        let timeout_duration = tokio::time::Duration::from_secs(LONG_LIVED_CONNECTION_TIMEOUT_SECS);
         loop {
             interval.tick().await;
             let last_activity_guard = last_activity.lock().await;
-            if last_activity_guard.elapsed() >= timeout_duration {
+            let idle_time = last_activity_guard.elapsed();
+            if idle_time >= timeout_duration {
+                log::warn!(peer = %peer_addr, idle_secs = idle_time.as_secs(), "Connection timeout due to inactivity");
                 return Ok::<(), anyhow::Error>(());
             }
         }
@@ -418,17 +420,26 @@ where
 {
     match server.transport_mode {
         TransportMode::Grpc => {
-            // 创建 gRPC 连接管理器，支持多路复用（兼容 v2ray）
+            let peer_addr_for_log = peer_addr.clone();
+            log::info!(peer = %peer_addr_for_log, "gRPC connection established, waiting for streams");
             let grpc_conn = grpc::GrpcH2cConnection::new(stream).await?;
-            // 运行连接管理器，为每个流启动独立的处理任务
-            grpc_conn.run(move |transport| {
+            let result = grpc_conn.run(move |transport| {
                 let server = Arc::clone(&server);
                 let peer_addr = peer_addr.clone();
                 async move {
                     handle_connection(server, transport, peer_addr).await
                 }
-            }).await?;
-            Ok(())
+            }).await;
+            
+            match &result {
+                Ok(()) => {
+                    log::info!(peer = %peer_addr_for_log, "gRPC connection closed normally");
+                }
+                Err(e) => {
+                    log::warn!(peer = %peer_addr_for_log, error = %e, "gRPC connection closed with error");
+                }
+            }
+            result
         }
         TransportMode::WebSocket => {
             let ws_stream = tokio_tungstenite::accept_async(stream).await?;
