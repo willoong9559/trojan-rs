@@ -13,7 +13,6 @@ use logger::log;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -22,9 +21,9 @@ use anyhow::{Result, anyhow};
 use tokio_rustls::{TlsAcceptor};
 use bytes::Bytes;
 
-const BUF_SIZE: usize = 32 * 1024;
+const BUF_SIZE: usize = 4 * 1024;
 const UDP_CHANNEL_BUFFER_SIZE: usize = 64;
-const TCP_IDLE_TIMEOUT_SECS: u64 = 60;
+const TCP_IDLE_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TransportMode {
@@ -228,19 +227,21 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     let (mut client_read, mut client_write) = tokio::io::split(client_stream);
     let (mut remote_read, mut remote_write) = tokio::io::split(remote_stream);
 
-    let start_time = Instant::now();
-    let last_activity = Arc::new(AtomicU64::new(0));
+    let last_activity = Arc::new(Mutex::new(Instant::now()));
 
     let last_activity_clone1 = Arc::clone(&last_activity);
     let last_activity_clone2 = Arc::clone(&last_activity);
-    let start_time_clone = start_time;
+
+    if !initial_payload.is_empty() {
+        *last_activity.lock().await = Instant::now();
+    }
 
     let client_to_remote = async move {
         let mut buf = vec![0u8; BUF_SIZE];
         loop {
             let n = client_read.read(&mut buf).await?;
             if n == 0 { break; }
-            last_activity_clone1.store(start_time_clone.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            *last_activity_clone1.lock().await = Instant::now();
             remote_write.write_all(&buf[..n]).await?;
         }
         Ok::<(), anyhow::Error>(())
@@ -251,7 +252,7 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         loop {
             let n = remote_read.read(&mut buf).await?;
             if n == 0 { break; }
-            last_activity_clone2.store(start_time_clone.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            *last_activity_clone2.lock().await = Instant::now();
             client_write.write_all(&buf[..n]).await?;
         }
         Ok::<(), anyhow::Error>(())
@@ -259,12 +260,12 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
 
     let timeout_check = async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
-        let timeout_nanos = (TCP_IDLE_TIMEOUT_SECS as u64) * 1_000_000_000;
+        interval.tick().await;
+        let timeout_duration = tokio::time::Duration::from_secs(TCP_IDLE_TIMEOUT_SECS);
         loop {
             interval.tick().await;
-            let last_nanos = last_activity.load(Ordering::Relaxed);
-            let elapsed_nanos = start_time.elapsed().as_nanos() as u64;
-            if elapsed_nanos.saturating_sub(last_nanos) >= timeout_nanos {
+            let last_activity_guard = last_activity.lock().await;
+            if last_activity_guard.elapsed() >= timeout_duration {
                 return Ok::<(), anyhow::Error>(());
             }
         }
