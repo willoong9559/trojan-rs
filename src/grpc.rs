@@ -9,6 +9,7 @@ use http::{Response, StatusCode};
 use anyhow::Result;
 use futures_util::Future;
 use tokio::sync::Semaphore;
+use tracing::warn;
 
 const READ_BUFFER_SIZE: usize = 256 * 1024;
 const WRITE_BUFFER_SIZE: usize = 128 * 1024;
@@ -82,7 +83,10 @@ where
 
                     let send_stream = match respond.send_response(response, false) {
                         Ok(stream) => stream,
-                        Err(_) => continue,
+                        Err(e) => {
+                            warn!(error = %e, "Failed to send gRPC response");
+                            continue;
+                        }
                     };
 
                     let recv_stream = request.into_body();
@@ -114,13 +118,17 @@ where
                     let handler_clone = Arc::clone(&handler);
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let _ = handler_clone(transport).await;
+                        if let Err(_e) = handler_clone(transport).await {
+                            // 记录流处理错误，但不影响其他流
+                        }
                     });
                 }
                 Some(Err(e)) => {
+                    warn!(error = %e, "gRPC connection error, closing connection");
                     return Err(anyhow::anyhow!("gRPC connection error: {}", e));
                 }
                 None => {
+                    // 正常关闭
                     break;
                 }
             }

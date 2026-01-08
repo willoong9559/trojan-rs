@@ -236,13 +236,26 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         *last_activity.lock().await = Instant::now();
     }
 
+    let peer_addr_for_log1 = peer_addr.clone();
+    let peer_addr_for_log2 = peer_addr.clone();
+    
     let client_to_remote = async move {
         let mut buf = vec![0u8; BUF_SIZE];
         loop {
-            let n = client_read.read(&mut buf).await?;
-            if n == 0 { break; }
-            *last_activity_clone1.lock().await = Instant::now();
-            remote_write.write_all(&buf[..n]).await?;
+            match client_read.read(&mut buf).await {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    *last_activity_clone1.lock().await = Instant::now();
+                    if let Err(e) = remote_write.write_all(&buf[..n]).await {
+                        log::debug!(peer = %peer_addr_for_log1, error = %e, "Error writing to remote");
+                        break;
+                    }
+                }
+                Err(e) => {
+                    log::debug!(peer = %peer_addr_for_log1, error = %e, "Error reading from client");
+                    break;
+                }
+            }
         }
         Ok::<(), anyhow::Error>(())
     };
@@ -250,10 +263,20 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     let remote_to_client = async move {
         let mut buf = vec![0u8; BUF_SIZE];
         loop {
-            let n = remote_read.read(&mut buf).await?;
-            if n == 0 { break; }
-            *last_activity_clone2.lock().await = Instant::now();
-            client_write.write_all(&buf[..n]).await?;
+            match remote_read.read(&mut buf).await {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    *last_activity_clone2.lock().await = Instant::now();
+                    if let Err(e) = client_write.write_all(&buf[..n]).await {
+                        log::debug!(peer = %peer_addr_for_log2, error = %e, "Error writing to client");
+                        break;
+                    }
+                }
+                Err(e) => {
+                    log::debug!(peer = %peer_addr_for_log2, error = %e, "Error reading from remote");
+                    break;
+                }
+            }
         }
         Ok::<(), anyhow::Error>(())
     };
