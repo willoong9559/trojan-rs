@@ -49,87 +49,106 @@ where
         F: Fn(GrpcH2cTransport) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
+        const CONNECTION_IDLE_TIMEOUT_SECS: u64 = 300; // 5分钟无新流则关闭连接
+        
         let handler = Arc::new(handler);
         let mut h2_conn = self.h2_conn;
         let stream_semaphore = self.stream_semaphore;
+        let mut last_stream_time = std::time::Instant::now();
         
         loop {
-            match h2_conn.accept().await {
-                Some(Ok((request, mut respond))) => {
-                    if request.method() != http::Method::POST {
-                        let response = Response::builder()
-                            .status(StatusCode::METHOD_NOT_ALLOWED)
-                            .body(())
-                            .unwrap();
-                        let _ = respond.send_response(response, true);
-                        continue;
-                    }
+            let accept_future = h2_conn.accept();
+            let timeout_future = tokio::time::sleep(tokio::time::Duration::from_secs(30));
+            
+            tokio::select! {
+                result = accept_future => {
+                    match result {
+                        Some(Ok((request, mut respond))) => {
+                            last_stream_time = std::time::Instant::now();
+                            
+                            if request.method() != http::Method::POST {
+                                let response = Response::builder()
+                                    .status(StatusCode::METHOD_NOT_ALLOWED)
+                                    .body(())
+                                    .unwrap();
+                                let _ = respond.send_response(response, true);
+                                continue;
+                            }
 
-                    let path = request.uri().path();
-                    if !path.ends_with("/Tun") {
-                        let response = Response::builder()
-                            .status(StatusCode::NOT_FOUND)
-                            .body(())
-                            .unwrap();
-                        let _ = respond.send_response(response, true);
-                        continue;
-                    }
+                            let path = request.uri().path();
+                            if !path.ends_with("/Tun") {
+                                let response = Response::builder()
+                                    .status(StatusCode::NOT_FOUND)
+                                    .body(())
+                                    .unwrap();
+                                let _ = respond.send_response(response, true);
+                                continue;
+                            }
 
-                    let response = Response::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "application/grpc")
-                        .body(())
-                        .unwrap();
-
-                    let send_stream = match respond.send_response(response, false) {
-                        Ok(stream) => stream,
-                        Err(e) => {
-                            warn!(error = %e, "Failed to send gRPC response");
-                            continue;
-                        }
-                    };
-
-                    let recv_stream = request.into_body();
-
-                    let permit = match stream_semaphore.clone().try_acquire_owned() {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            // 流数量已达上限，拒绝请求
                             let response = Response::builder()
-                                .status(StatusCode::SERVICE_UNAVAILABLE)
-                                .header("grpc-status", "8")  // RESOURCE_EXHAUSTED
+                                .status(StatusCode::OK)
+                                .header("content-type", "application/grpc")
                                 .body(())
                                 .unwrap();
-                            let _ = respond.send_response(response, true);
-                            continue;
-                        }
-                    };
 
-                    let transport = GrpcH2cTransport {
-                        recv_stream,
-                        send_stream,
-                        read_pending: BytesMut::with_capacity(READ_BUFFER_SIZE),
-                        read_buf: Bytes::new(),
-                        read_pos: 0,
-                        write_buf: BytesMut::with_capacity(WRITE_BUFFER_SIZE),
-                        closed: false,
-                    };
+                            let send_stream = match respond.send_response(response, false) {
+                                Ok(stream) => stream,
+                                Err(e) => {
+                                    warn!(error = %e, "Failed to send gRPC response");
+                                    continue;
+                                }
+                            };
 
-                    let handler_clone = Arc::clone(&handler);
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        if let Err(_e) = handler_clone(transport).await {
-                            // 记录流处理错误，但不影响其他流
+                            let recv_stream = request.into_body();
+
+                            let permit = match stream_semaphore.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    // 流数量已达上限，拒绝请求
+                                    let response = Response::builder()
+                                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                                        .header("grpc-status", "8")  // RESOURCE_EXHAUSTED
+                                        .body(())
+                                        .unwrap();
+                                    let _ = respond.send_response(response, true);
+                                    continue;
+                                }
+                            };
+
+                            let transport = GrpcH2cTransport {
+                                recv_stream,
+                                send_stream,
+                                read_pending: BytesMut::with_capacity(READ_BUFFER_SIZE),
+                                read_buf: Bytes::new(),
+                                read_pos: 0,
+                                write_buf: BytesMut::with_capacity(WRITE_BUFFER_SIZE),
+                                closed: false,
+                            };
+
+                            let handler_clone = Arc::clone(&handler);
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                if let Err(_e) = handler_clone(transport).await {
+                                    // 记录流处理错误，但不影响其他流
+                                }
+                            });
                         }
-                    });
+                        Some(Err(e)) => {
+                            warn!(error = %e, "gRPC connection error, closing connection");
+                            return Err(anyhow::anyhow!("gRPC connection error: {}", e));
+                        }
+                        None => {
+                            // 正常关闭
+                            break;
+                        }
+                    }
                 }
-                Some(Err(e)) => {
-                    warn!(error = %e, "gRPC connection error, closing connection");
-                    return Err(anyhow::anyhow!("gRPC connection error: {}", e));
-                }
-                None => {
-                    // 正常关闭
-                    break;
+                _ = timeout_future => {
+                    let idle_time = last_stream_time.elapsed();
+                    if idle_time.as_secs() >= CONNECTION_IDLE_TIMEOUT_SECS {
+                        warn!(idle_secs = idle_time.as_secs(), "gRPC connection idle timeout, closing");
+                        break;
+                    }
                 }
             }
         }
