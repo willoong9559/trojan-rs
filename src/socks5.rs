@@ -1,6 +1,8 @@
 use std::net::{IpAddr, SocketAddr};
 use anyhow::{Result, anyhow};
 
+const DNS_RESOLVE_TIMEOUT_SECS: u64 = 10;
+
 // SOCKS5 Address types
 #[derive(Debug, Clone, Copy)]
 pub enum _AddressType {
@@ -37,7 +39,12 @@ impl Address {
                 Ok(SocketAddr::new(addr, *port))
             }
             Address::Domain(domain, port) => {
-                let addrs = tokio::net::lookup_host((domain.as_str(), *port)).await?;
+                let addrs = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(DNS_RESOLVE_TIMEOUT_SECS),
+                    tokio::net::lookup_host((domain.as_str(), *port)),
+                )
+                .await
+                .map_err(|_| anyhow!("DNS resolution timeout after {} seconds", DNS_RESOLVE_TIMEOUT_SECS))??;
                 addrs.into_iter().next()
                     .ok_or_else(|| anyhow!("Failed to resolve domain: {}", domain))
             }

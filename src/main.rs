@@ -25,6 +25,7 @@ const BUF_SIZE: usize = 4 * 1024;
 const UDP_CHANNEL_BUFFER_SIZE: usize = 64;
 
 const CONNECTION_TIMEOUT_SECS: u64 = 300;
+const TCP_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TransportMode {
@@ -217,7 +218,25 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     log::info!(peer = %peer_addr, target = %target_addr.to_key(), "Connecting to target");
     
     let remote_addr = target_addr.to_socket_addr().await?;
-    let mut remote_stream = TcpStream::connect(remote_addr).await?;
+    let mut remote_stream = match tokio::time::timeout(
+        tokio::time::Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS),
+        TcpStream::connect(remote_addr),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            log::warn!(peer = %peer_addr, error = %e, "TCP connect failed");
+            return Err(e.into());
+        }
+        Err(_) => {
+            log::warn!(peer = %peer_addr, timeout_secs = TCP_CONNECT_TIMEOUT_SECS, "TCP connect timeout");
+            return Err(anyhow!(
+                "TCP connect timeout after {} seconds",
+                TCP_CONNECT_TIMEOUT_SECS
+            ));
+        }
+    };
     log::info!(peer = %peer_addr, remote = %remote_addr, "Connected to remote server");
 
     if !initial_payload.is_empty() {
