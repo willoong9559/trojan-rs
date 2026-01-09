@@ -27,6 +27,22 @@ cargo build --release
 # 可执行文件位于 target/release/trojan-rs
 ```
 
+### 针对 CPU 的优化编译
+
+在支持的环境下，你可以使用 `target-cpu=native` 等选项为当前机器 CPU 做更激进的优化（适合自行部署的服务器场景）：
+
+```bash
+# 使用 RUSTFLAGS 为当前 CPU 优化并开启较高优化级别
+RUSTFLAGS="-C target-cpu=native -C opt-level=3" cargo build --release
+
+# 或使用 cargo rustc 显式传递编译参数
+cargo rustc --release -- -C target-cpu=native -C opt-level=3
+```
+
+> **提示**：
+> - 这些优化通常会提升性能，但生成的二进制可能无法在较老或不同指令集的 CPU 上运行。
+> - 如果需要在多种不同 CPU 上分发二进制，请继续使用默认的 `cargo build --release`。
+
 ## 使用方法
 
 ### 命令行参数
