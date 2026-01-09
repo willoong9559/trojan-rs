@@ -10,7 +10,7 @@ mod logger;
 
 use logger::log;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
@@ -353,11 +353,13 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
         association
     };
 
-    let (udp_tx, mut udp_rx) = mpsc::channel::<(SocketAddr, Bytes)>(UDP_CHANNEL_BUFFER_SIZE);
+    // 使用固定大小的队列，当满了时自动移除最旧的元素
+    let udp_queue = Arc::new(Mutex::new(VecDeque::<(SocketAddr, Bytes)>::with_capacity(UDP_CHANNEL_BUFFER_SIZE)));
+    let udp_queue_clone = Arc::clone(&udp_queue);
+    let (udp_tx, mut udp_rx) = mpsc::unbounded_channel::<()>();
     let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
     let socket_clone = Arc::clone(&udp_association.socket);
-    let udp_tx_clone = udp_tx.clone();
     let association_clone = udp_association.clone();
     
     let udp_recv_handle = tokio::spawn(async move {
@@ -374,9 +376,16 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
                             
                             let data = Bytes::copy_from_slice(&buf[..len]);
                             
-                            if udp_tx_clone.try_send((from_addr, data)).is_err() {
-                                // 通道已满，丢弃数据
+                            let mut queue = udp_queue_clone.lock().await;
+                            // 如果队列已满，移除最旧的元素（FIFO）
+                            if queue.len() >= UDP_CHANNEL_BUFFER_SIZE {
+                                queue.pop_front();
                             }
+                            queue.push_back((from_addr, data));
+                            drop(queue);
+                            
+                            // 通知接收端有新数据
+                            let _ = udp_tx.send(());
                         }
                         Err(e) => {
                             log::debug!("UDP socket recv error: {}", e);
@@ -427,10 +436,15 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                 }
                 
-                // 从通道接收UDP响应并发送回客户端
-                udp_msg = udp_rx.recv() => {
-                    match udp_msg {
-                        Some((from_addr, data)) => {
+                // 从队列接收UDP响应并发送回客户端
+                _ = udp_rx.recv() => {
+                    loop {
+                        let packet = {
+                            let mut queue = udp_queue.lock().await;
+                            queue.pop_front()
+                        };
+                        
+                        if let Some((from_addr, data)) = packet {
                             let addr = match from_addr {
                                 SocketAddr::V4(v4) => socks5::Address::IPv4(v4.ip().octets(), v4.port()),
                                 SocketAddr::V6(v6) => socks5::Address::IPv6(v6.ip().octets(), v6.port()),
@@ -448,8 +462,8 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
                                 log::debug!(peer = %peer_addr, error = %e, "Error writing UDP response to client");
                                 break;
                             }
-                        }
-                        None => {
+                        } else {
+                            // 队列为空，退出循环
                             break;
                         }
                     }
