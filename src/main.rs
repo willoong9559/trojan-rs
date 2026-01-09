@@ -24,6 +24,8 @@ use bytes::Bytes;
 const BUF_SIZE: usize = 4 * 1024;
 const UDP_CHANNEL_BUFFER_SIZE: usize = 64;
 
+const CONNECTION_TIMEOUT_SECS: u64 = 300;
+
 #[derive(Debug, Clone, Copy)]
 pub enum TransportMode {
     Tcp,
@@ -212,7 +214,6 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     initial_payload: Bytes,
     peer_addr: String,
 ) -> Result<()> {
-    const LONG_LIVED_CONNECTION_TIMEOUT_SECS: u64 = 3600; // 1小时
     log::info!(peer = %peer_addr, target = %target_addr.to_key(), "Connecting to target");
     
     let remote_addr = target_addr.to_socket_addr().await?;
@@ -284,7 +285,7 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     let timeout_check = async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
         interval.tick().await;
-        let timeout_duration = tokio::time::Duration::from_secs(LONG_LIVED_CONNECTION_TIMEOUT_SECS);
+        let timeout_duration = tokio::time::Duration::from_secs(CONNECTION_TIMEOUT_SECS);
         loop {
             interval.tick().await;
             let last_activity_guard = last_activity.lock().await;
@@ -519,14 +520,22 @@ impl Server {
                         let peer_addr = addr.to_string();
                         let result = async {
                             if let Some(ref tls_acceptor) = server_clone.tls_acceptor {
-                                match tls_acceptor.accept(stream).await {
-                                    Ok(tls_stream) => {
+                                const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 30; // TLS握手超时30秒
+                                match tokio::time::timeout(
+                                    tokio::time::Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS),
+                                    tls_acceptor.accept(stream)
+                                ).await {
+                                    Ok(Ok(tls_stream)) => {
                                         log::info!(peer = %peer_addr, "TLS handshake successful");
                                         accept_connection(server_clone, tls_stream, peer_addr.clone()).await
                                     }
-                                    Err(e) => {
+                                    Ok(Err(e)) => {
                                         log::error!(peer = %peer_addr, error = %e, "TLS handshake failed");
                                         Err(anyhow!("TLS handshake failed: {}", e))
+                                    }
+                                    Err(_) => {
+                                        log::warn!(peer = %peer_addr, timeout_secs = TLS_HANDSHAKE_TIMEOUT_SECS, "TLS handshake timeout");
+                                        Err(anyhow!("TLS handshake timeout after {} seconds", TLS_HANDSHAKE_TIMEOUT_SECS))
                                     }
                                 }
                             } else {

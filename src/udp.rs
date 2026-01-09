@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
 
-pub const UDP_TIMEOUT: u64 = 60; // UDP association timeout in seconds;
+pub const UDP_TIMEOUT: u64 = 300; // UDP association timeout in seconds;
 
 // UDP Association info
 #[derive(Debug, Clone)]
