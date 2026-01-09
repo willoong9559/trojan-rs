@@ -13,7 +13,7 @@ use logger::log;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH, Instant};
+use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -333,20 +333,22 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<()> {
     log::info!(peer = %peer_addr, "Starting UDP associate");
     
+    // 生成唯一的socket key
     let socket_key = format!("client_{}_{}", peer_addr, 
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis());
     
     let udp_association = {
-        let mut associations = server.udp_associations.lock().await;
         let bind_socket_addr = SocketAddr::new(
             IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 
             0
         );
         let socket = UdpSocket::bind(bind_socket_addr).await?;
         let association = udp::UdpAssociation::new(socket);
+        
+        let mut associations = server.udp_associations.lock().await;
         associations.insert(socket_key.clone(), association.clone());
         association
     };
@@ -356,30 +358,30 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
 
     let socket_clone = Arc::clone(&udp_association.socket);
     let udp_tx_clone = udp_tx.clone();
-    let activity_tracker = Arc::clone(&udp_association.last_activity);
+    let association_clone = udp_association.clone();
     
-    // 简化UDP处理逻辑，直接丢弃旧数据，不使用额外的循环缓冲区
     let udp_recv_handle = tokio::spawn(async move {
         let mut buf = vec![0u8; BUF_SIZE];
         loop {
             tokio::select! {
-                _ = &mut cancel_rx => break,
+                _ = &mut cancel_rx => {
+                    break;
+                }
                 result = socket_clone.recv_from(&mut buf) => {
                     match result {
                         Ok((len, from_addr)) => {
-                            let now = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs();
-                            *activity_tracker.lock().await = now;
+                            association_clone.update_activity();
                             
-                            // 使用Bytes::copy_from_slice，避免to_vec()复制
                             let data = Bytes::copy_from_slice(&buf[..len]);
                             
-                            // 尝试发送，如果通道满了就丢弃（不阻塞）
-                            let _ = udp_tx_clone.try_send((from_addr, data));
+                            if udp_tx_clone.try_send((from_addr, data)).is_err() {
+                                // 通道已满，丢弃数据
+                            }
                         }
-                        Err(_) => break,
+                        Err(e) => {
+                            log::debug!("UDP socket recv error: {}", e);
+                            break;
+                        }
                     }
                 }
             }
@@ -390,30 +392,42 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
         let mut read_buf = vec![0u8; BUF_SIZE];
         loop {
             tokio::select! {
-                // 从客户端读取 UDP 数据包
+                // 从客户端读取UDP数据包
                 read_result = client_stream.read(&mut read_buf) => {
                     match read_result {
-                        Ok(0) => break,
+                        Ok(0) => {
+                            break;
+                        }
                         Ok(n) => {
                             match udp::UdpPacket::decode(&read_buf[..n]) {
                                 Ok((udp_packet, _)) => {
-                                    udp_association.update_activity().await;
+                                    udp_association.update_activity();
+                                    
                                     match udp_packet.addr.to_socket_addr().await {
                                         Ok(remote_addr) => {
-                                            let _ = udp_association.socket
-                                                .send_to(&udp_packet.payload, remote_addr).await;
+                                            if let Err(e) = udp_association.socket
+                                                .send_to(&udp_packet.payload, remote_addr).await {
+                                                log::debug!(peer = %peer_addr, error = %e, "Failed to send UDP packet");
+                                            }
                                         }
-                                        Err(_) => {}
+                                        Err(e) => {
+                                            log::debug!(peer = %peer_addr, error = %e, "Failed to resolve UDP target address");
+                                        }
                                     }
                                 }
-                                Err(_) => {}
+                                Err(e) => {
+                                    log::debug!(peer = %peer_addr, error = %e, "Failed to decode UDP packet");
+                                }
                             }
                         }
-                        Err(_) => break,
+                        Err(e) => {
+                            log::debug!(peer = %peer_addr, error = %e, "Error reading from client stream");
+                            break;
+                        }
                     }
                 }
                 
-                // 将 UDP 响应发送回客户端
+                // 从通道接收UDP响应并发送回客户端
                 udp_msg = udp_rx.recv() => {
                     match udp_msg {
                         Some((from_addr, data)) => {
@@ -428,12 +442,16 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
                                 payload: data,
                             };
                             
+                            // 编码并发送回客户端
                             let encoded = udp_packet.encode();
-                            if client_stream.write_all(&encoded).await.is_err() {
+                            if let Err(e) = client_stream.write_all(&encoded).await {
+                                log::debug!(peer = %peer_addr, error = %e, "Error writing UDP response to client");
                                 break;
                             }
                         }
-                        None => break,
+                        None => {
+                            break;
+                        }
                     }
                 }
             }
@@ -442,7 +460,26 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
     }.await;
 
     let _ = cancel_tx.send(());
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), udp_recv_handle).await;
+    
+    const CLEANUP_TIMEOUT_SECS: u64 = 5;
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(CLEANUP_TIMEOUT_SECS),
+        udp_recv_handle
+    ).await {
+        Ok(Ok(_)) => {
+            // 任务正常结束
+        }
+        Ok(Err(e)) => {
+            log::warn!(peer = %peer_addr, error = %e, "UDP receive task ended with error");
+        }
+        Err(_) => {
+            log::warn!(
+                peer = %peer_addr,
+                timeout_secs = CLEANUP_TIMEOUT_SECS,
+                "UDP receive task cleanup timeout"
+            );
+        }
+    }
     
     {
         let mut associations = server.udp_associations.lock().await;
@@ -452,7 +489,7 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
     result
 }
 
-// ============ 连接检测与分发 ============
+// 连接检测与分发
 pub async fn accept_connection<S>(
     server: Arc<Server>,
     stream: S,
@@ -508,26 +545,8 @@ impl Server {
         
         log::info!(address = %addr, mode = mode, tls = tls_enabled, "Server started");
 
-        // UDP 清理任务
-        let server_cleanup = Arc::clone(&server);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(udp::UDP_TIMEOUT / 2));
-            loop {
-                interval.tick().await;
-                let mut associations = server_cleanup.udp_associations.lock().await;
-                let mut keys_to_remove = Vec::new();
-                
-                for (key, association) in associations.iter() {
-                    if association.is_inactive(udp::UDP_TIMEOUT).await {
-                        keys_to_remove.push(key.clone());
-                    }
-                }
-                
-                for key in keys_to_remove {
-                    associations.remove(&key);
-                }
-            }
-        });
+        // UDP清理任务
+        udp::start_cleanup_task(Arc::clone(&server.udp_associations));
 
         loop {
             match server.listener.accept().await {

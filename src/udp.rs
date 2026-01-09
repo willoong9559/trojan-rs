@@ -1,9 +1,12 @@
 use crate::socks5;
+use crate::logger::log;
 
-use tokio::net::{UdpSocket};
-use tokio::sync::{Mutex};
+use tokio::net::UdpSocket;
+use tokio::sync::Mutex;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+use std::collections::HashMap;
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
 
@@ -13,61 +16,48 @@ pub const UDP_TIMEOUT: u64 = 300; // UDP association timeout in seconds;
 #[derive(Debug, Clone)]
 pub struct UdpAssociation {
     pub socket: Arc<UdpSocket>,
-    pub last_activity: Arc<Mutex<u64>>, // Unix timestamp
-    pub client_count: Arc<Mutex<u32>>,  // Number of active clients using this socket
+    last_activity: Arc<AtomicU64>,
+    created_at: Instant,
 }
 
 impl UdpAssociation {
-   pub fn new(socket: UdpSocket) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+    pub fn new(socket: UdpSocket) -> Self {
+        let now = Self::current_timestamp();
         
         Self {
             socket: Arc::new(socket),
-            last_activity: Arc::new(Mutex::new(now)),
-            client_count: Arc::new(Mutex::new(1)),
+            last_activity: Arc::new(AtomicU64::new(now)),
+            created_at: Instant::now(),
         }
     }
     
-    pub async fn update_activity(&self) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        *self.last_activity.lock().await = now;
+    #[inline]
+    pub fn current_timestamp() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }
     
-    pub async fn increment_clients(&self) {
-        *self.client_count.lock().await += 1;
+    #[inline]
+    pub fn update_activity(&self) {
+        self.last_activity.store(Self::current_timestamp(), Ordering::Relaxed);
     }
     
-    pub async fn decrement_clients(&self) {
-        let mut count = self.client_count.lock().await;
-        if *count > 0 {
-            *count -= 1;
-        }
+    #[inline]
+    pub fn get_last_activity(&self) -> u64 {
+        self.last_activity.load(Ordering::Relaxed)
     }
     
-    pub async fn get_client_count(&self) -> u32 {
-        *self.client_count.lock().await
+    pub fn is_inactive(&self, timeout_secs: u64) -> bool {
+        let now = Self::current_timestamp();
+        let last_activity = self.get_last_activity();
+        (now - last_activity) > timeout_secs
     }
     
-    pub async fn get_last_activity(&self) -> u64 {
-        *self.last_activity.lock().await
-    }
-    
-    pub async fn is_inactive(&self, timeout_secs: u64) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let last_activity = self.get_last_activity().await;
-        let client_count = self.get_client_count().await;
-        
-        // Clean up if no clients and inactive for timeout period
-        client_count == 0 && (now - last_activity) > timeout_secs
+    #[inline]
+    pub fn age(&self) -> std::time::Duration {
+        self.created_at.elapsed()
     }
 }
 
@@ -159,7 +149,14 @@ impl UdpPacket {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
+        let addr_size = match &self.addr {
+            socks5::Address::IPv4(_, _) => 1 + 4 + 2, // type + ip + port
+            socks5::Address::Domain(domain, _) => 1 + 1 + domain.len() + 2, // type + len + domain + port
+            socks5::Address::IPv6(_, _) => 1 + 16 + 2, // type + ip + port
+        };
+        let total_size = addr_size + 2 + 2 + self.payload.len(); // addr + length + CRLF + payload
+        
+        let mut buf = Vec::with_capacity(total_size);
 
         match &self.addr {
             socks5::Address::IPv4(ip, port) => {
@@ -186,4 +183,46 @@ impl UdpPacket {
 
         buf
     }
+}
+
+// UDP清理任务，定期清理不活跃的UDP association
+pub fn start_cleanup_task(
+    associations: Arc<Mutex<HashMap<String, UdpAssociation>>>
+) {
+    tokio::spawn(async move {
+        const CLEANUP_INTERVAL_SECS: u64 = UDP_TIMEOUT / 2;
+        let mut interval = tokio::time::interval(
+            tokio::time::Duration::from_secs(CLEANUP_INTERVAL_SECS)
+        );
+        interval.tick().await;
+        
+        loop {
+            interval.tick().await;
+            
+            let associations_to_check: Vec<(String, UdpAssociation)> = {
+                let assocs = associations.lock().await;
+                assocs.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            };
+            
+            let mut keys_to_remove = Vec::new();
+            for (key, association) in associations_to_check {
+                if association.is_inactive(UDP_TIMEOUT) {
+                    keys_to_remove.push(key);
+                }
+            }
+            
+            if !keys_to_remove.is_empty() {
+                let mut assocs = associations.lock().await;
+                let removed_count = keys_to_remove.len();
+                for key in keys_to_remove {
+                    assocs.remove(&key);
+                }
+                log::debug!(
+                    removed = removed_count,
+                    remaining = assocs.len(),
+                    "Cleaned up inactive UDP associations"
+                );
+            }
+        }
+    });
 }
