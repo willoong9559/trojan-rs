@@ -14,6 +14,7 @@ const READ_BUFFER_SIZE: usize = 256 * 1024;
 const WRITE_BUFFER_SIZE: usize = 128 * 1024;
 const MAX_CONCURRENT_STREAMS: usize = 100;
 const MAX_HEADER_LIST_SIZE: u32 = 2 * 1024;
+const MAX_GRPC_PAYLOAD_SIZE: usize = 32 * 1024;
 
 /// gRPC HTTP/2 连接管理器
 /// 
@@ -465,7 +466,11 @@ impl GrpcH2cTransport {
             return Poll::Ready(Ok(()));
         }
 
-        let frame = encode_grpc_message(&self.write_buf);
+        // 限制单帧 payload 大小，如果超过则分帧发送
+        let payload_size = self.write_buf.len().min(MAX_GRPC_PAYLOAD_SIZE);
+        let payload = &self.write_buf[..payload_size];
+        
+        let frame = encode_grpc_message(payload);
         let frame_len = frame.len();
         
         loop {
@@ -500,7 +505,8 @@ impl GrpcH2cTransport {
         let frame_bytes = frame.freeze();
         match self.send_stream.send_data(frame_bytes, false) {
             Ok(()) => {
-                self.write_buf.clear();
+                // 只清除已发送的数据，保留剩余数据
+                self.write_buf.advance(payload_size);
                 Poll::Ready(Ok(()))
             }
             Err(e) => Poll::Ready(Err(io::Error::new(
