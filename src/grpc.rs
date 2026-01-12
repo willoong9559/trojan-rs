@@ -416,11 +416,7 @@ impl AsyncWrite for GrpcH2cTransport {
         }
 
         if self.write_buf.len() + buf.len() > WRITE_BUFFER_SIZE {
-            match self.try_send_pending(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
+            return Poll::Pending;
         }
         
         self.write_buf.extend_from_slice(buf);
@@ -473,23 +469,19 @@ impl GrpcH2cTransport {
             return Poll::Ready(Ok(()));
         }
 
-        // 限制单帧 payload 大小，如果超过则分帧发送
+        // 一次 poll 只发送一帧
         let payload_size = self.write_buf.len().min(MAX_GRPC_PAYLOAD_SIZE);
         let payload = &self.write_buf[..payload_size];
         
         let frame = encode_grpc_message(payload);
         let frame_len = frame.len();
         
-        loop {
-            let capacity = self.send_stream.capacity();
-            if capacity >= frame_len {
-                break;
-            }
-            
+        let capacity = self.send_stream.capacity();
+        if capacity < frame_len {
             self.send_stream.reserve_capacity(frame_len);
             match self.send_stream.poll_capacity(cx) {
                 Poll::Ready(Some(Ok(_))) => {
-                    continue;
+                    // 容量已准备好，继续发送
                 }
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Err(io::Error::new(
