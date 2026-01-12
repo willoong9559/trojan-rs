@@ -15,6 +15,7 @@ const WRITE_BUFFER_SIZE: usize = 128 * 1024;
 const MAX_CONCURRENT_STREAMS: usize = 100;
 const MAX_HEADER_LIST_SIZE: u32 = 2 * 1024;
 const MAX_GRPC_PAYLOAD_SIZE: usize = 32 * 1024;
+const MAX_FRAMES_PER_POLL: usize = 8;
 
 /// gRPC HTTP/2 连接管理器
 /// 
@@ -486,7 +487,33 @@ impl GrpcH2cTransport {
             return Poll::Ready(Ok(()));
         }
 
-        // 一次 poll 只发送一帧
+        let mut sent = 0;
+        while sent < MAX_FRAMES_PER_POLL && !self.write_buf.is_empty() {
+            match self.try_send_one_frame(cx) {
+                Poll::Ready(Ok(true)) => {
+                    sent += 1;
+                }
+                Poll::Ready(Ok(false)) => {
+                    // 没有数据可发送
+                    break;
+                }
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(e));
+                }
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
+            }
+        }
+        
+        Poll::Ready(Ok(()))
+    }
+    
+    fn try_send_one_frame(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        if self.write_buf.is_empty() {
+            return Poll::Ready(Ok(false));
+        }
+
         let payload_size = self.write_buf.len().min(MAX_GRPC_PAYLOAD_SIZE);
         let payload = &self.write_buf[..payload_size];
         
@@ -523,7 +550,7 @@ impl GrpcH2cTransport {
             Ok(()) => {
                 // 只清除已发送的数据，保留剩余数据
                 self.write_buf.advance(payload_size);
-                Poll::Ready(Ok(()))
+                Poll::Ready(Ok(true))
             }
             Err(e) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
