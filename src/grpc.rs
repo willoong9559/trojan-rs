@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::io;
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
-use h2::{server, SendStream, Reason};
+use h2::{server, SendStream, Reason, FlowControl};
 use http::{Response, StatusCode};
 use anyhow::Result;
 use tokio::sync::{Semaphore, mpsc};
@@ -100,7 +100,8 @@ where
                                 }
                             };
 
-                            let recv_stream = request.into_body();
+                            let mut recv_stream = request.into_body();
+                            let flow_control: _ = recv_stream.flow_control().clone();
 
                             let permit = match stream_semaphore.clone().try_acquire_owned() {
                                 Ok(permit) => permit,
@@ -117,15 +118,14 @@ where
                             };
 
                             // 创建 channel 用于后台任务传递数据
+                            // 不立即释放容量，延迟到真正消费后
                             let (recv_tx, recv_rx) = mpsc::channel(16);
                             
                             tokio::spawn(async move {
-                                let mut recv_stream = recv_stream;
                                 loop {
                                     match recv_stream.data().await {
                                         Some(Ok(chunk)) => {
-                                            let consumed = chunk.len();
-                                            let _ = recv_stream.flow_control().release_capacity(consumed);
+                                            // 不立即释放容量，延迟到真正消费后
                                             if recv_tx.send(Ok(chunk)).await.is_err() {
                                                 // receiver 已关闭
                                                 break;
@@ -150,6 +150,9 @@ where
                                 write_buf: BytesMut::with_capacity(WRITE_BUFFER_SIZE),
                                 closed: false,
                                 recv_rx,
+                                flow_control,
+                                received_bytes: 0,
+                                released_bytes: 0,
                             };
 
                             let handler_clone = Arc::clone(&handler);
@@ -200,6 +203,9 @@ pub struct GrpcH2cTransport {
     write_buf: BytesMut,
     closed: bool,
     recv_rx: mpsc::Receiver<Result<Bytes, h2::Error>>,
+    flow_control: FlowControl,
+    received_bytes: usize,  // 累计已接收的字节数（从 channel 接收的）
+    released_bytes: usize,  // 累计已释放的字节数（从 read_pending advance 后释放的）
 }
 
 /// 解析 gRPC 消息帧（兼容 v2ray 格式）
@@ -348,7 +354,16 @@ impl AsyncRead for GrpcH2cTransport {
                         None
                     };
                     
+                    // 真正消费：从 read_pending 中 advance 掉 consumed 字节
                     self.read_pending.advance(consumed);
+                    
+                    // 释放对应的容量：当 gRPC frame 的字节已经从 read_pending 中 advance 掉
+                    // 释放的容量不能超过已接收的容量
+                    let to_release = consumed.min(self.received_bytes - self.released_bytes);
+                    if to_release > 0 {
+                        let _ = self.flow_control.release_capacity(to_release);
+                        self.released_bytes += to_release;
+                    }
                     
                     buf.put_slice(&payload_data);
                     
@@ -369,6 +384,8 @@ impl AsyncRead for GrpcH2cTransport {
             match self.recv_rx.poll_recv(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
                     self.read_pending.extend_from_slice(&chunk);
+                    // 记录累计的已接收容量，等待真正消费后释放
+                    self.received_bytes += chunk.len();
                 }
                 Poll::Ready(Some(Err(e))) => {
                     self.closed = true;
