@@ -4,11 +4,10 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::io;
 use std::sync::Arc;
-use h2::{server, SendStream, RecvStream, Reason};
+use h2::{server, SendStream, Reason};
 use http::{Response, StatusCode};
 use anyhow::Result;
-use futures_util::Future;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::warn;
 
 const READ_BUFFER_SIZE: usize = 256 * 1024;
@@ -115,14 +114,40 @@ where
                                 }
                             };
 
+                            // 创建 channel 用于后台任务传递数据
+                            let (recv_tx, recv_rx) = mpsc::unbounded_channel();
+                            
+                            tokio::spawn(async move {
+                                let mut recv_stream = recv_stream;
+                                loop {
+                                    match recv_stream.data().await {
+                                        Some(Ok(chunk)) => {
+                                            let consumed = chunk.len();
+                                            let _ = recv_stream.flow_control().release_capacity(consumed);
+                                            if recv_tx.send(Ok(chunk)).is_err() {
+                                                // receiver 已关闭
+                                                break;
+                                            }
+                                        }
+                                        Some(Err(e)) => {
+                                            let _ = recv_tx.send(Err(e));
+                                            break;
+                                        }
+                                        None => {
+                                            break;
+                                        }
+                                    }
+                                }
+                            });
+
                             let transport = GrpcH2cTransport {
-                                recv_stream,
                                 send_stream,
                                 read_pending: BytesMut::with_capacity(READ_BUFFER_SIZE),
                                 read_buf: Bytes::new(),
                                 read_pos: 0,
                                 write_buf: BytesMut::with_capacity(WRITE_BUFFER_SIZE),
                                 closed: false,
+                                recv_rx,
                             };
 
                             let handler_clone = Arc::clone(&handler);
@@ -160,13 +185,13 @@ where
 /// 
 /// 实现 AsyncRead + AsyncWrite，可以像普通 TCP 流一样使用
 pub struct GrpcH2cTransport {
-    recv_stream: RecvStream,
     send_stream: SendStream<Bytes>,
     read_pending: BytesMut,
     read_buf: Bytes,
     read_pos: usize,
     write_buf: BytesMut,
     closed: bool,
+    recv_rx: mpsc::UnboundedReceiver<Result<Bytes, h2::Error>>,
 }
 
 /// 解析 gRPC 消息帧（兼容 v2ray 格式）
@@ -315,7 +340,6 @@ impl AsyncRead for GrpcH2cTransport {
                         None
                     };
                     
-                    let _ = self.recv_stream.flow_control().release_capacity(consumed);
                     self.read_pending.advance(consumed);
                     
                     buf.put_slice(&payload_data);
@@ -333,12 +357,8 @@ impl AsyncRead for GrpcH2cTransport {
                 }
             }
 
-            let poll_result = {
-                let data_future = self.recv_stream.data();
-                Pin::new(&mut Box::pin(data_future)).poll(cx)
-            };
-            
-            match poll_result {
+            // 从 channel 接收数据，由后台任务发送
+            match self.recv_rx.poll_recv(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
                     self.read_pending.extend_from_slice(&chunk);
                 }
@@ -353,6 +373,7 @@ impl AsyncRead for GrpcH2cTransport {
                     )));
                 }
                 Poll::Ready(None) => {
+                    // channel 关闭，流已结束
                     self.closed = true;
                     return Poll::Ready(Ok(()));
                 }
@@ -399,7 +420,7 @@ impl AsyncWrite for GrpcH2cTransport {
         match self.try_send_pending(cx) {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Ready(Ok(buf.len())),
+            Poll::Pending => Poll::Pending,
         }
     }
 
