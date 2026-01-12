@@ -3,7 +3,7 @@ use bytes::{BytesMut, Buf, BufMut, Bytes};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use h2::{server, SendStream, Reason};
 use http::{Response, StatusCode};
 use anyhow::Result;
@@ -55,6 +55,7 @@ where
         let mut h2_conn = self.h2_conn;
         let stream_semaphore = self.stream_semaphore;
         let mut last_stream_time = std::time::Instant::now();
+        let active_streams = Arc::new(AtomicUsize::new(0));
         
         loop {
             let accept_future = h2_conn.accept();
@@ -152,10 +153,15 @@ where
                             };
 
                             let handler_clone = Arc::clone(&handler);
+                            let active_streams_clone = Arc::clone(&active_streams);
+                            active_streams_clone.fetch_add(1, Ordering::Relaxed);
+                            
                             tokio::spawn(async move {
                                 let _permit = permit;
-                                if let Err(_e) = handler_clone(transport).await {
-                                    // 记录流处理错误，但不影响其他流
+                                let result = handler_clone(transport).await;
+                                active_streams_clone.fetch_sub(1, Ordering::Relaxed);
+                                if let Err(_e) = result {
+                                    // 记录流处理错误，不影响其他流
                                 }
                             });
                         }
@@ -171,8 +177,9 @@ where
                 }
                 _ = timeout_future => {
                     let idle_time = last_stream_time.elapsed();
-                    if idle_time.as_secs() >= CONNECTION_IDLE_TIMEOUT_SECS {
-                        warn!(idle_secs = idle_time.as_secs(), "gRPC connection idle timeout, closing");
+                    let active_count = active_streams.load(Ordering::Relaxed);
+                    if idle_time.as_secs() >= CONNECTION_IDLE_TIMEOUT_SECS && active_count == 0 {
+                        warn!(idle_secs = idle_time.as_secs(), "gRPC connection idle timeout (no new streams for 5 min, no active streams), closing");
                         break;
                     }
                 }
