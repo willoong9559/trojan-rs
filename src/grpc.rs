@@ -11,11 +11,11 @@ use tokio::sync::{Semaphore, mpsc};
 use tracing::warn;
 
 const READ_BUFFER_SIZE: usize = 256 * 1024;
-const WRITE_BUFFER_SIZE: usize = 128 * 1024;
+const WRITE_BUFFER_SIZE: usize = 512 * 1024;
 const MAX_CONCURRENT_STREAMS: usize = 100;
 const MAX_HEADER_LIST_SIZE: u32 = 2 * 1024;
-const MAX_GRPC_PAYLOAD_SIZE: usize = 32 * 1024;
-const MAX_FRAMES_PER_POLL: usize = 8;
+const MAX_GRPC_PAYLOAD_SIZE: usize = 64 * 1024;
+const MAX_FRAMES_PER_POLL: usize = 16;
 
 /// gRPC HTTP/2 连接管理器
 /// 
@@ -120,7 +120,7 @@ where
 
                             // 创建 channel 用于后台任务传递数据
                             // 不立即释放容量，延迟到真正消费后
-                            let (recv_tx, recv_rx) = mpsc::channel(16);
+                            let (recv_tx, recv_rx) = mpsc::channel(32);
                             
                             tokio::spawn(async move {
                                 loop {
