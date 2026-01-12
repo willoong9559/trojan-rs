@@ -117,7 +117,7 @@ where
                             };
 
                             // 创建 channel 用于后台任务传递数据
-                            let (recv_tx, recv_rx) = mpsc::unbounded_channel();
+                            let (recv_tx, recv_rx) = mpsc::channel(16);
                             
                             tokio::spawn(async move {
                                 let mut recv_stream = recv_stream;
@@ -126,13 +126,13 @@ where
                                         Some(Ok(chunk)) => {
                                             let consumed = chunk.len();
                                             let _ = recv_stream.flow_control().release_capacity(consumed);
-                                            if recv_tx.send(Ok(chunk)).is_err() {
+                                            if recv_tx.send(Ok(chunk)).await.is_err() {
                                                 // receiver 已关闭
                                                 break;
                                             }
                                         }
                                         Some(Err(e)) => {
-                                            let _ = recv_tx.send(Err(e));
+                                            let _ = recv_tx.send(Err(e)).await;
                                             break;
                                         }
                                         None => {
@@ -199,7 +199,7 @@ pub struct GrpcH2cTransport {
     read_pos: usize,
     write_buf: BytesMut,
     closed: bool,
-    recv_rx: mpsc::UnboundedReceiver<Result<Bytes, h2::Error>>,
+    recv_rx: mpsc::Receiver<Result<Bytes, h2::Error>>,
 }
 
 /// 解析 gRPC 消息帧（兼容 v2ray 格式）
