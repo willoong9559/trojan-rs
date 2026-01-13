@@ -459,11 +459,20 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
                             
                             // 编码并发送回客户端
                             let encoded = udp_packet.encode();
-                            match client_stream.write(&encoded).await {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    log::debug!(peer = %peer_addr, error = %e, "Error writing UDP response to client, dropping UDP");
-                                    break 'main_loop;
+                            let mut written = 0;
+                            while written < encoded.len() {
+                                match client_stream.write(&encoded[written..]).await {
+                                    Ok(0) => {
+                                        log::debug!(peer = %peer_addr, "TCP connection closed while writing UDP response, dropping UDP");
+                                        break 'main_loop;
+                                    }
+                                    Ok(n) => {
+                                        written += n;
+                                    }
+                                    Err(e) => {
+                                        log::debug!(peer = %peer_addr, error = %e, "Error writing UDP response to client, dropping UDP");
+                                        break 'main_loop;
+                                    }
                                 }
                             }
                         } else {
