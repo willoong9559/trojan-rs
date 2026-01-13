@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, oneshot};
 use anyhow::{Result, anyhow};
 use tokio_rustls::{TlsAcceptor};
 use bytes::Bytes;
@@ -356,7 +356,8 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
     // 使用固定大小的队列，当满了时自动移除最旧的元素
     let udp_queue = Arc::new(Mutex::new(VecDeque::<(SocketAddr, Bytes)>::with_capacity(UDP_CHANNEL_BUFFER_SIZE)));
     let udp_queue_clone = Arc::clone(&udp_queue);
-    let (udp_tx, mut udp_rx) = mpsc::unbounded_channel::<()>();
+    let udp_notify = Arc::new(Notify::new());
+    let udp_notify_clone = Arc::clone(&udp_notify);
     let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
     let socket_clone = Arc::clone(&udp_association.socket);
@@ -385,7 +386,7 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
                             drop(queue);
                             
                             // 通知接收端有新数据
-                            let _ = udp_tx.send(());
+                            udp_notify_clone.notify_one();
                         }
                         Err(e) => {
                             log::debug!("UDP socket recv error: {}", e);
@@ -437,7 +438,7 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 
                 // 从队列接收UDP响应并发送回客户端
-                _ = udp_rx.recv() => {
+                _ = udp_notify.notified() => {
                     loop {
                         let packet = {
                             let mut queue = udp_queue.lock().await;
