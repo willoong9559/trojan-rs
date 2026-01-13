@@ -24,43 +24,27 @@ const CLEANUP_TIMEOUT_SECS: u64 = 5;
 #[derive(Debug, Clone)]
 pub struct UdpAssociation {
     pub socket: Arc<UdpSocket>,
-    last_activity: Arc<AtomicU64>,
+    last_activity: Arc<Mutex<Instant>>,
     created_at: Instant,
 }
 
 impl UdpAssociation {
     pub fn new(socket: UdpSocket) -> Self {
-        let now = Self::current_timestamp();
-        
         Self {
             socket: Arc::new(socket),
-            last_activity: Arc::new(AtomicU64::new(now)),
+            last_activity: Arc::new(Mutex::new(Instant::now())),
             created_at: Instant::now(),
         }
     }
     
     #[inline]
-    pub fn current_timestamp() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
+    pub async fn update_activity(&self) {
+        *self.last_activity.lock().await = Instant::now();
     }
     
-    #[inline]
-    pub fn update_activity(&self) {
-        self.last_activity.store(Self::current_timestamp(), Ordering::Relaxed);
-    }
-    
-    #[inline]
-    pub fn get_last_activity(&self) -> u64 {
-        self.last_activity.load(Ordering::Relaxed)
-    }
-    
-    pub fn is_inactive(&self, timeout_secs: u64) -> bool {
-        let now = Self::current_timestamp();
-        let last_activity = self.get_last_activity();
-        (now - last_activity) > timeout_secs
+    pub async fn is_inactive(&self, timeout_secs: u64) -> bool {
+        let last_activity = *self.last_activity.lock().await;
+        last_activity.elapsed().as_secs() > timeout_secs
     }
     
     #[inline]
@@ -214,7 +198,7 @@ pub fn start_cleanup_task(
             
             let mut keys_to_remove = Vec::new();
             for (key, association) in associations_to_check {
-                if association.is_inactive(UDP_TIMEOUT) {
+                if association.is_inactive(UDP_TIMEOUT).await {
                     keys_to_remove.push(key);
                 }
             }
@@ -245,11 +229,9 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     log::info!(peer = %peer_addr, "Starting UDP associate");
     
     // 生成唯一的socket key
-    let socket_key = format!("client_{}_{}", peer_addr, 
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis());
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let socket_key = format!("client_{}_{}", peer_addr, id);
     
     let udp_association = {
         let bind_socket_addr = SocketAddr::new(
@@ -290,7 +272,7 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 } => {
                     match result {
                         Ok((len, from_addr)) => {
-                            association_clone.update_activity();
+                            association_clone.update_activity().await;
                             
                             buf.truncate(len);
                             
@@ -361,7 +343,7 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                                     Ok((udp_packet, consumed)) => {
                                         let _ = buffer.split_to(consumed);
                                         
-                                        udp_association.update_activity();
+                                        udp_association.update_activity().await;
                                         
                                         match udp_packet.addr.to_socket_addr().await {
                                             Ok(remote_addr) => {
