@@ -9,12 +9,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use bytes::{Bytes, BytesMut};
 
-pub const UDP_TIMEOUT: u64 = 60; // UDP association timeout in seconds;
-
-// UDP 相关常量
+const UDP_TIMEOUT: u64 = 60; // UDP association timeout in seconds;
 const BUF_SIZE: usize = 4 * 1024;
 const UDP_CHANNEL_BUFFER_SIZE: usize = 64;
 const TCP_WRITE_CHANNEL_BUFFER_SIZE: usize = 256;
@@ -61,10 +59,17 @@ pub struct UdpPacket {
     pub payload: Bytes,
 }
 
+#[derive(Debug)]
+pub enum DecodeResult {
+    Ok(UdpPacket, usize),
+    NeedMoreData,
+    Invalid,
+}
+
 impl UdpPacket {
-    pub fn decode(buf: &[u8]) -> Result<(Self, usize)> {
+    pub fn decode(buf: &[u8]) -> DecodeResult {
         if buf.len() < 4 {
-            return Err(anyhow!("Buffer too small"));
+            return DecodeResult::NeedMoreData;
         }
 
         let mut cursor = 0;
@@ -74,7 +79,7 @@ impl UdpPacket {
         let addr = match atyp {
             1 => { // IPv4
                 if buf.len() < cursor + 6 {
-                    return Err(anyhow!("Buffer too small for IPv4"));
+                    return DecodeResult::NeedMoreData;
                 }
                 let mut ip = [0u8; 4];
                 ip.copy_from_slice(&buf[cursor..cursor + 4]);
@@ -85,16 +90,17 @@ impl UdpPacket {
             }
             3 => { // Domain
                 if buf.len() <= cursor {
-                    return Err(anyhow!("Buffer too small for domain length"));
+                    return DecodeResult::NeedMoreData;
                 }
                 let domain_len = buf[cursor] as usize;
                 cursor += 1;
                 if buf.len() < cursor + domain_len + 2 {
-                    return Err(anyhow!("Buffer too small for domain"));
+                    return DecodeResult::NeedMoreData;
                 }
-                let domain = std::str::from_utf8(&buf[cursor..cursor + domain_len])
-                    .map_err(|e| anyhow!("Invalid UTF-8 domain: {}", e))?
-                    .to_string();
+                let domain = match std::str::from_utf8(&buf[cursor..cursor + domain_len]) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => return DecodeResult::Invalid,
+                };
                 cursor += domain_len;
                 let port = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
                 cursor += 2;
@@ -102,7 +108,7 @@ impl UdpPacket {
             }
             4 => { // IPv6
                 if buf.len() < cursor + 18 {
-                    return Err(anyhow!("Buffer too small for IPv6"));
+                    return DecodeResult::NeedMoreData;
                 }
                 let mut ip = [0u8; 16];
                 ip.copy_from_slice(&buf[cursor..cursor + 16]);
@@ -111,33 +117,36 @@ impl UdpPacket {
                 cursor += 2;
                 socks5::Address::IPv6(ip, port)
             }
-            _ => return Err(anyhow!("Invalid address type")),
+            _ => return DecodeResult::Invalid,
         };
 
         // Read length
         if buf.len() < cursor + 2 {
-            return Err(anyhow!("Buffer too small for length"));
+            return DecodeResult::NeedMoreData;
         }
         let length = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
         cursor += 2;
 
         // Read CRLF
-        if buf.len() < cursor + 2 || buf[cursor] != b'\r' || buf[cursor + 1] != b'\n' {
-            return Err(anyhow!("Invalid CRLF"));
+        if buf.len() < cursor + 2 {
+            return DecodeResult::NeedMoreData;
+        }
+        if buf[cursor] != b'\r' || buf[cursor + 1] != b'\n' {
+            return DecodeResult::Invalid;
         }
         cursor += 2;
 
         if buf.len() < cursor + length as usize {
-            return Err(anyhow!("Buffer too small for payload"));
+            return DecodeResult::NeedMoreData;
         }
         let payload = Bytes::copy_from_slice(&buf[cursor..cursor + length as usize]);
         cursor += length as usize;
 
-        Ok((UdpPacket {
+        DecodeResult::Ok(UdpPacket {
             addr,
             length,
             payload,
-        }, cursor))
+        }, cursor)
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -340,7 +349,7 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                             
                             loop {
                                 match UdpPacket::decode(&buffer) {
-                                    Ok((udp_packet, consumed)) => {
+                                    DecodeResult::Ok(udp_packet, consumed) => {
                                         let _ = buffer.split_to(consumed);
                                         
                                         udp_association.update_activity().await;
@@ -357,8 +366,12 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                                             }
                                         }
                                     }
-                                    Err(_) => {
+                                    DecodeResult::NeedMoreData => {
                                         break;
+                                    }
+                                    DecodeResult::Invalid => {
+                                        log::debug!(peer = %peer_addr, "Invalid UDP packet, closing connection");
+                                        break 'main_loop;
                                     }
                                 }
                             }
