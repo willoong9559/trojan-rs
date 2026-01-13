@@ -400,13 +400,13 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
 
     let result = async {
         let mut read_buf = vec![0u8; BUF_SIZE];
-        loop {
+        'main_loop: loop {
             tokio::select! {
                 // 从客户端读取UDP数据包
                 read_result = client_stream.read(&mut read_buf) => {
                     match read_result {
                         Ok(0) => {
-                            break;
+                            break 'main_loop;
                         }
                         Ok(n) => {
                             match udp::UdpPacket::decode(&read_buf[..n]) {
@@ -432,7 +432,7 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
                         }
                         Err(e) => {
                             log::debug!(peer = %peer_addr, error = %e, "Error reading from client stream");
-                            break;
+                            break 'main_loop;
                         }
                     }
                 }
@@ -459,9 +459,12 @@ async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
                             
                             // 编码并发送回客户端
                             let encoded = udp_packet.encode();
-                            if let Err(e) = client_stream.write_all(&encoded).await {
-                                log::debug!(peer = %peer_addr, error = %e, "Error writing UDP response to client");
-                                break;
+                            match client_stream.write(&encoded).await {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    log::debug!(peer = %peer_addr, error = %e, "Error writing UDP response to client, dropping UDP");
+                                    break 'main_loop;
+                                }
                             }
                         } else {
                             // 队列为空，退出循环
