@@ -10,19 +10,17 @@ mod logger;
 
 use logger::log;
 
-use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, SocketAddr};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{Mutex, Notify, oneshot};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
 use anyhow::{Result, anyhow};
 use tokio_rustls::{TlsAcceptor};
 use bytes::Bytes;
 
 const BUF_SIZE: usize = 4 * 1024;
-const UDP_CHANNEL_BUFFER_SIZE: usize = 64;
 
 const CONNECTION_TIMEOUT_SECS: u64 = 300;
 const TCP_CONNECT_TIMEOUT_SECS: u64 = 10;
@@ -164,7 +162,7 @@ where
     process_trojan(server, stream, peer_addr).await
 }
 
-async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + 'static>(
+async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     server: Arc<Server>,
     mut stream: S,
     peer_addr: String,
@@ -202,7 +200,7 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + 'static>(
                 log::warn!(peer = %peer_addr, "UDP associate request rejected: UDP support is disabled");
                 return Err(anyhow!("UDP support is disabled"));
             }
-            handle_udp_associate(server, stream, request.addr, peer_addr).await
+            udp::handle_udp_associate(Arc::clone(&server.udp_associations), stream, request.addr, peer_addr).await
         }
     }
 }
@@ -325,196 +323,6 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin>(
-    server: Arc<Server>,
-    mut client_stream: S,
-    _bind_addr: socks5::Address,
-    peer_addr: String,
-) -> Result<()> {
-    log::info!(peer = %peer_addr, "Starting UDP associate");
-    
-    // 生成唯一的socket key
-    let socket_key = format!("client_{}_{}", peer_addr, 
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis());
-    
-    let udp_association = {
-        let bind_socket_addr = SocketAddr::new(
-            IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 
-            0
-        );
-        let socket = UdpSocket::bind(bind_socket_addr).await?;
-        let association = udp::UdpAssociation::new(socket);
-        
-        let mut associations = server.udp_associations.lock().await;
-        associations.insert(socket_key.clone(), association.clone());
-        association
-    };
-
-    // 使用固定大小的队列，当满了时自动移除最旧的元素
-    let udp_queue = Arc::new(Mutex::new(VecDeque::<(SocketAddr, Bytes)>::with_capacity(UDP_CHANNEL_BUFFER_SIZE)));
-    let udp_queue_clone = Arc::clone(&udp_queue);
-    let udp_notify = Arc::new(Notify::new());
-    let udp_notify_clone = Arc::clone(&udp_notify);
-    let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
-
-    let socket_clone = Arc::clone(&udp_association.socket);
-    let association_clone = udp_association.clone();
-    
-    let udp_recv_handle = tokio::spawn(async move {
-        let mut buf = vec![0u8; BUF_SIZE];
-        loop {
-            tokio::select! {
-                _ = &mut cancel_rx => {
-                    break;
-                }
-                result = socket_clone.recv_from(&mut buf) => {
-                    match result {
-                        Ok((len, from_addr)) => {
-                            association_clone.update_activity();
-                            
-                            let data = Bytes::copy_from_slice(&buf[..len]);
-                            
-                            let mut queue = udp_queue_clone.lock().await;
-                            // 如果队列已满，移除最旧的元素（FIFO）
-                            if queue.len() >= UDP_CHANNEL_BUFFER_SIZE {
-                                queue.pop_front();
-                            }
-                            queue.push_back((from_addr, data));
-                            drop(queue);
-                            
-                            // 通知接收端有新数据
-                            udp_notify_clone.notify_one();
-                        }
-                        Err(e) => {
-                            log::debug!("UDP socket recv error: {}", e);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    let result = async {
-        let mut read_buf = vec![0u8; BUF_SIZE];
-        'main_loop: loop {
-            tokio::select! {
-                // 从客户端读取UDP数据包
-                read_result = client_stream.read(&mut read_buf) => {
-                    match read_result {
-                        Ok(0) => {
-                            break 'main_loop;
-                        }
-                        Ok(n) => {
-                            match udp::UdpPacket::decode(&read_buf[..n]) {
-                                Ok((udp_packet, _)) => {
-                                    udp_association.update_activity();
-                                    
-                                    match udp_packet.addr.to_socket_addr().await {
-                                        Ok(remote_addr) => {
-                                            if let Err(e) = udp_association.socket
-                                                .send_to(&udp_packet.payload, remote_addr).await {
-                                                log::debug!(peer = %peer_addr, error = %e, "Failed to send UDP packet");
-                                            }
-                                        }
-                                        Err(e) => {
-                                            log::debug!(peer = %peer_addr, error = %e, "Failed to resolve UDP target address");
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    log::debug!(peer = %peer_addr, error = %e, "Failed to decode UDP packet");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            log::debug!(peer = %peer_addr, error = %e, "Error reading from client stream");
-                            break 'main_loop;
-                        }
-                    }
-                }
-                
-                // 从队列接收UDP响应并发送回客户端
-                _ = udp_notify.notified() => {
-                    loop {
-                        let packet = {
-                            let mut queue = udp_queue.lock().await;
-                            queue.pop_front()
-                        };
-                        
-                        if let Some((from_addr, data)) = packet {
-                            let addr = match from_addr {
-                                SocketAddr::V4(v4) => socks5::Address::IPv4(v4.ip().octets(), v4.port()),
-                                SocketAddr::V6(v6) => socks5::Address::IPv6(v6.ip().octets(), v6.port()),
-                            };
-                            
-                            let udp_packet = udp::UdpPacket {
-                                addr,
-                                length: data.len() as u16,
-                                payload: data,
-                            };
-                            
-                            // 编码并发送回客户端
-                            let encoded = udp_packet.encode();
-                            let mut written = 0;
-                            while written < encoded.len() {
-                                match client_stream.write(&encoded[written..]).await {
-                                    Ok(0) => {
-                                        log::debug!(peer = %peer_addr, "TCP connection closed while writing UDP response, dropping UDP");
-                                        break 'main_loop;
-                                    }
-                                    Ok(n) => {
-                                        written += n;
-                                    }
-                                    Err(e) => {
-                                        log::debug!(peer = %peer_addr, error = %e, "Error writing UDP response to client, dropping UDP");
-                                        break 'main_loop;
-                                    }
-                                }
-                            }
-                        } else {
-                            // 队列为空，退出循环
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        Ok::<(), anyhow::Error>(())
-    }.await;
-
-    let _ = cancel_tx.send(());
-    
-    const CLEANUP_TIMEOUT_SECS: u64 = 5;
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(CLEANUP_TIMEOUT_SECS),
-        udp_recv_handle
-    ).await {
-        Ok(Ok(_)) => {
-            // 任务正常结束
-        }
-        Ok(Err(e)) => {
-            log::warn!(peer = %peer_addr, error = %e, "UDP receive task ended with error");
-        }
-        Err(_) => {
-            log::warn!(
-                peer = %peer_addr,
-                timeout_secs = CLEANUP_TIMEOUT_SECS,
-                "UDP receive task cleanup timeout"
-            );
-        }
-    }
-    
-    {
-        let mut associations = server.udp_associations.lock().await;
-        associations.remove(&socket_key);
-    }
-
-    result
-}
 
 // 连接检测与分发
 pub async fn accept_connection<S>(
