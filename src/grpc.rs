@@ -3,18 +3,18 @@ use bytes::{BytesMut, Buf, BufMut, Bytes};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::io;
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
-use h2::{server, SendStream, Reason, FlowControl};
+use std::sync::Arc;
+use h2::{server, SendStream, RecvStream, Reason};
 use http::{Response, StatusCode};
 use anyhow::Result;
-use tokio::sync::{Semaphore, mpsc};
+use futures_util::Future;
+use tokio::sync::Semaphore;
 use tracing::warn;
 
 const READ_BUFFER_SIZE: usize = 256 * 1024;
-const WRITE_BUFFER_SIZE: usize = 512 * 1024;
+const WRITE_BUFFER_SIZE: usize = 128 * 1024;
 const MAX_CONCURRENT_STREAMS: usize = 100;
 const MAX_HEADER_LIST_SIZE: u32 = 2 * 1024;
-const MAX_GRPC_PAYLOAD_SIZE: usize = 4 * 1024 * 1024;
 
 /// gRPC HTTP/2 连接管理器
 /// 
@@ -55,7 +55,6 @@ where
         let mut h2_conn = self.h2_conn;
         let stream_semaphore = self.stream_semaphore;
         let mut last_stream_time = std::time::Instant::now();
-        let active_streams = Arc::new(AtomicUsize::new(0));
         
         loop {
             let accept_future = h2_conn.accept();
@@ -100,8 +99,7 @@ where
                                 }
                             };
 
-                            let mut recv_stream = request.into_body();
-                            let flow_control: _ = recv_stream.flow_control().clone();
+                            let recv_stream = request.into_body();
 
                             let permit = match stream_semaphore.clone().try_acquire_owned() {
                                 Ok(permit) => permit,
@@ -117,52 +115,21 @@ where
                                 }
                             };
 
-                            // 创建 channel 用于后台任务传递数据
-                            // 不立即释放容量，延迟到真正消费后
-                            let (recv_tx, recv_rx) = mpsc::channel(1024);
-                            
-                            tokio::spawn(async move {
-                                loop {
-                                    match recv_stream.data().await {
-                                        Some(Ok(chunk)) => {
-                                            // 不立即释放容量，延迟到真正消费后
-                                            if recv_tx.send(Ok(chunk)).await.is_err() {
-                                                // receiver 已关闭
-                                                break;
-                                            }
-                                        }
-                                        Some(Err(e)) => {
-                                            let _ = recv_tx.send(Err(e)).await;
-                                            break;
-                                        }
-                                        None => {
-                                            break;
-                                        }
-                                    }
-                                }
-                            });
-
                             let transport = GrpcH2cTransport {
+                                recv_stream,
                                 send_stream,
                                 read_pending: BytesMut::with_capacity(READ_BUFFER_SIZE),
                                 read_buf: Bytes::new(),
                                 read_pos: 0,
                                 write_buf: BytesMut::with_capacity(WRITE_BUFFER_SIZE),
                                 closed: false,
-                                recv_rx,
-                                flow_control,
                             };
 
                             let handler_clone = Arc::clone(&handler);
-                            let active_streams_clone = Arc::clone(&active_streams);
-                            active_streams_clone.fetch_add(1, Ordering::Relaxed);
-                            
                             tokio::spawn(async move {
                                 let _permit = permit;
-                                let result = handler_clone(transport).await;
-                                active_streams_clone.fetch_sub(1, Ordering::Relaxed);
-                                if let Err(_e) = result {
-                                    // 记录流处理错误，不影响其他流
+                                if let Err(_e) = handler_clone(transport).await {
+                                    // 记录流处理错误，但不影响其他流
                                 }
                             });
                         }
@@ -178,9 +145,8 @@ where
                 }
                 _ = timeout_future => {
                     let idle_time = last_stream_time.elapsed();
-                    let active_count = active_streams.load(Ordering::Relaxed);
-                    if idle_time.as_secs() >= CONNECTION_IDLE_TIMEOUT_SECS && active_count == 0 {
-                        warn!(idle_secs = idle_time.as_secs(), "gRPC connection idle timeout (no new streams for 5 min, no active streams), closing");
+                    if idle_time.as_secs() >= CONNECTION_IDLE_TIMEOUT_SECS {
+                        warn!(idle_secs = idle_time.as_secs(), "gRPC connection idle timeout, closing");
                         break;
                     }
                 }
@@ -194,14 +160,13 @@ where
 /// 
 /// 实现 AsyncRead + AsyncWrite，可以像普通 TCP 流一样使用
 pub struct GrpcH2cTransport {
+    recv_stream: RecvStream,
     send_stream: SendStream<Bytes>,
     read_pending: BytesMut,
     read_buf: Bytes,
     read_pos: usize,
     write_buf: BytesMut,
     closed: bool,
-    recv_rx: mpsc::Receiver<Result<Bytes, h2::Error>>,
-    flow_control: FlowControl,
 }
 
 /// 解析 gRPC 消息帧（兼容 v2ray 格式）
@@ -350,7 +315,7 @@ impl AsyncRead for GrpcH2cTransport {
                         None
                     };
                     
-                    // 从 read_pending 中 advance 掉已处理的字节
+                    let _ = self.recv_stream.flow_control().release_capacity(consumed);
                     self.read_pending.advance(consumed);
                     
                     buf.put_slice(&payload_data);
@@ -368,12 +333,14 @@ impl AsyncRead for GrpcH2cTransport {
                 }
             }
 
-            // 从 channel 接收数据，由后台任务发送
-            match self.recv_rx.poll_recv(cx) {
+            let poll_result = {
+                let mut data_future = Box::pin(self.recv_stream.data());
+                data_future.as_mut().poll(cx)
+            };
+            
+            match poll_result {
                 Poll::Ready(Some(Ok(chunk))) => {
-                    let chunk_len = chunk.len();
                     self.read_pending.extend_from_slice(&chunk);
-                    let _ = self.flow_control.release_capacity(chunk_len);
                 }
                 Poll::Ready(Some(Err(e))) => {
                     self.closed = true;
@@ -386,7 +353,6 @@ impl AsyncRead for GrpcH2cTransport {
                     )));
                 }
                 Poll::Ready(None) => {
-                    // channel 关闭，流已结束
                     self.closed = true;
                     return Poll::Ready(Ok(()));
                 }
@@ -421,7 +387,11 @@ impl AsyncWrite for GrpcH2cTransport {
         }
 
         if self.write_buf.len() + buf.len() > WRITE_BUFFER_SIZE {
-            return Poll::Pending;
+            match self.try_send_pending(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
         }
         
         self.write_buf.extend_from_slice(buf);
@@ -429,7 +399,7 @@ impl AsyncWrite for GrpcH2cTransport {
         match self.try_send_pending(cx) {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => Poll::Ready(Ok(buf.len())),
         }
     }
 
@@ -474,56 +444,19 @@ impl GrpcH2cTransport {
             return Poll::Ready(Ok(()));
         }
 
-        let mut sent = 0;
-        const MAX_FRAMES_PER_LOOP: usize = 100;
+        let frame = encode_grpc_message(&self.write_buf);
+        let frame_len = frame.len();
         
-        while sent < MAX_FRAMES_PER_LOOP && !self.write_buf.is_empty() {
-            match self.try_send_one_frame(cx) {
-                Poll::Ready(Ok(true)) => {
-                    sent += 1;
-                }
-                Poll::Ready(Ok(false)) => {
-                    // 没有数据可发送
-                    break;
-                }
-                Poll::Ready(Err(e)) => {
-                    return Poll::Ready(Err(e));
-                }
-                Poll::Pending => {
-                    // 容量不足，等待下次 poll
-                    return Poll::Pending;
-                }
+        loop {
+            let capacity = self.send_stream.capacity();
+            if capacity >= frame_len {
+                break;
             }
-        }
-        
-        Poll::Ready(Ok(()))
-    }
-    
-    fn try_send_one_frame(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
-        if self.write_buf.is_empty() {
-            return Poll::Ready(Ok(false));
-        }
-
-        let available_capacity = self.send_stream.capacity();
-        let desired_payload_size = self.write_buf.len().min(MAX_GRPC_PAYLOAD_SIZE);
-        
-        let estimated_frame_size = desired_payload_size + 20;
-        
-        let payload_size = if available_capacity >= estimated_frame_size {
-            // 容量充足，发送完整 payload
-            desired_payload_size
-        } else if available_capacity > 20 {
-            (available_capacity - 20).min(desired_payload_size)
-        } else {
-            // 容量不足，请求更多容量
-            self.send_stream.reserve_capacity(estimated_frame_size);
+            
+            self.send_stream.reserve_capacity(frame_len);
             match self.send_stream.poll_capacity(cx) {
-                Poll::Ready(Some(Ok(new_capacity))) => {
-                    let adjusted_size = (new_capacity - 20).min(desired_payload_size);
-                    if adjusted_size == 0 {
-                        return Poll::Ready(Ok(false));
-                    }
-                    adjusted_size
+                Poll::Ready(Some(Ok(_))) => {
+                    continue;
                 }
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Err(io::Error::new(
@@ -541,16 +474,13 @@ impl GrpcH2cTransport {
                     return Poll::Pending;
                 }
             }
-        };
+        }
         
-        let payload = &self.write_buf[..payload_size];
-        let frame = encode_grpc_message(payload);
         let frame_bytes = frame.freeze();
-        
         match self.send_stream.send_data(frame_bytes, false) {
             Ok(()) => {
-                self.write_buf.advance(payload_size);
-                Poll::Ready(Ok(true))
+                self.write_buf.clear();
+                Poll::Ready(Ok(()))
             }
             Err(e) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
