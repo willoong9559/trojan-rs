@@ -151,8 +151,6 @@ where
                                 closed: false,
                                 recv_rx,
                                 flow_control,
-                                received_bytes: 0,
-                                released_bytes: 0,
                             };
 
                             let handler_clone = Arc::clone(&handler);
@@ -204,8 +202,6 @@ pub struct GrpcH2cTransport {
     closed: bool,
     recv_rx: mpsc::Receiver<Result<Bytes, h2::Error>>,
     flow_control: FlowControl,
-    received_bytes: usize,  // 累计已接收的字节数（从 channel 接收的）
-    released_bytes: usize,  // 累计已释放的字节数（从 read_pending advance 后释放的）
 }
 
 /// 解析 gRPC 消息帧（兼容 v2ray 格式）
@@ -354,16 +350,8 @@ impl AsyncRead for GrpcH2cTransport {
                         None
                     };
                     
-                    // 真正消费：从 read_pending 中 advance 掉 consumed 字节
+                    // 从 read_pending 中 advance 掉已处理的字节
                     self.read_pending.advance(consumed);
-                    
-                    // 释放对应的容量：当 gRPC frame 的字节已经从 read_pending 中 advance 掉
-                    // 释放的容量不能超过已接收的容量
-                    let to_release = consumed.min(self.received_bytes - self.released_bytes);
-                    if to_release > 0 {
-                        let _ = self.flow_control.release_capacity(to_release);
-                        self.released_bytes += to_release;
-                    }
                     
                     buf.put_slice(&payload_data);
                     
@@ -383,9 +371,9 @@ impl AsyncRead for GrpcH2cTransport {
             // 从 channel 接收数据，由后台任务发送
             match self.recv_rx.poll_recv(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
+                    let chunk_len = chunk.len();
                     self.read_pending.extend_from_slice(&chunk);
-                    // 记录累计的已接收容量，等待真正消费后释放
-                    self.received_bytes += chunk.len();
+                    let _ = self.flow_control.release_capacity(chunk_len);
                 }
                 Poll::Ready(Some(Err(e))) => {
                     self.closed = true;
