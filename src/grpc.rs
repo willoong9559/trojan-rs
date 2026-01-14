@@ -15,6 +15,8 @@ const READ_BUFFER_SIZE: usize = 256 * 1024;
 const WRITE_BUFFER_SIZE: usize = 128 * 1024;
 const MAX_CONCURRENT_STREAMS: usize = 100;
 const MAX_HEADER_LIST_SIZE: u32 = 2 * 1024;
+const INITIAL_WINDOW_SIZE: u32 = 1024 * 1024;
+const INITIAL_CONNECTION_WINDOW_SIZE: u32 = 2 * 1024 * 1024;
 
 /// gRPC HTTP/2 连接管理器
 /// 
@@ -31,6 +33,8 @@ where
     pub async fn new(stream: S) -> io::Result<Self> {
         let h2_conn = server::Builder::new()
             .max_header_list_size(MAX_HEADER_LIST_SIZE)
+            .initial_window_size(INITIAL_WINDOW_SIZE)
+            .initial_connection_window_size(INITIAL_CONNECTION_WINDOW_SIZE)
             .handshake(stream)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 handshake: {}", e)))?;
@@ -308,22 +312,19 @@ impl AsyncRead for GrpcH2cTransport {
             match parse_grpc_message(&self.read_pending) {
                 Ok(Some((consumed, payload))) => {
                     let to_copy = payload.len().min(buf.remaining());
-                    let payload_data = Bytes::copy_from_slice(&payload[..to_copy]);
-                    let remaining_data = if to_copy < payload.len() {
-                        Some(Bytes::copy_from_slice(&payload[to_copy..]))
-                    } else {
-                        None
-                    };
                     
-                    let _ = self.recv_stream.flow_control().release_capacity(consumed);
-                    self.read_pending.advance(consumed);
+                    // 直接复制到目标缓冲区，避免中间分配
+                    buf.put_slice(&payload[..to_copy]);
                     
-                    buf.put_slice(&payload_data);
-                    
-                    if let Some(remaining) = remaining_data {
-                        self.read_buf = remaining;
+                    // 如果有剩余数据，保存起来
+                    if to_copy < payload.len() {
+                        self.read_buf = Bytes::copy_from_slice(&payload[to_copy..]);
                         self.read_pos = 0;
                     }
+                    
+                    // 释放流控容量
+                    let _ = self.recv_stream.flow_control().release_capacity(consumed);
+                    self.read_pending.advance(consumed);
                     
                     return Poll::Ready(Ok(()));
                 }
