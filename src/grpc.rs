@@ -14,8 +14,7 @@ const READ_BUFFER_SIZE: usize = 256 * 1024;
 const WRITE_BUFFER_SIZE: usize = 512 * 1024;
 const MAX_CONCURRENT_STREAMS: usize = 100;
 const MAX_HEADER_LIST_SIZE: u32 = 2 * 1024;
-const MAX_GRPC_PAYLOAD_SIZE: usize = 64 * 1024;
-const MAX_FRAMES_PER_POLL: usize = 16;
+const MAX_GRPC_PAYLOAD_SIZE: usize = 4 * 1024 * 1024;
 
 /// gRPC HTTP/2 连接管理器
 /// 
@@ -120,7 +119,7 @@ where
 
                             // 创建 channel 用于后台任务传递数据
                             // 不立即释放容量，延迟到真正消费后
-                            let (recv_tx, recv_rx) = mpsc::channel(32);
+                            let (recv_tx, recv_rx) = mpsc::channel(1024);
                             
                             tokio::spawn(async move {
                                 loop {
@@ -488,7 +487,9 @@ impl GrpcH2cTransport {
         }
 
         let mut sent = 0;
-        while sent < MAX_FRAMES_PER_POLL && !self.write_buf.is_empty() {
+        const MAX_FRAMES_PER_LOOP: usize = 100;
+        
+        while sent < MAX_FRAMES_PER_LOOP && !self.write_buf.is_empty() {
             match self.try_send_one_frame(cx) {
                 Poll::Ready(Ok(true)) => {
                     sent += 1;
@@ -501,6 +502,7 @@ impl GrpcH2cTransport {
                     return Poll::Ready(Err(e));
                 }
                 Poll::Pending => {
+                    // 容量不足，等待下次 poll
                     return Poll::Pending;
                 }
             }
@@ -514,18 +516,26 @@ impl GrpcH2cTransport {
             return Poll::Ready(Ok(false));
         }
 
-        let payload_size = self.write_buf.len().min(MAX_GRPC_PAYLOAD_SIZE);
-        let payload = &self.write_buf[..payload_size];
+        let available_capacity = self.send_stream.capacity();
+        let desired_payload_size = self.write_buf.len().min(MAX_GRPC_PAYLOAD_SIZE);
         
-        let frame = encode_grpc_message(payload);
-        let frame_len = frame.len();
+        let estimated_frame_size = desired_payload_size + 20;
         
-        let capacity = self.send_stream.capacity();
-        if capacity < frame_len {
-            self.send_stream.reserve_capacity(frame_len);
+        let payload_size = if available_capacity >= estimated_frame_size {
+            // 容量充足，发送完整 payload
+            desired_payload_size
+        } else if available_capacity > 20 {
+            (available_capacity - 20).min(desired_payload_size)
+        } else {
+            // 容量不足，请求更多容量
+            self.send_stream.reserve_capacity(estimated_frame_size);
             match self.send_stream.poll_capacity(cx) {
-                Poll::Ready(Some(Ok(_))) => {
-                    // 容量已准备好，继续发送
+                Poll::Ready(Some(Ok(new_capacity))) => {
+                    let adjusted_size = (new_capacity - 20).min(desired_payload_size);
+                    if adjusted_size == 0 {
+                        return Poll::Ready(Ok(false));
+                    }
+                    adjusted_size
                 }
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Err(io::Error::new(
@@ -543,12 +553,14 @@ impl GrpcH2cTransport {
                     return Poll::Pending;
                 }
             }
-        }
+        };
         
+        let payload = &self.write_buf[..payload_size];
+        let frame = encode_grpc_message(payload);
         let frame_bytes = frame.freeze();
+        
         match self.send_stream.send_data(frame_bytes, false) {
             Ok(()) => {
-                // 只清除已发送的数据，保留剩余数据
                 self.write_buf.advance(payload_size);
                 Poll::Ready(Ok(true))
             }
