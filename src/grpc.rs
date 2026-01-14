@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::io;
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
-use h2::{server, SendStream, Reason, FlowControl};
+use h2::{server, SendStream, Reason};
 use http::{Response, StatusCode};
 use anyhow::Result;
 use tokio::sync::{Semaphore, mpsc};
@@ -14,7 +14,7 @@ const READ_BUFFER_SIZE: usize = 256 * 1024;
 const WRITE_BUFFER_SIZE: usize = 512 * 1024;
 const MAX_CONCURRENT_STREAMS: usize = 100;
 const MAX_HEADER_LIST_SIZE: u32 = 2 * 1024;
-const MAX_GRPC_PAYLOAD_SIZE: usize = 4 * 1024 * 1024;
+const MAX_GRPC_PAYLOAD_SIZE: usize = 16 * 1024;
 const CHANNEL_BUFFER_SIZE: usize = 1024;
 
 /// gRPC HTTP/2 连接管理器
@@ -102,7 +102,7 @@ where
                             };
 
                             let mut recv_stream = request.into_body();
-                            let flow_control: _ = recv_stream.flow_control().clone();
+                            let mut flow_control = recv_stream.flow_control().clone();
 
                             let permit = match stream_semaphore.clone().try_acquire_owned() {
                                 Ok(permit) => permit,
@@ -119,14 +119,16 @@ where
                             };
 
                             // 创建 channel 用于后台任务传递数据
-                            // 不立即释放容量，延迟到真正消费后
                             let (recv_tx, recv_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
                             
                             tokio::spawn(async move {
                                 loop {
                                     match recv_stream.data().await {
                                         Some(Ok(chunk)) => {
-                                            // 不立即释放容量，延迟到真正消费后
+                                            let chunk_len = chunk.len();
+                                            // 立即释放流控窗口，避免高RTT下限制吞吐
+                                            let _ = flow_control.release_capacity(chunk_len);
+                                            
                                             if recv_tx.send(Ok(chunk)).await.is_err() {
                                                 // receiver 已关闭
                                                 break;
@@ -151,9 +153,6 @@ where
                                 write_buf: BytesMut::with_capacity(WRITE_BUFFER_SIZE),
                                 closed: false,
                                 recv_rx,
-                                flow_control,
-                                received_bytes: 0,
-                                released_bytes: 0,
                             };
 
                             let handler_clone = Arc::clone(&handler);
@@ -204,9 +203,6 @@ pub struct GrpcH2cTransport {
     write_buf: BytesMut,
     closed: bool,
     recv_rx: mpsc::Receiver<Result<Bytes, h2::Error>>,
-    flow_control: FlowControl,
-    received_bytes: usize,  // 累计已接收的字节数（从 channel 接收的）
-    released_bytes: usize,  // 累计已释放的字节数（从 read_pending advance 后释放的）
 }
 
 /// 解析 gRPC 消息帧（兼容 v2ray 格式）
@@ -355,16 +351,8 @@ impl AsyncRead for GrpcH2cTransport {
                         None
                     };
                     
-                    // 真正消费：从 read_pending 中 advance 掉 consumed 字节
+                    // 从 read_pending 中 advance 掉 consumed 字节
                     self.read_pending.advance(consumed);
-                    
-                    // 释放对应的容量：当 gRPC frame 的字节已经从 read_pending 中 advance 掉
-                    // 释放的容量不能超过已接收的容量
-                    let to_release = consumed.min(self.received_bytes - self.released_bytes);
-                    if to_release > 0 {
-                        let _ = self.flow_control.release_capacity(to_release);
-                        self.released_bytes += to_release;
-                    }
                     
                     buf.put_slice(&payload_data);
                     
@@ -384,17 +372,7 @@ impl AsyncRead for GrpcH2cTransport {
             // 从 channel 接收数据，由后台任务发送
             match self.recv_rx.poll_recv(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
-                    let chunk_len = chunk.len();
                     self.read_pending.extend_from_slice(&chunk);
-                    self.received_bytes += chunk_len;
-                    
-                    if self.read_pending.len() < READ_BUFFER_SIZE / 4 {
-                        let to_release = chunk_len.min(self.received_bytes - self.released_bytes);
-                        if to_release > 0 {
-                            let _ = self.flow_control.release_capacity(to_release);
-                            self.released_bytes += to_release;
-                        }
-                    }
                 }
                 Poll::Ready(Some(Err(e))) => {
                     self.closed = true;
