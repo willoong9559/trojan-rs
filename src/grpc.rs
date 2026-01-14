@@ -15,6 +15,7 @@ const WRITE_BUFFER_SIZE: usize = 512 * 1024;
 const MAX_CONCURRENT_STREAMS: usize = 100;
 const MAX_HEADER_LIST_SIZE: u32 = 2 * 1024;
 const MAX_GRPC_PAYLOAD_SIZE: usize = 4 * 1024 * 1024;
+const CHANNEL_BUFFER_SIZE: usize = 1024;
 
 /// gRPC HTTP/2 连接管理器
 /// 
@@ -119,7 +120,7 @@ where
 
                             // 创建 channel 用于后台任务传递数据
                             // 不立即释放容量，延迟到真正消费后
-                            let (recv_tx, recv_rx) = mpsc::channel(1024);
+                            let (recv_tx, recv_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
                             
                             tokio::spawn(async move {
                                 loop {
@@ -383,9 +384,17 @@ impl AsyncRead for GrpcH2cTransport {
             // 从 channel 接收数据，由后台任务发送
             match self.recv_rx.poll_recv(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
+                    let chunk_len = chunk.len();
                     self.read_pending.extend_from_slice(&chunk);
-                    // 记录累计的已接收容量，等待真正消费后释放
-                    self.received_bytes += chunk.len();
+                    self.received_bytes += chunk_len;
+                    
+                    if self.read_pending.len() < READ_BUFFER_SIZE / 4 {
+                        let to_release = chunk_len.min(self.received_bytes - self.released_bytes);
+                        if to_release > 0 {
+                            let _ = self.flow_control.release_capacity(to_release);
+                            self.released_bytes += to_release;
+                        }
+                    }
                 }
                 Poll::Ready(Some(Err(e))) => {
                     self.closed = true;
@@ -423,25 +432,43 @@ impl AsyncWrite for GrpcH2cTransport {
             )));
         }
 
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
         // 尝试发送待发送的数据
         if !self.write_buf.is_empty() {
             match self.try_send_pending(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    // 如果缓冲区还有很多空间，接受新数据
+                    if self.write_buf.len() < WRITE_BUFFER_SIZE / 2 {
+                        let to_write = buf.len().min(WRITE_BUFFER_SIZE - self.write_buf.len());
+                        if to_write > 0 {
+                            self.write_buf.extend_from_slice(&buf[..to_write]);
+                            return Poll::Ready(Ok(to_write));
+                        }
+                    }
+                    return Poll::Pending;
+                }
             }
         }
 
-        if self.write_buf.len() + buf.len() > WRITE_BUFFER_SIZE {
+        // 计算可以写入的数据量
+        let available = WRITE_BUFFER_SIZE.saturating_sub(self.write_buf.len());
+        if available == 0 {
             return Poll::Pending;
         }
         
-        self.write_buf.extend_from_slice(buf);
+        let to_write = buf.len().min(available);
+        self.write_buf.extend_from_slice(&buf[..to_write]);
         
+        // 尝试立即发送
         match self.try_send_pending(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(to_write)),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => Poll::Ready(Ok(to_write)),
         }
     }
 
@@ -486,13 +513,10 @@ impl GrpcH2cTransport {
             return Poll::Ready(Ok(()));
         }
 
-        let mut sent = 0;
-        const MAX_FRAMES_PER_LOOP: usize = 100;
-        
-        while sent < MAX_FRAMES_PER_LOOP && !self.write_buf.is_empty() {
+        while !self.write_buf.is_empty() {
             match self.try_send_one_frame(cx) {
                 Poll::Ready(Ok(true)) => {
-                    sent += 1;
+                    // 成功发送一帧，继续
                 }
                 Poll::Ready(Ok(false)) => {
                     // 没有数据可发送
