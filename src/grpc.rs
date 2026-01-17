@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use h2::{server, SendStream, RecvStream, Reason};
 use http::{Response, StatusCode};
 use anyhow::Result;
@@ -17,6 +18,7 @@ const MAX_CONCURRENT_STREAMS: usize = 100;
 const MAX_HEADER_LIST_SIZE: u32 = 2 * 1024;
 const INITIAL_WINDOW_SIZE: u32 = 1024 * 1024;
 const INITIAL_CONNECTION_WINDOW_SIZE: u32 = 2 * 1024 * 1024;
+const CONNECTION_IDLE_TIMEOUT_SECS: u64 = 300;
 
 /// gRPC HTTP/2 连接管理器
 /// 
@@ -24,6 +26,7 @@ const INITIAL_CONNECTION_WINDOW_SIZE: u32 = 2 * 1024 * 1024;
 pub struct GrpcH2cConnection<S> {
     h2_conn: server::Connection<S, Bytes>,
     stream_semaphore: Arc<Semaphore>,
+    active_count: Arc<AtomicUsize>,
 }
 
 impl<S> GrpcH2cConnection<S>
@@ -45,6 +48,7 @@ where
         Ok(Self { 
             h2_conn,
             stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
+            active_count: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -53,11 +57,11 @@ where
         F: Fn(GrpcH2cTransport) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
-        const CONNECTION_IDLE_TIMEOUT_SECS: u64 = 300; // 5分钟无新流则关闭连接
         
         let handler = Arc::new(handler);
         let mut h2_conn = self.h2_conn;
         let stream_semaphore = self.stream_semaphore;
+        let active_count = self.active_count;
         let mut last_stream_time = std::time::Instant::now();
         
         loop {
@@ -130,11 +134,14 @@ where
                             };
 
                             let handler_clone = Arc::clone(&handler);
+                            let active_count_clone = Arc::clone(&active_count);
+                            active_count_clone.fetch_add(1, Ordering::Relaxed);
                             tokio::spawn(async move {
                                 let _permit = permit;
                                 if let Err(_e) = handler_clone(transport).await {
                                     // 记录流处理错误，但不影响其他流
                                 }
+                                active_count_clone.fetch_sub(1, Ordering::Relaxed);
                             });
                         }
                         Some(Err(e)) => {
@@ -149,8 +156,13 @@ where
                 }
                 _ = timeout_future => {
                     let idle_time = last_stream_time.elapsed();
-                    if idle_time.as_secs() >= CONNECTION_IDLE_TIMEOUT_SECS {
-                        warn!(idle_secs = idle_time.as_secs(), "gRPC connection idle timeout, closing");
+                    let current_active = active_count.load(Ordering::Relaxed);
+                    if idle_time.as_secs() >= CONNECTION_IDLE_TIMEOUT_SECS && current_active == 0 {
+                        warn!(
+                            idle_secs = idle_time.as_secs(), 
+                            active_count = current_active,
+                            "gRPC connection idle timeout with no active streams, closing"
+                        );
                         break;
                     }
                 }
