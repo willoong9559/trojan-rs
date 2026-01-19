@@ -96,6 +96,8 @@ where
                             let response = Response::builder()
                                 .status(StatusCode::OK)
                                 .header("content-type", "application/grpc")
+                                .header("te", "trailers")
+                                .header("grpc-accept-encoding", "identity,deflate,gzip")
                                 .body(())
                                 .unwrap();
 
