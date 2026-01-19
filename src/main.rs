@@ -261,7 +261,10 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         let mut buf = vec![0u8; BUF_SIZE];
         loop {
             match client_read.read(&mut buf).await {
-                Ok(0) => break, // EOF
+                Ok(0) => {
+                    let _ = remote_write.shutdown().await;
+                    break;
+                }
                 Ok(n) => {
                     *last_activity_clone1.lock().await = Instant::now();
                     if let Err(e) = remote_write.write_all(&buf[..n]).await {
@@ -282,7 +285,10 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         let mut buf = vec![0u8; BUF_SIZE];
         loop {
             match remote_read.read(&mut buf).await {
-                Ok(0) => break, // EOF
+                Ok(0) => {
+                    let _ = client_write.shutdown().await;
+                    break;
+                }
                 Ok(n) => {
                     *last_activity_clone2.lock().await = Instant::now();
                     if let Err(e) = client_write.write_all(&buf[..n]).await {
