@@ -21,7 +21,7 @@ use anyhow::{Result, anyhow};
 use tokio_rustls::{TlsAcceptor};
 use bytes::Bytes;
 
-const BUF_SIZE: usize = 4 * 1024;
+const BUF_SIZE: usize = 32 * 1024;
 
 const CONNECTION_TIMEOUT_SECS: u64 = 300;
 const TCP_CONNECT_TIMEOUT_SECS: u64 = 10;
