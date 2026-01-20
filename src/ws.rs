@@ -112,7 +112,7 @@ where
                 Poll::Ready(Ok(())) => {
                     // 发送缓冲区中的数据
                     let data = std::mem::take(&mut self.write_buffer);
-                    match Sink::start_send(self.ws_stream.as_mut(), Message::Binary(data)) {
+                    match Sink::start_send(self.ws_stream.as_mut(), Message::Binary(data.into())) {
                         Ok(()) => {
                             self.write_pending = false;
                         }
@@ -143,7 +143,7 @@ where
         match Sink::poll_ready(self.ws_stream.as_mut(), cx) {
             Poll::Ready(Ok(())) => {
                 let data = std::mem::take(&mut self.write_buffer);
-                match Sink::start_send(self.ws_stream.as_mut(), Message::Binary(data)) {
+                match Sink::start_send(self.ws_stream.as_mut(), Message::Binary(data.into())) {
                     Ok(()) => {
                         Poll::Ready(Ok(buf.len()))
                     }
@@ -178,7 +178,7 @@ where
                 Poll::Ready(Ok(())) => {
                     if !self.write_buffer.is_empty() {
                         let data = std::mem::take(&mut self.write_buffer);
-                        match Sink::start_send(self.ws_stream.as_mut(), Message::Binary(data)) {
+                        match Sink::start_send(self.ws_stream.as_mut(), Message::Binary(data.into())) {
                             Ok(()) => {
                                 self.write_pending = false;
                             }
