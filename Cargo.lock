@@ -1420,6 +1420,7 @@ dependencies = [
  "h2",
  "hex",
  "http",
+ "pin-project-lite",
  "rustls",
  "rustls-pemfile",
  "serde",

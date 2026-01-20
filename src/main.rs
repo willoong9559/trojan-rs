@@ -7,18 +7,17 @@ mod ws;
 mod grpc;
 mod error;
 mod logger;
+mod relay;
 
 use logger::log;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use anyhow::{Result, anyhow};
-use tokio_rustls::{TlsAcceptor};
+use tokio_rustls::TlsAcceptor;
 use bytes::Bytes;
 
 const BUF_SIZE: usize = 32 * 1024;
@@ -242,90 +241,18 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         remote_stream.write_all(&initial_payload).await?;
     }
 
-    // 双向转发
-    let (mut client_read, mut client_write) = tokio::io::split(client_stream);
-    let (mut remote_read, mut remote_write) = tokio::io::split(remote_stream);
-
-    let start_time = Instant::now();
-    let last_activity_secs = Arc::new(AtomicU64::new(0));
-
-    let last_activity_clone1 = Arc::clone(&last_activity_secs);
-    let last_activity_clone2 = Arc::clone(&last_activity_secs);
-    let last_activity_for_timeout = Arc::clone(&last_activity_secs);
-
-    let start_time1 = start_time;
-    let start_time2 = start_time;
-
-    let peer_addr_for_log1 = peer_addr.clone();
-    let peer_addr_for_log2 = peer_addr.clone();
-    
-    let client_to_remote = async move {
-        let mut buf = vec![0u8; BUF_SIZE];
-        loop {
-            match client_read.read(&mut buf).await {
-                Ok(0) => {
-                    let _ = remote_write.shutdown().await;
-                    break;
-                }
-                Ok(n) => {
-                    last_activity_clone1.store(start_time1.elapsed().as_secs(), Ordering::Relaxed);
-                    if let Err(e) = remote_write.write_all(&buf[..n]).await {
-                        log::debug!(peer = %peer_addr_for_log1, error = %e, "Error writing to remote");
-                        break;
-                    }
-                }
-                Err(e) => {
-                    log::debug!(peer = %peer_addr_for_log1, error = %e, "Error reading from client");
-                    break;
-                }
-            }
+    match relay::copy_bidirectional_with_idle_timeout(
+        client_stream,
+        remote_stream,
+        CONNECTION_TIMEOUT_SECS,
+    ).await {
+        Ok(true) => {}
+        Ok(false) => {
+            log::warn!(peer = %peer_addr, "Connection timeout due to inactivity");
         }
-        Ok::<(), anyhow::Error>(())
-    };
-
-    let remote_to_client = async move {
-        let mut buf = vec![0u8; BUF_SIZE];
-        loop {
-            match remote_read.read(&mut buf).await {
-                Ok(0) => {
-                    let _ = client_write.shutdown().await;
-                    break;
-                }
-                Ok(n) => {
-                    last_activity_clone2.store(start_time2.elapsed().as_secs(), Ordering::Relaxed);
-                    if let Err(e) = client_write.write_all(&buf[..n]).await {
-                        log::debug!(peer = %peer_addr_for_log2, error = %e, "Error writing to client");
-                        break;
-                    }
-                }
-                Err(e) => {
-                    log::debug!(peer = %peer_addr_for_log2, error = %e, "Error reading from remote");
-                    break;
-                }
-            }
+        Err(e) => {
+            log::debug!(peer = %peer_addr, error = %e, "Copy bidirectional error");
         }
-        Ok::<(), anyhow::Error>(())
-    };
-
-    let timeout_check = async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            let last_active = last_activity_for_timeout.load(Ordering::Relaxed);
-            let current_elapsed = start_time.elapsed().as_secs();
-            let idle_secs = current_elapsed.saturating_sub(last_active);
-            if idle_secs >= CONNECTION_TIMEOUT_SECS {
-                log::warn!(peer = %peer_addr, idle_secs = idle_secs, "Connection timeout due to inactivity");
-                return Ok::<(), anyhow::Error>(());
-            }
-        }
-    };
-
-    tokio::select! {
-        _ = client_to_remote => {},
-        _ = remote_to_client => {},
-        _ = timeout_check => {},
     }
 
     Ok(())
