@@ -18,7 +18,6 @@ const MAX_CONCURRENT_STREAMS: usize = 100;
 const MAX_HEADER_LIST_SIZE: u32 = 2 * 1024;
 const INITIAL_WINDOW_SIZE: u32 = 1024 * 1024;
 const INITIAL_CONNECTION_WINDOW_SIZE: u32 = 2 * 1024 * 1024;
-const CONNECTION_IDLE_TIMEOUT_SECS: u64 = 300;
 
 // PING 心跳相关常量
 const PING_INTERVAL_SECS: u64 = 30;
@@ -66,7 +65,6 @@ where
         let mut h2_conn = self.h2_conn;
         let stream_semaphore = self.stream_semaphore;
         let active_count = self.active_count;
-        let mut last_activity_time = std::time::Instant::now();
         
         let mut ping_pong = h2_conn.ping_pong();
         
@@ -81,7 +79,6 @@ where
                 result = h2_conn.accept() => {
                     match result {
                         Some(Ok((request, mut respond))) => {
-                            last_activity_time = std::time::Instant::now();
                             missed_pings = 0;
                             
                             if request.method() != http::Method::POST {
@@ -170,18 +167,6 @@ where
                 
                 // 定期心跳检查
                 _ = ping_timer.tick() => {
-                    let idle_time = last_activity_time.elapsed();
-                    let current_active = active_count.load(Ordering::Relaxed);
-                    
-                    if idle_time.as_secs() >= CONNECTION_IDLE_TIMEOUT_SECS && current_active == 0 {
-                        warn!(
-                            idle_secs = idle_time.as_secs(), 
-                            active_count = current_active,
-                            "gRPC connection idle timeout with no active streams, closing"
-                        );
-                        break;
-                    }
-                    
                     if let Some(ref mut pp) = ping_pong {
                         match &ping_state {
                             PingState::Idle => {
@@ -221,7 +206,6 @@ where
                         Some(Ok(_pong)) => {
                             ping_state = PingState::Idle;
                             missed_pings = 0;
-                            last_activity_time = std::time::Instant::now();
                             debug!("Received HTTP/2 PONG response");
                         }
                         Some(Err(e)) => {
