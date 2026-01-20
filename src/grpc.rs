@@ -5,12 +5,12 @@ use std::task::{Context, Poll};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use h2::{server, SendStream, RecvStream, Reason};
+use h2::{server, SendStream, RecvStream, Reason, Ping};
 use http::{Response, StatusCode};
 use anyhow::Result;
 use futures_util::Future;
 use tokio::sync::Semaphore;
-use tracing::warn;
+use tracing::{warn, debug};
 
 const READ_BUFFER_SIZE: usize = 256 * 1024;
 const WRITE_BUFFER_SIZE: usize = 128 * 1024;
@@ -19,6 +19,11 @@ const MAX_HEADER_LIST_SIZE: u32 = 2 * 1024;
 const INITIAL_WINDOW_SIZE: u32 = 1024 * 1024;
 const INITIAL_CONNECTION_WINDOW_SIZE: u32 = 2 * 1024 * 1024;
 const CONNECTION_IDLE_TIMEOUT_SECS: u64 = 300;
+
+// PING 心跳相关常量
+const PING_INTERVAL_SECS: u64 = 30;
+const PING_TIMEOUT_SECS: u64 = 10;
+const MAX_MISSED_PINGS: u32 = 3;
 
 /// gRPC HTTP/2 连接管理器
 /// 
@@ -57,22 +62,27 @@ where
         F: Fn(GrpcH2cTransport) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
-        
         let handler = Arc::new(handler);
         let mut h2_conn = self.h2_conn;
         let stream_semaphore = self.stream_semaphore;
         let active_count = self.active_count;
-        let mut last_stream_time = std::time::Instant::now();
+        let mut last_activity_time = std::time::Instant::now();
+        
+        let mut ping_pong = h2_conn.ping_pong();
+        
+        let mut ping_state = PingState::Idle;
+        let mut missed_pings: u32 = 0;
+        let mut ping_timer = tokio::time::interval(tokio::time::Duration::from_secs(PING_INTERVAL_SECS));
+        ping_timer.tick().await;
         
         loop {
-            let accept_future = h2_conn.accept();
-            let timeout_future = tokio::time::sleep(tokio::time::Duration::from_secs(30));
-            
             tokio::select! {
-                result = accept_future => {
+                // 处理新的 HTTP/2 流请求
+                result = h2_conn.accept() => {
                     match result {
                         Some(Ok((request, mut respond))) => {
-                            last_stream_time = std::time::Instant::now();
+                            last_activity_time = std::time::Instant::now();
+                            missed_pings = 0;
                             
                             if request.method() != http::Method::POST {
                                 let response = Response::builder()
@@ -152,13 +162,17 @@ where
                         }
                         None => {
                             // 正常关闭
+                            debug!("gRPC connection closed normally");
                             break;
                         }
                     }
                 }
-                _ = timeout_future => {
-                    let idle_time = last_stream_time.elapsed();
+                
+                // 定期心跳检查
+                _ = ping_timer.tick() => {
+                    let idle_time = last_activity_time.elapsed();
                     let current_active = active_count.load(Ordering::Relaxed);
+                    
                     if idle_time.as_secs() >= CONNECTION_IDLE_TIMEOUT_SECS && current_active == 0 {
                         warn!(
                             idle_secs = idle_time.as_secs(), 
@@ -167,10 +181,83 @@ where
                         );
                         break;
                     }
+                    
+                    if let Some(ref mut pp) = ping_pong {
+                        match &ping_state {
+                            PingState::Idle => {
+                                let ping = Ping::opaque();
+                                if let Err(e) = pp.send_ping(ping) {
+                                    warn!(error = %e, "Failed to send HTTP/2 PING");
+                                } else {
+                                    ping_state = PingState::WaitingPong(std::time::Instant::now());
+                                    debug!("Sent HTTP/2 PING frame");
+                                }
+                            }
+                            PingState::WaitingPong(sent_time) => {
+                                // 检查上一个 PING 是否超时
+                                if sent_time.elapsed().as_secs() >= PING_TIMEOUT_SECS {
+                                    missed_pings += 1;
+                                    warn!(
+                                        missed_pings = missed_pings,
+                                        max_missed = MAX_MISSED_PINGS,
+                                        "HTTP/2 PING timeout, no PONG received"
+                                    );
+                                    
+                                    if missed_pings >= MAX_MISSED_PINGS {
+                                        warn!("Too many missed PING responses, connection appears dead");
+                                        return Err(anyhow::anyhow!("gRPC heartbeat timeout"));
+                                    }
+                                    
+                                    ping_state = PingState::Idle;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // 等待 PONG 响应
+                pong_result = poll_pong_if_waiting(&mut ping_pong, &ping_state) => {
+                    match pong_result {
+                        Some(Ok(_pong)) => {
+                            ping_state = PingState::Idle;
+                            missed_pings = 0;
+                            last_activity_time = std::time::Instant::now();
+                            debug!("Received HTTP/2 PONG response");
+                        }
+                        Some(Err(e)) => {
+                            warn!(error = %e, "HTTP/2 PONG receive error");
+                            return Err(anyhow::anyhow!("gRPC PONG error: {}", e));
+                        }
+                        None => {
+                            // 不在等待状态，继续
+                        }
+                    }
                 }
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Clone)]
+enum PingState {
+    Idle,
+    WaitingPong(std::time::Instant),
+}
+
+async fn poll_pong_if_waiting(
+    ping_pong: &mut Option<h2::PingPong>,
+    ping_state: &PingState,
+) -> Option<Result<h2::Pong, h2::Error>> {
+    if !matches!(ping_state, PingState::WaitingPong(_)) {
+        return std::future::pending().await;
+    }
+    
+    if let Some(ref mut pp) = ping_pong {
+        let result = futures_util::future::poll_fn(|cx| pp.poll_pong(cx)).await;
+        Some(result)
+    } else {
+        std::future::pending().await
     }
 }
 
@@ -336,8 +423,9 @@ impl AsyncRead for GrpcH2cTransport {
                         self.read_pos = 0;
                     }
                     
-                    // 释放流控容量
-                    let _ = self.recv_stream.flow_control().release_capacity(consumed);
+                    if let Err(e) = self.recv_stream.flow_control().release_capacity(consumed) {
+                        warn!(error = %e, consumed = consumed, "Failed to release HTTP/2 flow control capacity");
+                    }
                     self.read_pending.advance(consumed);
                     
                     return Poll::Ready(Ok(()));
