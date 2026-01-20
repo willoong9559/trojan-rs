@@ -418,12 +418,7 @@ impl AsyncRead for GrpcH2cTransport {
                 }
             }
 
-            let poll_result = {
-                let mut data_future = Box::pin(self.recv_stream.data());
-                data_future.as_mut().poll(cx)
-            };
-            
-            match poll_result {
+            match self.recv_stream.poll_data(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
                     let chunk_len = chunk.len();
                     self.read_pending.extend_from_slice(&chunk);
