@@ -12,6 +12,7 @@ use logger::log;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -245,14 +246,15 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     let (mut client_read, mut client_write) = tokio::io::split(client_stream);
     let (mut remote_read, mut remote_write) = tokio::io::split(remote_stream);
 
-    let last_activity = Arc::new(Mutex::new(Instant::now()));
+    let start_time = Instant::now();
+    let last_activity_secs = Arc::new(AtomicU64::new(0));
 
-    let last_activity_clone1 = Arc::clone(&last_activity);
-    let last_activity_clone2 = Arc::clone(&last_activity);
+    let last_activity_clone1 = Arc::clone(&last_activity_secs);
+    let last_activity_clone2 = Arc::clone(&last_activity_secs);
+    let last_activity_for_timeout = Arc::clone(&last_activity_secs);
 
-    if !initial_payload.is_empty() {
-        *last_activity.lock().await = Instant::now();
-    }
+    let start_time1 = start_time;
+    let start_time2 = start_time;
 
     let peer_addr_for_log1 = peer_addr.clone();
     let peer_addr_for_log2 = peer_addr.clone();
@@ -266,7 +268,7 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
                     break;
                 }
                 Ok(n) => {
-                    *last_activity_clone1.lock().await = Instant::now();
+                    last_activity_clone1.store(start_time1.elapsed().as_secs(), Ordering::Relaxed);
                     if let Err(e) = remote_write.write_all(&buf[..n]).await {
                         log::debug!(peer = %peer_addr_for_log1, error = %e, "Error writing to remote");
                         break;
@@ -290,7 +292,7 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
                     break;
                 }
                 Ok(n) => {
-                    *last_activity_clone2.lock().await = Instant::now();
+                    last_activity_clone2.store(start_time2.elapsed().as_secs(), Ordering::Relaxed);
                     if let Err(e) = client_write.write_all(&buf[..n]).await {
                         log::debug!(peer = %peer_addr_for_log2, error = %e, "Error writing to client");
                         break;
@@ -308,13 +310,13 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     let timeout_check = async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
         interval.tick().await;
-        let timeout_duration = tokio::time::Duration::from_secs(CONNECTION_TIMEOUT_SECS);
         loop {
             interval.tick().await;
-            let last_activity_guard = last_activity.lock().await;
-            let idle_time = last_activity_guard.elapsed();
-            if idle_time >= timeout_duration {
-                log::warn!(peer = %peer_addr, idle_secs = idle_time.as_secs(), "Connection timeout due to inactivity");
+            let last_active = last_activity_for_timeout.load(Ordering::Relaxed);
+            let current_elapsed = start_time.elapsed().as_secs();
+            let idle_secs = current_elapsed.saturating_sub(last_active);
+            if idle_secs >= CONNECTION_TIMEOUT_SECS {
+                log::warn!(peer = %peer_addr, idle_secs = idle_secs, "Connection timeout due to inactivity");
                 return Ok::<(), anyhow::Error>(());
             }
         }
