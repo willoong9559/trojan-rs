@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use h2::{server, SendStream, RecvStream, Reason, Ping};
 use http::{Response, StatusCode};
 use anyhow::Result;
-use futures_util::Future;
 use tokio::sync::Semaphore;
 use tracing::{warn, debug};
 
