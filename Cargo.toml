@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1.49", features = ["full", "signal"] }
-tokio-tungstenite = "0.20"
+tokio-tungstenite = "0.28"
 futures-util = "0.3"
 sha2 = "0.10"
 anyhow = "1.0"
