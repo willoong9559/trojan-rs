@@ -100,24 +100,6 @@ where
                                 continue;
                             }
 
-                            let response = Response::builder()
-                                .status(StatusCode::OK)
-                                .header("content-type", "application/grpc")
-                                .header("te", "trailers")
-                                .header("grpc-accept-encoding", "identity,deflate,gzip")
-                                .body(())
-                                .unwrap();
-
-                            let send_stream = match respond.send_response(response, false) {
-                                Ok(stream) => stream,
-                                Err(e) => {
-                                    warn!(error = %e, "Failed to send gRPC response");
-                                    continue;
-                                }
-                            };
-
-                            let recv_stream = request.into_body();
-
                             let permit = match stream_semaphore.clone().try_acquire_owned() {
                                 Ok(permit) => permit,
                                 Err(_) => {
@@ -131,6 +113,25 @@ where
                                     continue;
                                 }
                             };
+
+                            let response = Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "application/grpc")
+                                .header("te", "trailers")
+                                .header("grpc-accept-encoding", "identity,deflate,gzip")
+                                .body(())
+                                .unwrap();
+
+                            let send_stream = match respond.send_response(response, false) {
+                                Ok(stream) => stream,
+                                Err(e) => {
+                                    warn!(error = %e, "Failed to send gRPC response");
+                                    drop(permit);
+                                    continue;
+                                }
+                            };
+
+                            let recv_stream = request.into_body();
 
                             let transport = GrpcH2cTransport {
                                 recv_stream,
