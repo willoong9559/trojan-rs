@@ -24,11 +24,11 @@ pub fn get_tls_acceptor(cert_path: Option<String>, key_path: Option<String>, tra
 fn load_tls_config_with_transport_mode(cert_path: &str, key_path: &str, transport_mode: TransportMode) -> Result<TlsAcceptor> {
     let mut config = load_tls_config(cert_path, key_path)?;
     config.alpn_protocols = match transport_mode {
-        TransportMode::Grpc => {
-            vec![Vec::from(b"h2")]
+        TransportMode::Grpc | TransportMode::Tcp => {
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         }
-        _ => {
-            vec![Vec::from(b"http/1.1")]
+        TransportMode::WebSocket => {
+            vec![b"http/1.1".to_vec()]
         }
     };
     Ok(TlsAcceptor::from(Arc::new(config)))
