@@ -538,7 +538,10 @@ impl GrpcH2cTransport {
             
             self.send_stream.reserve_capacity(frame_len);
             match self.send_stream.poll_capacity(cx) {
-                Poll::Ready(Some(Ok(_))) => {
+                Poll::Ready(Some(Ok(new_capacity))) => {
+                    if new_capacity == 0 {
+                        return Poll::Pending;
+                    }
                     continue;
                 }
                 Poll::Ready(Some(Err(e))) => {
