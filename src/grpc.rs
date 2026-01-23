@@ -11,17 +11,22 @@ use anyhow::Result;
 use tokio::sync::Semaphore;
 use tracing::{warn, debug};
 
-const READ_BUFFER_SIZE: usize = 256 * 1024;
-const WRITE_BUFFER_SIZE: usize = 128 * 1024;
+const READ_BUFFER_SIZE: usize = 512 * 1024;
+const WRITE_BUFFER_SIZE: usize = 256 * 1024;
 const MAX_CONCURRENT_STREAMS: usize = 100;
-const MAX_HEADER_LIST_SIZE: u32 = 2 * 1024;
-const INITIAL_WINDOW_SIZE: u32 = 1024 * 1024;
-const INITIAL_CONNECTION_WINDOW_SIZE: u32 = 2 * 1024 * 1024;
+const MAX_HEADER_LIST_SIZE: u32 = 8 * 1024;
+// 流控窗口适应环境（BDP = 带宽 × RTT）
+// 例如 100Mbps @ 300ms RTT 需要约 3.75MB 窗口
+const INITIAL_WINDOW_SIZE: u32 = 8 * 1024 * 1024;
+const INITIAL_CONNECTION_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
+const MAX_FRAME_SIZE: u32 = 64 * 1024;
 
-// PING 心跳相关常量
 const PING_INTERVAL_SECS: u64 = 30;
-const PING_TIMEOUT_SECS: u64 = 10;
+const PING_TIMEOUT_SECS: u64 = 20;
 const MAX_MISSED_PINGS: u32 = 3;
+
+// 发送相关常量
+const MIN_SEND_CHUNK_SIZE: usize = 16 * 1024;
 
 /// gRPC HTTP/2 连接管理器
 /// 
@@ -41,6 +46,9 @@ where
             .max_header_list_size(MAX_HEADER_LIST_SIZE)
             .initial_window_size(INITIAL_WINDOW_SIZE)
             .initial_connection_window_size(INITIAL_CONNECTION_WINDOW_SIZE)
+            .max_frame_size(MAX_FRAME_SIZE)
+            .max_concurrent_streams(MAX_CONCURRENT_STREAMS as u32)
+            .max_send_buffer_size(WRITE_BUFFER_SIZE)
             .handshake(stream)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 handshake: {}", e)))?;
@@ -139,6 +147,8 @@ where
                                 read_buf: Bytes::new(),
                                 read_pos: 0,
                                 write_buf: BytesMut::with_capacity(WRITE_BUFFER_SIZE),
+                                pending_frame: None,
+                                pending_frame_offset: 0,
                                 closed: false,
                             };
 
@@ -255,6 +265,8 @@ pub struct GrpcH2cTransport {
     read_buf: Bytes,
     read_pos: usize,
     write_buf: BytesMut,
+    pending_frame: Option<Bytes>,
+    pending_frame_offset: usize,
     closed: bool,
 }
 
@@ -460,12 +472,17 @@ impl AsyncWrite for GrpcH2cTransport {
             )));
         }
 
-        // 尝试发送待发送的数据
-        if !self.write_buf.is_empty() {
+        if self.pending_frame.is_some() || !self.write_buf.is_empty() {
             match self.try_send_pending(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    if self.write_buf.len() + buf.len() <= WRITE_BUFFER_SIZE {
+                        self.write_buf.extend_from_slice(buf);
+                        return Poll::Ready(Ok(buf.len()));
+                    }
+                    return Poll::Pending;
+                }
             }
         }
 
@@ -473,7 +490,9 @@ impl AsyncWrite for GrpcH2cTransport {
             match self.try_send_pending(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
             }
         }
         
@@ -490,7 +509,7 @@ impl AsyncWrite for GrpcH2cTransport {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        if !self.write_buf.is_empty() {
+        if !self.write_buf.is_empty() || self.pending_frame.is_some() {
             self.try_send_pending(cx)
         } else {
             Poll::Ready(Ok(()))
@@ -505,14 +524,24 @@ impl AsyncWrite for GrpcH2cTransport {
         
         match self.as_mut().poll_flush(cx) {
             Poll::Ready(Ok(())) => {
+                if self.pending_frame.is_some() || !self.write_buf.is_empty() {
+                    return Poll::Pending;
+                }
+                
                 let mut trailers = http::HeaderMap::new();
                 trailers.insert("grpc-status", "0".parse().unwrap());
                 match self.send_stream.send_trailers(trailers) {
                     Ok(()) => Poll::Ready(Ok(())),
-                    Err(e) => Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("gRPC send trailers error: {}", e),
-                    ))),
+                    Err(e) => {
+                        if e.is_remote() || e.is_io() {
+                            Poll::Ready(Ok(()))
+                        } else {
+                            Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                format!("gRPC send trailers error: {}", e),
+                            )))
+                        }
+                    }
                 }
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
@@ -522,56 +551,138 @@ impl AsyncWrite for GrpcH2cTransport {
 }
 
 impl GrpcH2cTransport {
+    /// 尝试发送待发送的数据
+    /// 支持分块发送，不阻塞等待完整容量
     fn try_send_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(ref frame) = self.pending_frame {
+            let remaining = frame.len() - self.pending_frame_offset;
+            if remaining > 0 {
+                match self.try_send_frame_chunk(cx, remaining)? {
+                    Poll::Ready(()) => {
+                        self.pending_frame = None;
+                        self.pending_frame_offset = 0;
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            } else {
+                self.pending_frame = None;
+                self.pending_frame_offset = 0;
+            }
+        }
+
         if self.write_buf.is_empty() {
             return Poll::Ready(Ok(()));
         }
 
         let frame = encode_grpc_message(&self.write_buf);
-        let frame_len = frame.len();
-        
-        loop {
-            let capacity = self.send_stream.capacity();
-            if capacity >= frame_len {
-                break;
+        self.write_buf.clear();
+        self.pending_frame = Some(frame.freeze());
+        self.pending_frame_offset = 0;
+
+        let remaining = self.pending_frame.as_ref().unwrap().len();
+        match self.try_send_frame_chunk(cx, remaining)? {
+            Poll::Ready(()) => {
+                self.pending_frame = None;
+                self.pending_frame_offset = 0;
+                Poll::Ready(Ok(()))
             }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// 尝试发送帧的一部分或全部
+    /// 
+    /// 不会阻塞等待完整容量，而是发送当前可用的数据
+    fn try_send_frame_chunk(&mut self, cx: &mut Context<'_>, _needed: usize) -> Poll<io::Result<()>> {
+        let frame = match &self.pending_frame {
+            Some(f) => f,
+            None => return Poll::Ready(Ok(())),
+        };
+
+        loop {
+            let remaining = frame.len() - self.pending_frame_offset;
+            if remaining == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            let capacity = self.send_stream.capacity();
             
-            self.send_stream.reserve_capacity(frame_len);
-            match self.send_stream.poll_capacity(cx) {
-                Poll::Ready(Some(Ok(new_capacity))) => {
-                    if new_capacity == 0 {
-                        return Poll::Pending;
+            if capacity == 0 {
+                self.send_stream.reserve_capacity(remaining.min(MAX_FRAME_SIZE as usize));
+                match self.send_stream.poll_capacity(cx) {
+                    Poll::Ready(Some(Ok(new_cap))) => {
+                        if new_cap == 0 {
+                            return Poll::Pending;
+                        }
+                        continue;
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("gRPC capacity error: {}", e),
+                        )));
+                    }
+                    Poll::Ready(None) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "gRPC stream closed",
+                        )));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
+            let send_size = if remaining <= capacity {
+                remaining
+            } else if capacity >= MIN_SEND_CHUNK_SIZE {
+                capacity
+            } else {
+                self.send_stream.reserve_capacity(MIN_SEND_CHUNK_SIZE.min(remaining));
+                match self.send_stream.poll_capacity(cx) {
+                    Poll::Ready(Some(Ok(new_cap))) => {
+                        if new_cap >= MIN_SEND_CHUNK_SIZE || new_cap >= remaining {
+                            continue;
+                        }
+                        if new_cap > 0 {
+                            new_cap
+                        } else {
+                            return Poll::Pending;
+                        }
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("gRPC capacity error: {}", e),
+                        )));
+                    }
+                    Poll::Ready(None) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "gRPC stream closed",
+                        )));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            };
+
+            let chunk = frame.slice(self.pending_frame_offset..self.pending_frame_offset + send_size);
+            let is_last_chunk = self.pending_frame_offset + send_size >= frame.len();
+            
+            match self.send_stream.send_data(chunk, false) {
+                Ok(()) => {
+                    self.pending_frame_offset += send_size;
+                    if is_last_chunk {
+                        return Poll::Ready(Ok(()));
                     }
                     continue;
                 }
-                Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("gRPC capacity error: {}", e),
-                    )));
-                }
-                Poll::Ready(None) => {
+                Err(e) => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
-                        "gRPC stream closed",
+                        format!("gRPC send error: {}", e),
                     )));
                 }
-                Poll::Pending => {
-                    return Poll::Pending;
-                }
             }
-        }
-        
-        let frame_bytes = frame.freeze();
-        match self.send_stream.send_data(frame_bytes, false) {
-            Ok(()) => {
-                self.write_buf.clear();
-                Poll::Ready(Ok(()))
-            }
-            Err(e) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                format!("gRPC send error: {}", e),
-            ))),
         }
     }
 }
