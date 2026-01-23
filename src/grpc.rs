@@ -25,8 +25,9 @@ const PING_INTERVAL_SECS: u64 = 30;
 const PING_TIMEOUT_SECS: u64 = 20;
 const MAX_MISSED_PINGS: u32 = 3;
 
-// 发送相关常量
-const MIN_SEND_CHUNK_SIZE: usize = 16 * 1024;
+// gRPC 流式发送配置
+const GRPC_MAX_MESSAGE_SIZE: usize = 32 * 1024;
+const MIN_SEND_SIZE: usize = 4 * 1024;
 
 /// gRPC HTTP/2 连接管理器
 /// 
@@ -147,8 +148,9 @@ where
                                 read_buf: Bytes::new(),
                                 read_pos: 0,
                                 write_buf: BytesMut::with_capacity(WRITE_BUFFER_SIZE),
-                                pending_frame: None,
-                                pending_frame_offset: 0,
+                                send_queue: std::collections::VecDeque::new(),
+                                current_frame: None,
+                                current_frame_offset: 0,
                                 closed: false,
                             };
 
@@ -258,6 +260,7 @@ async fn poll_pong_if_waiting(
 /// gRPC 传输层（兼容 v2ray）
 /// 
 /// 实现 AsyncRead + AsyncWrite，可以像普通 TCP 流一样使用
+/// 采用流式发送：将大数据拆分成多个小 gRPC 帧，利用可用窗口立即发送
 pub struct GrpcH2cTransport {
     recv_stream: RecvStream,
     send_stream: SendStream<Bytes>,
@@ -265,8 +268,9 @@ pub struct GrpcH2cTransport {
     read_buf: Bytes,
     read_pos: usize,
     write_buf: BytesMut,
-    pending_frame: Option<Bytes>,
-    pending_frame_offset: usize,
+    send_queue: std::collections::VecDeque<Bytes>,
+    current_frame: Option<Bytes>,
+    current_frame_offset: usize,
     closed: bool,
 }
 
@@ -472,48 +476,35 @@ impl AsyncWrite for GrpcH2cTransport {
             )));
         }
 
-        if self.pending_frame.is_some() || !self.write_buf.is_empty() {
-            match self.try_send_pending(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {
-                    if self.write_buf.len() + buf.len() <= WRITE_BUFFER_SIZE {
-                        self.write_buf.extend_from_slice(buf);
-                        return Poll::Ready(Ok(buf.len()));
-                    }
-                    return Poll::Pending;
-                }
+        let _ = self.poll_send_queued(cx)?;
+
+        let buffer_space = WRITE_BUFFER_SIZE.saturating_sub(self.write_buf.len());
+        if buffer_space == 0 {
+            match self.poll_send_queued(cx)? {
+                Poll::Ready(()) => {}
+                Poll::Pending => return Poll::Pending,
             }
         }
 
-        if self.write_buf.len() + buf.len() > WRITE_BUFFER_SIZE {
-            match self.try_send_pending(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {
-                    return Poll::Pending;
-                }
-            }
-        }
-        
-        self.write_buf.extend_from_slice(buf);
-        
-        match self.try_send_pending(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Ready(Ok(buf.len())),
-        }
+        let to_write = buf.len().min(buffer_space.max(buf.len()));
+        self.write_buf.extend_from_slice(&buf[..to_write]);
+
+        self.encode_and_queue_frames();
+
+        let _ = self.poll_send_queued(cx)?;
+
+        Poll::Ready(Ok(to_write))
     }
 
     fn poll_flush(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        if !self.write_buf.is_empty() || self.pending_frame.is_some() {
-            self.try_send_pending(cx)
-        } else {
-            Poll::Ready(Ok(()))
+        if !self.write_buf.is_empty() {
+            self.encode_and_queue_frames();
         }
+        
+        self.poll_send_queued(cx)
     }
 
     fn poll_shutdown(
@@ -524,7 +515,7 @@ impl AsyncWrite for GrpcH2cTransport {
         
         match self.as_mut().poll_flush(cx) {
             Poll::Ready(Ok(())) => {
-                if self.pending_frame.is_some() || !self.write_buf.is_empty() {
+                if self.current_frame.is_some() || !self.send_queue.is_empty() || !self.write_buf.is_empty() {
                     return Poll::Pending;
                 }
                 
@@ -551,56 +542,53 @@ impl AsyncWrite for GrpcH2cTransport {
 }
 
 impl GrpcH2cTransport {
-    /// 尝试发送待发送的数据
-    /// 支持分块发送，不阻塞等待完整容量
-    fn try_send_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if let Some(ref frame) = self.pending_frame {
-            let remaining = frame.len() - self.pending_frame_offset;
-            if remaining > 0 {
-                match self.try_send_frame_chunk(cx, remaining)? {
-                    Poll::Ready(()) => {
-                        self.pending_frame = None;
-                        self.pending_frame_offset = 0;
-                    }
-                    Poll::Pending => return Poll::Pending,
-                }
-            } else {
-                self.pending_frame = None;
-                self.pending_frame_offset = 0;
-            }
-        }
-
-        if self.write_buf.is_empty() {
-            return Poll::Ready(Ok(()));
-        }
-
-        let frame = encode_grpc_message(&self.write_buf);
-        self.write_buf.clear();
-        self.pending_frame = Some(frame.freeze());
-        self.pending_frame_offset = 0;
-
-        let remaining = self.pending_frame.as_ref().unwrap().len();
-        match self.try_send_frame_chunk(cx, remaining)? {
-            Poll::Ready(()) => {
-                self.pending_frame = None;
-                self.pending_frame_offset = 0;
-                Poll::Ready(Ok(()))
-            }
-            Poll::Pending => Poll::Pending,
+    /// 将 write_buf 中的数据编码为多个 gRPC 帧并加入发送队列
+    /// 拆分大数据为多个小帧
+    fn encode_and_queue_frames(&mut self) {
+        while !self.write_buf.is_empty() {
+            let chunk_size = self.write_buf.len().min(GRPC_MAX_MESSAGE_SIZE);
+            let chunk = self.write_buf.split_to(chunk_size);
+            let frame = encode_grpc_message(&chunk);
+            self.send_queue.push_back(frame.freeze());
         }
     }
 
-    /// 尝试发送帧的一部分或全部
-    /// 
-    /// 不会阻塞等待完整容量，而是发送当前可用的数据
-    fn try_send_frame_chunk(&mut self, cx: &mut Context<'_>, _needed: usize) -> Poll<io::Result<()>> {
-        let frame = match &self.pending_frame {
+    fn poll_send_queued(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            if let Some(ref frame) = self.current_frame {
+                let remaining = frame.len() - self.current_frame_offset;
+                if remaining > 0 {
+                    match self.poll_send_current_frame(cx)? {
+                        Poll::Ready(()) => {
+                            self.current_frame = None;
+                            self.current_frame_offset = 0;
+                        }
+                        Poll::Pending => return Poll::Pending,
+                    }
+                } else {
+                    self.current_frame = None;
+                    self.current_frame_offset = 0;
+                }
+            }
+
+            match self.send_queue.pop_front() {
+                Some(frame) => {
+                    self.current_frame = Some(frame);
+                    self.current_frame_offset = 0;
+                }
+                None => return Poll::Ready(Ok(())),
+            }
+        }
+    }
+
+    fn poll_send_current_frame(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let frame = match &self.current_frame {
             Some(f) => f,
             None => return Poll::Ready(Ok(())),
         };
 
         loop {
-            let remaining = frame.len() - self.pending_frame_offset;
+            let remaining = frame.len() - self.current_frame_offset;
             if remaining == 0 {
                 return Poll::Ready(Ok(()));
             }
@@ -608,7 +596,9 @@ impl GrpcH2cTransport {
             let capacity = self.send_stream.capacity();
             
             if capacity == 0 {
-                self.send_stream.reserve_capacity(remaining.min(MAX_FRAME_SIZE as usize));
+                let request_size = remaining.min(MAX_FRAME_SIZE as usize);
+                self.send_stream.reserve_capacity(request_size);
+                
                 match self.send_stream.poll_capacity(cx) {
                     Poll::Ready(Some(Ok(new_cap))) => {
                         if new_cap == 0 {
@@ -634,20 +624,18 @@ impl GrpcH2cTransport {
 
             let send_size = if remaining <= capacity {
                 remaining
-            } else if capacity >= MIN_SEND_CHUNK_SIZE {
+            } else if capacity >= MIN_SEND_SIZE {
                 capacity
             } else {
-                self.send_stream.reserve_capacity(MIN_SEND_CHUNK_SIZE.min(remaining));
+                let request_size = MIN_SEND_SIZE.min(remaining);
+                self.send_stream.reserve_capacity(request_size);
+                
                 match self.send_stream.poll_capacity(cx) {
                     Poll::Ready(Some(Ok(new_cap))) => {
-                        if new_cap >= MIN_SEND_CHUNK_SIZE || new_cap >= remaining {
+                        if new_cap >= MIN_SEND_SIZE || new_cap >= remaining {
                             continue;
                         }
-                        if new_cap > 0 {
-                            new_cap
-                        } else {
-                            return Poll::Pending;
-                        }
+                        if new_cap > 0 { new_cap } else { return Poll::Pending; }
                     }
                     Poll::Ready(Some(Err(e))) => {
                         return Poll::Ready(Err(io::Error::new(
@@ -665,16 +653,14 @@ impl GrpcH2cTransport {
                 }
             };
 
-            let chunk = frame.slice(self.pending_frame_offset..self.pending_frame_offset + send_size);
-            let is_last_chunk = self.pending_frame_offset + send_size >= frame.len();
+            let chunk = frame.slice(self.current_frame_offset..self.current_frame_offset + send_size);
             
             match self.send_stream.send_data(chunk, false) {
                 Ok(()) => {
-                    self.pending_frame_offset += send_size;
-                    if is_last_chunk {
+                    self.current_frame_offset += send_size;
+                    if self.current_frame_offset >= frame.len() {
                         return Poll::Ready(Ok(()));
                     }
-                    continue;
                 }
                 Err(e) => {
                     return Poll::Ready(Err(io::Error::new(
