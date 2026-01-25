@@ -30,25 +30,36 @@ impl H2Heartbeat {
     }
 
     pub async fn poll(&mut self) -> Result<(), &'static str> {
-        tokio::select! {
-            _ = self.timer.tick() => {
-                self.handle_tick()
-            }
-            result = self.poll_pong() => {
-                match result {
-                    Some(Ok(_)) => {
+        let waiting_pong = matches!(self.state, HeartbeatState::WaitingPong(_));
+        
+        if waiting_pong {
+            if let Some(ref mut pp) = self.ping_pong {
+                tokio::select! {
+                    _ = self.timer.tick() => {
+                        self.handle_tick()
+                    }
+                    result = futures_util::future::poll_fn(|cx| pp.poll_pong(cx)) => {
                         self.state = HeartbeatState::Idle;
                         self.missed_pings = 0;
-                        debug!("Received HTTP/2 PONG response");
-                        Ok(())
+                        match result {
+                            Ok(_) => {
+                                debug!("Received HTTP/2 PONG response");
+                                Ok(())
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "HTTP/2 PONG receive error");
+                                Err("PONG error")
+                            }
+                        }
                     }
-                    Some(Err(e)) => {
-                        warn!(error = %e, "HTTP/2 PONG receive error");
-                        Err("PONG error")
-                    }
-                    None => Ok(()),
                 }
+            } else {
+                self.timer.tick().await;
+                self.handle_tick()
             }
+        } else {
+            self.timer.tick().await;
+            self.handle_tick()
         }
     }
 

@@ -4,7 +4,6 @@ mod heartbeat;
 mod codec;
 
 pub use connection::GrpcH2cConnection;
-pub use transport::GrpcH2cTransport;
 
 // HTTP/2 配置
 pub(crate) const READ_BUFFER_SIZE: usize = 512 * 1024;
