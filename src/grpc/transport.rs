@@ -19,6 +19,7 @@ pub struct GrpcH2cTransport {
     pub(crate) read_pending: BytesMut,
     pub(crate) read_buf: Bytes,
     pub(crate) read_pos: usize,
+    pub(crate) pending_release_capacity: usize,
     pub(crate) send_queue: VecDeque<Bytes>,
     pub(crate) send_queue_bytes: usize,
     pub(crate) current_frame: Option<Bytes>,
@@ -34,6 +35,7 @@ impl GrpcH2cTransport {
             read_pending: BytesMut::with_capacity(READ_BUFFER_SIZE),
             read_buf: Bytes::new(),
             read_pos: 0,
+            pending_release_capacity: 0,
             send_queue: VecDeque::new(),
             send_queue_bytes: 0,
             current_frame: None,
@@ -151,6 +153,14 @@ impl AsyncRead for GrpcH2cTransport {
             buf.put_slice(&remaining[..to_copy]);
             self.read_pos += to_copy;
 
+            if self.pending_release_capacity > 0 {
+                let to_release = self.pending_release_capacity.min(to_copy);
+                if let Err(e) = self.recv_stream.flow_control().release_capacity(to_release) {
+                    warn!(error = %e, to_release, "Failed to release HTTP/2 flow control capacity");
+                }
+                self.pending_release_capacity -= to_release;
+            }
+
             if self.read_pos >= self.read_buf.len() {
                 self.read_buf = Bytes::new();
                 self.read_pos = 0;
@@ -170,6 +180,15 @@ impl AsyncRead for GrpcH2cTransport {
                     }
                     
                     self.read_pending.advance(consumed);
+                    
+                    let to_release = self.pending_release_capacity.min(consumed);
+                    if to_release > 0 {
+                        if let Err(e) = self.recv_stream.flow_control().release_capacity(to_release) {
+                            warn!(error = %e, to_release, "Failed to release HTTP/2 flow control capacity");
+                        }
+                        self.pending_release_capacity -= to_release;
+                    }
+                    
                     return Poll::Ready(Ok(()));
                 }
                 Ok(None) => {}
@@ -180,9 +199,7 @@ impl AsyncRead for GrpcH2cTransport {
                 Poll::Ready(Some(Ok(chunk))) => {
                     let chunk_len = chunk.len();
                     self.read_pending.extend_from_slice(&chunk);
-                    if let Err(e) = self.recv_stream.flow_control().release_capacity(chunk_len) {
-                        warn!(error = %e, chunk_len = chunk_len, "Failed to release HTTP/2 flow control capacity");
-                    }
+                    self.pending_release_capacity += chunk_len;
                 }
                 Poll::Ready(Some(Err(e))) => {
                     self.closed = true;
