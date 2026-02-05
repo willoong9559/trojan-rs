@@ -14,7 +14,7 @@ use super::transport::GrpcH2cTransport;
 use super::{
     MAX_CONCURRENT_STREAMS, MAX_HEADER_LIST_SIZE,
     INITIAL_WINDOW_SIZE, INITIAL_CONNECTION_WINDOW_SIZE,
-    MAX_FRAME_SIZE, MAX_SEND_QUEUE_BYTES,
+    MAX_FRAME_SIZE, MAX_SEND_QUEUE_BYTES, MAX_CONNECTION_AGE_SECS,
 };
 
 /// gRPC HTTP/2 连接管理器
@@ -60,6 +60,11 @@ where
         let active_count = self.active_count;
         
         let mut heartbeat = H2Heartbeat::new(h2_conn.ping_pong());
+        
+        let max_age_timer = tokio::time::sleep(
+            tokio::time::Duration::from_secs(MAX_CONNECTION_AGE_SECS)
+        );
+        tokio::pin!(max_age_timer);
         
         loop {
             tokio::select! {
@@ -146,6 +151,15 @@ where
                     if let Err(e) = result {
                         return Err(anyhow::anyhow!("gRPC {}", e));
                     }
+                }
+                
+                _ = &mut max_age_timer => {
+                    debug!(
+                        max_age_secs = MAX_CONNECTION_AGE_SECS,
+                        active_streams = active_count.load(Ordering::Relaxed),
+                        "gRPC connection max age reached, closing"
+                    );
+                    break;
                 }
             }
         }
