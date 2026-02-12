@@ -61,8 +61,8 @@ impl<S: AsyncWrite> AsyncWrite for TimedStream<S> {
 
 /// 双向转发，支持空闲超时检测
 pub async fn copy_bidirectional_with_idle_timeout<A, B>(
-    a: A,
-    b: B,
+    a: &mut A,
+    b: &mut B,
     idle_timeout_secs: u64,
 ) -> std::io::Result<bool>
 where
