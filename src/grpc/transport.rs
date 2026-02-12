@@ -127,6 +127,23 @@ impl GrpcH2cTransport {
             }
         }
     }
+
+    fn poll_wait_send_capacity(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.send_stream.reserve_capacity(MAX_FRAME_SIZE as usize);
+        match self.send_stream.poll_capacity(cx) {
+            Poll::Ready(Some(Ok(cap))) if cap > 0 => Poll::Ready(Ok(())),
+            Poll::Ready(Some(Ok(_))) => Poll::Pending,
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("gRPC capacity error: {}", e),
+            ))),
+            Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "gRPC stream closed",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 fn is_normal_stream_close(error: &h2::Error) -> bool {
@@ -242,10 +259,20 @@ impl AsyncWrite for GrpcH2cTransport {
             )));
         }
 
-        let _ = self.poll_send_queued(cx)?;
+        match self.poll_send_queued(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
 
         if self.send_queue_bytes >= MAX_SEND_QUEUE_BYTES {
-            return Poll::Pending;
+            return match self.poll_wait_send_capacity(cx) {
+                Poll::Ready(Ok(())) => {
+                    Poll::Pending
+                }
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            };
         }
 
         let to_write = buf.len().min(GRPC_MAX_MESSAGE_SIZE);
@@ -254,7 +281,11 @@ impl AsyncWrite for GrpcH2cTransport {
         self.send_queue.push_back(frame.freeze());
         self.send_queue_bytes += frame_bytes;
 
-        let _ = self.poll_send_queued(cx)?;
+        match self.poll_send_queued(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
 
         Poll::Ready(Ok(to_write))
     }
@@ -299,4 +330,3 @@ impl AsyncWrite for GrpcH2cTransport {
         }
     }
 }
-
