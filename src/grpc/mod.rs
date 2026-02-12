@@ -18,9 +18,6 @@ pub(crate) const PING_INTERVAL_SECS: u64 = 30;
 pub(crate) const PING_TIMEOUT_SECS: u64 = 20;
 pub(crate) const MAX_MISSED_PINGS: u32 = 3;
 
-// 连接生命周期配置
-pub(crate) const MAX_CONNECTION_AGE_SECS: u64 = 3600;
-
 // gRPC 配置
 pub(crate) const GRPC_MAX_MESSAGE_SIZE: usize = 32 * 1024;
 pub(crate) const MAX_SEND_QUEUE_BYTES: usize = 512 * 1024;
