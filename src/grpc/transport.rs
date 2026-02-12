@@ -198,6 +198,14 @@ impl AsyncRead for GrpcH2cTransport {
             match self.recv_stream.poll_data(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
                     let chunk_len = chunk.len();
+
+                    if self.read_pending.len() + chunk_len > READ_BUFFER_SIZE {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "gRPC read buffer overflow",
+                        )));
+                    }
+                    
                     self.read_pending.extend_from_slice(&chunk);
                     self.pending_release_capacity += chunk_len;
                 }
