@@ -8,7 +8,6 @@ mod grpc;
 mod error;
 mod logger;
 mod relay;
-mod pool;
 
 use logger::log;
 
@@ -20,7 +19,6 @@ use tokio::sync::Mutex;
 use anyhow::{Result, anyhow};
 use tokio_rustls::TlsAcceptor;
 use bytes::Bytes;
-use pool::OutboundConnectionPool;
 
 const BUF_SIZE: usize = 32 * 1024;
 
@@ -41,7 +39,6 @@ pub struct Server {
     pub enable_udp: bool,
     pub udp_associations: Arc<Mutex<HashMap<String, udp::UdpAssociation>>>,
     pub tls_acceptor: Option<TlsAcceptor>,
-    pub outbound_pool: Arc<OutboundConnectionPool>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -196,7 +193,7 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
     match request.cmd {
         TrojanCmd::Connect => {
-            handle_connect(server, stream, request.addr, request.payload, peer_addr).await
+            handle_connect(stream, request.addr, request.payload, peer_addr).await
         }
         TrojanCmd::UdpAssociate => {
             if !server.enable_udp {
@@ -211,8 +208,7 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 // 统一的 CONNECT 处理
 
 async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
-    server: Arc<Server>,
-    mut client_stream: S,
+    client_stream: S,
     target_addr: socks5::Address,
     initial_payload: Bytes,
     peer_addr: String,
@@ -220,67 +216,40 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     log::info!(peer = %peer_addr, target = %target_addr.to_key(), "Connecting to target");
     
     let remote_addr = target_addr.to_socket_addr().await?;
-    let mut reused_connection = false;
-    let mut remote_stream = if let Some(stream) = server.outbound_pool.take_idle_connection(remote_addr) {
-        reused_connection = true;
-        log::debug!(peer = %peer_addr, remote = %remote_addr, "Reusing pooled outbound TCP connection");
-        stream
-    } else {
-        match tokio::time::timeout(
-            tokio::time::Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS),
-            TcpStream::connect(remote_addr),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => {
-                log::warn!(peer = %peer_addr, error = %e, "TCP connect failed");
-                return Err(e.into());
-            }
-            Err(_) => {
-                log::warn!(peer = %peer_addr, timeout_secs = TCP_CONNECT_TIMEOUT_SECS, "TCP connect timeout");
-                return Err(anyhow!(
-                    "TCP connect timeout after {} seconds",
-                    TCP_CONNECT_TIMEOUT_SECS
-                ));
-            }
+    let mut remote_stream = match tokio::time::timeout(
+        tokio::time::Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS),
+        TcpStream::connect(remote_addr),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => {
+            let _ = stream.set_nodelay(true);
+            stream
+        }
+        Ok(Err(e)) => {
+            log::warn!(peer = %peer_addr, error = %e, "TCP connect failed");
+            return Err(e.into());
+        }
+        Err(_) => {
+            log::warn!(peer = %peer_addr, timeout_secs = TCP_CONNECT_TIMEOUT_SECS, "TCP connect timeout");
+            return Err(anyhow!(
+                "TCP connect timeout after {} seconds",
+                TCP_CONNECT_TIMEOUT_SECS
+            ));
         }
     };
-    let _ = remote_stream.set_nodelay(true);
     log::info!(peer = %peer_addr, remote = %remote_addr, "Connected to remote server");
 
     if !initial_payload.is_empty() {
-        if let Err(e) = remote_stream.write_all(&initial_payload).await {
-            if reused_connection {
-                log::debug!(
-                    peer = %peer_addr,
-                    remote = %remote_addr,
-                    error = %e,
-                    "Write on pooled connection failed, retrying with a fresh connection"
-                );
-                remote_stream = tokio::time::timeout(
-                    tokio::time::Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS),
-                    TcpStream::connect(remote_addr),
-                )
-                .await
-                .map_err(|_| anyhow!("TCP connect timeout after {} seconds", TCP_CONNECT_TIMEOUT_SECS))??
-                ;
-                let _ = remote_stream.set_nodelay(true);
-                remote_stream.write_all(&initial_payload).await?;
-            } else {
-                return Err(e.into());
-            }
-        }
+        remote_stream.write_all(&initial_payload).await?;
     }
 
     match relay::copy_bidirectional_with_idle_timeout(
-        &mut client_stream,
-        &mut remote_stream,
+        client_stream,
+        remote_stream,
         CONNECTION_TIMEOUT_SECS,
     ).await {
-        Ok(true) => {
-            server.outbound_pool.store_idle_connection(remote_addr, remote_stream);
-        }
+        Ok(true) => {}
         Ok(false) => {
             log::warn!(peer = %peer_addr, "Connection timeout due to inactivity");
         }
@@ -427,7 +396,6 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         enable_udp: config.enable_udp,
         udp_associations: Arc::new(Mutex::new(HashMap::new())),
         tls_acceptor,
-        outbound_pool: Arc::new(OutboundConnectionPool::with_defaults()),
     })
 }
 
