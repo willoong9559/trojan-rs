@@ -17,6 +17,8 @@ pub struct GrpcH2cTransport {
     pub(crate) read_pending: BytesMut,
     pub(crate) read_buf: Bytes,
     pub(crate) read_pos: usize,
+    pub(crate) pending_frame: Option<Bytes>,
+    pub(crate) pending_frame_offset: usize,
     pub(crate) closed: bool,
     pub(crate) trailers_sent: bool,
 }
@@ -29,6 +31,8 @@ impl GrpcH2cTransport {
             read_pending: BytesMut::with_capacity(READ_BUFFER_SIZE),
             read_buf: Bytes::new(),
             read_pos: 0,
+            pending_frame: None,
+            pending_frame_offset: 0,
             closed: false,
             trailers_sent: false,
         }
@@ -103,15 +107,25 @@ impl GrpcH2cTransport {
         }
     }
 
-    fn poll_send_frame(&mut self, cx: &mut Context<'_>, frame: Bytes) -> Poll<io::Result<()>> {
-        let needed = frame.len();
+    fn poll_send_pending_frame(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.pending_frame.is_none() {
+            return Poll::Ready(Ok(()));
+        }
 
         loop {
+            let frame_len = self.pending_frame.as_ref().expect("checked above").len();
+            if self.pending_frame_offset >= frame_len {
+                self.pending_frame = None;
+                self.pending_frame_offset = 0;
+                return Poll::Ready(Ok(()));
+            }
+
+            let remaining = frame_len - self.pending_frame_offset;
             let capacity = self.send_stream.capacity();
-            if capacity < needed {
-                self.send_stream.reserve_capacity(needed.min(MAX_FRAME_SIZE as usize));
+            if capacity == 0 {
+                self.send_stream.reserve_capacity(remaining.min(MAX_FRAME_SIZE as usize));
                 match self.send_stream.poll_capacity(cx) {
-                    Poll::Ready(Some(Ok(cap))) if cap >= needed => continue,
+                    Poll::Ready(Some(Ok(cap))) if cap > 0 => continue,
                     Poll::Ready(Some(Ok(_))) => return Poll::Pending,
                     Poll::Ready(Some(Err(e))) => {
                         return Poll::Ready(Err(io::Error::new(
@@ -129,13 +143,28 @@ impl GrpcH2cTransport {
                 }
             }
 
-            return match self.send_stream.send_data(frame.clone(), false) {
-                Ok(()) => Poll::Ready(Ok(())),
-                Err(e) => Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    format!("gRPC send error: {}", e),
-                ))),
+            let send_size = remaining.min(capacity);
+            let chunk = {
+                let frame = self.pending_frame.as_ref().expect("checked above");
+                frame.slice(self.pending_frame_offset..self.pending_frame_offset + send_size)
             };
+
+            match self.send_stream.send_data(chunk, false) {
+                Ok(()) => {
+                    self.pending_frame_offset += send_size;
+                    if self.pending_frame_offset >= frame_len {
+                        self.pending_frame = None;
+                        self.pending_frame_offset = 0;
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+                Err(e) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        format!("gRPC send error: {}", e),
+                    )));
+                }
+            }
         }
     }
 
@@ -201,19 +230,26 @@ impl AsyncWrite for GrpcH2cTransport {
             return Poll::Ready(Ok(0));
         }
 
+        match self.poll_send_pending_frame(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
+
         // Frame strategy: each gRPC frame carries at most 32KiB payload.
         let to_write = Self::frame_payload_len(buf.len());
-        let frame = encode_grpc_message(&buf[..to_write]).freeze();
+        self.pending_frame = Some(encode_grpc_message(&buf[..to_write]).freeze());
+        self.pending_frame_offset = 0;
 
-        match self.poll_send_frame(cx, frame) {
+        match self.poll_send_pending_frame(cx) {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(to_write)),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => Poll::Ready(Ok(to_write)),
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_send_pending_frame(cx)
     }
 
     fn poll_shutdown(
