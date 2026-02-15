@@ -270,7 +270,7 @@ impl AsyncWrite for GrpcH2cTransport {
             Poll::Pending => return Poll::Pending,
         }
 
-        // Frame strategy: each gRPC message carries at most 4MiB payload.
+        // Frame strategy: each gRPC message carries at most 64KiB payload.
         // HTTP/2 frame splitting is handled by the h2 layer.
         let to_write = Self::frame_payload_len(buf.len());
         self.pending_frame = Some(encode_grpc_message(&buf[..to_write]).freeze());
