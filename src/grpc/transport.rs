@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use h2::{Reason, RecvStream, SendStream};
 
-use super::codec::{encode_grpc_message, parse_grpc_message};
+use super::codec::{encode_grpc_message, parse_grpc_prefix};
 use super::{GRPC_MAX_MESSAGE_SIZE, MAX_FRAME_SIZE, READ_BUFFER_SIZE};
 
 /// gRPC 传输层（兼容 v2ray）
@@ -15,8 +15,8 @@ pub struct GrpcH2cTransport {
     pub(crate) recv_stream: RecvStream,
     pub(crate) send_stream: SendStream<Bytes>,
     pub(crate) read_pending: BytesMut,
-    pub(crate) read_buf: Bytes,
-    pub(crate) read_pos: usize,
+    pub(crate) pending_release_capacity: usize,
+    pub(crate) payload_remaining: usize,
     pub(crate) pending_frame: Option<Bytes>,
     pub(crate) pending_frame_offset: usize,
     pub(crate) closed: bool,
@@ -29,8 +29,8 @@ impl GrpcH2cTransport {
             recv_stream,
             send_stream,
             read_pending: BytesMut::with_capacity(READ_BUFFER_SIZE),
-            read_buf: Bytes::new(),
-            read_pos: 0,
+            pending_release_capacity: 0,
+            payload_remaining: 0,
             pending_frame: None,
             pending_frame_offset: 0,
             closed: false,
@@ -38,41 +38,39 @@ impl GrpcH2cTransport {
         }
     }
 
-    fn copy_from_read_buffer(&mut self, buf: &mut ReadBuf<'_>) -> bool {
-        if self.read_pos >= self.read_buf.len() {
+    fn copy_payload_to_user(&mut self, buf: &mut ReadBuf<'_>) -> bool {
+        if self.payload_remaining == 0 || self.read_pending.is_empty() {
             return false;
         }
 
-        let remaining = &self.read_buf[self.read_pos..];
-        let to_copy = remaining.len().min(buf.remaining());
-        buf.put_slice(&remaining[..to_copy]);
-        self.read_pos += to_copy;
-
-        if self.read_pos >= self.read_buf.len() {
-            self.read_buf = Bytes::new();
-            self.read_pos = 0;
+        let to_copy = self
+            .payload_remaining
+            .min(self.read_pending.len())
+            .min(buf.remaining());
+        if to_copy == 0 {
+            return false;
         }
 
+        buf.put_slice(&self.read_pending[..to_copy]);
+        self.read_pending.advance(to_copy);
+        self.payload_remaining -= to_copy;
+        self.release_recv_capacity(to_copy);
         true
     }
 
-    fn parse_pending_message(&mut self, buf: &mut ReadBuf<'_>) -> io::Result<Option<()>> {
-        match parse_grpc_message(&self.read_pending)? {
-            Some((consumed, payload)) => {
-                let to_copy = payload.len().min(buf.remaining());
-                buf.put_slice(&payload[..to_copy]);
-
-                if to_copy < payload.len() {
-                    self.read_buf = Bytes::copy_from_slice(&payload[to_copy..]);
-                    self.read_pos = 0;
-                }
-
-                self.read_pending.advance(consumed);
-                let _ = self.recv_stream.flow_control().release_capacity(consumed);
-                Ok(Some(()))
-            }
-            None => Ok(None),
+    fn try_start_next_payload(&mut self) -> io::Result<bool> {
+        if self.payload_remaining > 0 {
+            return Ok(true);
         }
+
+        let Some((header_len, payload_len, _grpc_frame_len)) = parse_grpc_prefix(&self.read_pending)? else {
+            return Ok(false);
+        };
+
+        self.read_pending.advance(header_len);
+        self.release_recv_capacity(header_len);
+        self.payload_remaining = payload_len;
+        Ok(true)
     }
 
     fn poll_recv_next_chunk(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
@@ -87,6 +85,7 @@ impl GrpcH2cTransport {
                 }
 
                 self.read_pending.extend_from_slice(&chunk);
+                self.pending_release_capacity += chunk_len;
                 Poll::Ready(Ok(true))
             }
             Poll::Ready(Some(Err(e))) => {
@@ -168,6 +167,19 @@ impl GrpcH2cTransport {
         }
     }
 
+    fn release_recv_capacity(&mut self, max_release: usize) {
+        if self.pending_release_capacity == 0 {
+            return;
+        }
+        let to_release = self.pending_release_capacity.min(max_release);
+        if to_release == 0 {
+            return;
+        }
+        if self.recv_stream.flow_control().release_capacity(to_release).is_ok() {
+            self.pending_release_capacity -= to_release;
+        }
+    }
+
     #[inline]
     fn frame_payload_len(total: usize) -> usize {
         total.min(GRPC_MAX_MESSAGE_SIZE)
@@ -192,20 +204,34 @@ impl AsyncRead for GrpcH2cTransport {
             return Poll::Ready(Ok(()));
         }
 
-        if self.copy_from_read_buffer(buf) {
-            return Poll::Ready(Ok(()));
-        }
-
         loop {
-            match self.parse_pending_message(buf) {
-                Ok(Some(())) => return Poll::Ready(Ok(())),
-                Ok(None) => {}
-                Err(e) => return Poll::Ready(Err(e)),
+            if self.copy_payload_to_user(buf) {
+                return Poll::Ready(Ok(()));
+            }
+
+            if self.payload_remaining == 0 {
+                match self.try_start_next_payload() {
+                    Ok(true) => {
+                        if self.payload_remaining == 0 {
+                            continue;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(e) => return Poll::Ready(Err(e)),
+                }
             }
 
             match self.poll_recv_next_chunk(cx) {
                 Poll::Ready(Ok(true)) => {}
-                Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
+                Poll::Ready(Ok(false)) => {
+                    if self.payload_remaining > 0 || !self.read_pending.is_empty() {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "gRPC stream closed with incomplete message",
+                        )));
+                    }
+                    return Poll::Ready(Ok(()));
+                }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
@@ -255,9 +281,14 @@ impl AsyncWrite for GrpcH2cTransport {
 
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
         self.closed = true;
+        match self.as_mut().poll_flush(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
 
         if self.trailers_sent {
             return Poll::Ready(Ok(()));

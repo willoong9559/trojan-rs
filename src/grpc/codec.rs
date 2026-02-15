@@ -1,10 +1,10 @@
 use bytes::{BytesMut, BufMut};
 use std::io;
+use super::GRPC_MAX_MESSAGE_SIZE;
 
-/// 解析 gRPC 消息帧（兼容 v2ray 格式）
-/// 
-/// 格式：5字节 gRPC 头部 + protobuf 头部 + 数据
-pub fn parse_grpc_message(buf: &BytesMut) -> io::Result<Option<(usize, &[u8])>> {
+/// Parse enough bytes to determine payload boundaries without requiring the full payload.
+/// Returns (header_len, payload_len, grpc_frame_len).
+pub fn parse_grpc_prefix(buf: &BytesMut) -> io::Result<Option<(usize, usize, usize)>> {
     if buf.len() < 6 {
         return Ok(None);
     }
@@ -17,9 +17,12 @@ pub fn parse_grpc_message(buf: &BytesMut) -> io::Result<Option<(usize, &[u8])>> 
     }
 
     let grpc_frame_len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
-
-    if buf.len() < 5 + grpc_frame_len {
-        return Ok(None);
+    let max_frame_len = GRPC_MAX_MESSAGE_SIZE + 16;
+    if grpc_frame_len > max_frame_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("gRPC frame length {} exceeds max {}", grpc_frame_len, max_frame_len),
+        ));
     }
 
     if buf[5] != 0x0A {
@@ -29,10 +32,14 @@ pub fn parse_grpc_message(buf: &BytesMut) -> io::Result<Option<(usize, &[u8])>> 
         ));
     }
 
-    let (payload_len_u64, varint_bytes) = decode_varint(&buf[6..])?;
+    let (payload_len_u64, varint_bytes) = match decode_varint(&buf[6..]) {
+        Ok(v) => v,
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    };
     let payload_len = payload_len_u64 as usize;
-    let data_start = 6 + varint_bytes;
-    let data_end = data_start + payload_len;
+    let header_len = 6 + varint_bytes;
+    let data_end = header_len + payload_len;
 
     if data_end > 5 + grpc_frame_len {
         return Err(io::Error::new(
@@ -41,10 +48,7 @@ pub fn parse_grpc_message(buf: &BytesMut) -> io::Result<Option<(usize, &[u8])>> 
         ));
     }
 
-    let payload = &buf[data_start..data_end];
-    let consumed = 5 + grpc_frame_len;
-    
-    Ok(Some((consumed, payload)))
+    Ok(Some((header_len, payload_len, grpc_frame_len)))
 }
 
 /// 编码 gRPC 消息帧
@@ -97,4 +101,3 @@ fn encode_varint(mut value: u64, buf: &mut BytesMut) {
         }
     }
 }
-
