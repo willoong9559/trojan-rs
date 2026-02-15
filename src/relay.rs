@@ -6,6 +6,8 @@ use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use pin_project_lite::pin_project;
 
+const RELAY_BUFFER_SIZE: usize = 256 * 1024;
+
 pin_project! {
     struct TimedStream<S> {
         #[pin]
@@ -75,7 +77,12 @@ where
     let mut stream_a = TimedStream::new(a, start_time, Arc::clone(&last_activity));
     let mut stream_b = TimedStream::new(b, start_time, Arc::clone(&last_activity));
 
-    let copy_task = tokio::io::copy_bidirectional(&mut stream_a, &mut stream_b);
+    let copy_task = tokio::io::copy_bidirectional_with_sizes(
+        &mut stream_a,
+        &mut stream_b,
+        RELAY_BUFFER_SIZE,
+        RELAY_BUFFER_SIZE,
+    );
 
     let timeout_check = async {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
