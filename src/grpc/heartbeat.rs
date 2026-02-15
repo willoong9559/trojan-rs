@@ -94,16 +94,5 @@ impl H2Heartbeat {
         }
         Ok(())
     }
-
-    async fn poll_pong(&mut self) -> Option<Result<h2::Pong, h2::Error>> {
-        if !matches!(self.state, HeartbeatState::WaitingPong(_)) {
-            return std::future::pending().await;
-        }
-        if let Some(ref mut pp) = self.ping_pong {
-            Some(futures_util::future::poll_fn(|cx| pp.poll_pong(cx)).await)
-        } else {
-            std::future::pending().await
-        }
-    }
 }
 
