@@ -12,7 +12,6 @@ use super::transport::GrpcH2cTransport;
 use super::{
     MAX_CONCURRENT_STREAMS, MAX_HEADER_LIST_SIZE,
     INITIAL_WINDOW_SIZE, INITIAL_CONNECTION_WINDOW_SIZE,
-    MAX_FRAME_SIZE,
 };
 
 /// gRPC HTTP/2 连接管理器
@@ -31,7 +30,6 @@ where
             .max_header_list_size(MAX_HEADER_LIST_SIZE)
             .initial_window_size(INITIAL_WINDOW_SIZE)
             .initial_connection_window_size(INITIAL_CONNECTION_WINDOW_SIZE)
-            .max_frame_size(MAX_FRAME_SIZE)
             .max_concurrent_streams(MAX_CONCURRENT_STREAMS as u32)
             .handshake(stream)
             .await

@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 use h2::{Reason, RecvStream, SendStream};
 
 use super::codec::{encode_grpc_message, parse_grpc_message};
-use super::{GRPC_MAX_MESSAGE_SIZE, MAX_FRAME_SIZE, READ_BUFFER_SIZE};
+use super::{GRPC_MAX_MESSAGE_SIZE, READ_BUFFER_SIZE};
 
 /// gRPC 传输层（兼容 v2ray）
 ///
@@ -133,7 +133,7 @@ impl GrpcH2cTransport {
             let remaining = frame_len - self.pending_frame_offset;
             let capacity = self.send_stream.capacity();
             if capacity == 0 {
-                self.send_stream.reserve_capacity(remaining.min(MAX_FRAME_SIZE as usize));
+                self.send_stream.reserve_capacity(remaining);
                 match self.send_stream.poll_capacity(cx) {
                     Poll::Ready(Some(Ok(cap))) if cap > 0 => continue,
                     Poll::Ready(Some(Ok(_))) => return Poll::Pending,
