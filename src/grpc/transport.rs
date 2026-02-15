@@ -17,6 +17,7 @@ pub struct GrpcH2cTransport {
     pub(crate) read_pending: BytesMut,
     pub(crate) read_buf: Bytes,
     pub(crate) read_pos: usize,
+    pub(crate) pending_release_capacity: usize,
     pub(crate) pending_frame: Option<Bytes>,
     pub(crate) pending_frame_offset: usize,
     pub(crate) closed: bool,
@@ -31,6 +32,7 @@ impl GrpcH2cTransport {
             read_pending: BytesMut::with_capacity(READ_BUFFER_SIZE),
             read_buf: Bytes::new(),
             read_pos: 0,
+            pending_release_capacity: 0,
             pending_frame: None,
             pending_frame_offset: 0,
             closed: false,
@@ -45,8 +47,13 @@ impl GrpcH2cTransport {
 
         let remaining = &self.read_buf[self.read_pos..];
         let to_copy = remaining.len().min(buf.remaining());
+        if to_copy == 0 {
+            return false;
+        }
+
         buf.put_slice(&remaining[..to_copy]);
         self.read_pos += to_copy;
+        self.release_recv_capacity(to_copy);
 
         if self.read_pos >= self.read_buf.len() {
             self.read_buf = Bytes::new();
@@ -59,16 +66,18 @@ impl GrpcH2cTransport {
     fn parse_pending_message(&mut self, buf: &mut ReadBuf<'_>) -> io::Result<Option<()>> {
         match parse_grpc_message(&self.read_pending)? {
             Some((consumed, payload)) => {
-                let to_copy = payload.len().min(buf.remaining());
+                let payload_len = payload.len();
+                let to_copy = payload_len.min(buf.remaining());
                 buf.put_slice(&payload[..to_copy]);
 
-                if to_copy < payload.len() {
+                if to_copy < payload_len {
                     self.read_buf = Bytes::copy_from_slice(&payload[to_copy..]);
                     self.read_pos = 0;
                 }
 
                 self.read_pending.advance(consumed);
-                let _ = self.recv_stream.flow_control().release_capacity(consumed);
+                let frame_overhead = consumed.saturating_sub(payload_len);
+                self.release_recv_capacity(frame_overhead + to_copy);
                 Ok(Some(()))
             }
             None => Ok(None),
@@ -87,6 +96,7 @@ impl GrpcH2cTransport {
                 }
 
                 self.read_pending.extend_from_slice(&chunk);
+                self.pending_release_capacity += chunk_len;
                 Poll::Ready(Ok(true))
             }
             Poll::Ready(Some(Err(e))) => {
@@ -168,6 +178,19 @@ impl GrpcH2cTransport {
         }
     }
 
+    fn release_recv_capacity(&mut self, max_release: usize) {
+        if self.pending_release_capacity == 0 {
+            return;
+        }
+        let to_release = self.pending_release_capacity.min(max_release);
+        if to_release == 0 {
+            return;
+        }
+        if self.recv_stream.flow_control().release_capacity(to_release).is_ok() {
+            self.pending_release_capacity -= to_release;
+        }
+    }
+
     #[inline]
     fn frame_payload_len(total: usize) -> usize {
         total.min(GRPC_MAX_MESSAGE_SIZE)
@@ -205,7 +228,15 @@ impl AsyncRead for GrpcH2cTransport {
 
             match self.poll_recv_next_chunk(cx) {
                 Poll::Ready(Ok(true)) => {}
-                Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
+                Poll::Ready(Ok(false)) => {
+                    if !self.read_pending.is_empty() {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "gRPC stream closed with incomplete message",
+                        )));
+                    }
+                    return Poll::Ready(Ok(()));
+                }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
@@ -255,9 +286,14 @@ impl AsyncWrite for GrpcH2cTransport {
 
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
         self.closed = true;
+        match self.as_mut().poll_flush(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
 
         if self.trailers_sent {
             return Poll::Ready(Ok(()));

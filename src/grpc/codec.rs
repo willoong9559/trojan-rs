@@ -1,5 +1,6 @@
 use bytes::{BytesMut, BufMut};
 use std::io;
+use super::GRPC_MAX_MESSAGE_SIZE;
 
 /// 解析 gRPC 消息帧（兼容 v2ray 格式）
 /// 
@@ -17,6 +18,13 @@ pub fn parse_grpc_message(buf: &BytesMut) -> io::Result<Option<(usize, &[u8])>> 
     }
 
     let grpc_frame_len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+    let max_frame_len = GRPC_MAX_MESSAGE_SIZE + 16;
+    if grpc_frame_len > max_frame_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("gRPC frame length {} exceeds max {}", grpc_frame_len, max_frame_len),
+        ));
+    }
 
     if buf.len() < 5 + grpc_frame_len {
         return Ok(None);
@@ -97,4 +105,3 @@ fn encode_varint(mut value: u64, buf: &mut BytesMut) {
         }
     }
 }
-
