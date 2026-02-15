@@ -144,6 +144,32 @@ impl GrpcH2cTransport {
             Poll::Pending => Poll::Pending,
         }
     }
+
+    fn is_send_queue_full(&self) -> bool {
+        self.send_queue_bytes >= MAX_SEND_QUEUE_BYTES
+    }
+
+    fn poll_backpressure(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.is_send_queue_full() {
+            return Poll::Ready(Ok(()));
+        }
+
+        match self.poll_wait_send_capacity(cx) {
+            Poll::Ready(Ok(())) => match self.poll_send_queued(cx) {
+                Poll::Ready(Ok(())) => {
+                    if self.is_send_queue_full() {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(Ok(()))
+                    }
+                }
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            },
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 fn is_normal_stream_close(error: &h2::Error) -> bool {
@@ -259,20 +285,20 @@ impl AsyncWrite for GrpcH2cTransport {
             )));
         }
 
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
         match self.poll_send_queued(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => return Poll::Pending,
         }
 
-        if self.send_queue_bytes >= MAX_SEND_QUEUE_BYTES {
-            return match self.poll_wait_send_capacity(cx) {
-                Poll::Ready(Ok(())) => {
-                    Poll::Pending
-                }
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-                Poll::Pending => Poll::Pending,
-            };
+        match self.poll_backpressure(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
         }
 
         let to_write = buf.len().min(GRPC_MAX_MESSAGE_SIZE);
@@ -284,7 +310,7 @@ impl AsyncWrite for GrpcH2cTransport {
         match self.poll_send_queued(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => return Poll::Pending,
+            Poll::Pending => {}
         }
 
         Poll::Ready(Ok(to_write))
