@@ -2,7 +2,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use bytes::Bytes;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use h2::server;
 use http::{Response, StatusCode};
 use anyhow::Result;
@@ -21,7 +20,6 @@ use super::{
 /// 管理整个 HTTP/2 连接，接受多个流，每个流对应一个独立的 Trojan 隧道
 pub struct GrpcH2cConnection<S> {
     h2_conn: server::Connection<S, Bytes>,
-    active_count: Arc<AtomicUsize>,
 }
 
 impl<S> GrpcH2cConnection<S>
@@ -39,10 +37,7 @@ where
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 handshake: {}", e)))?;
         
-        Ok(Self {
-            h2_conn,
-            active_count: Arc::new(AtomicUsize::new(0)),
-        })
+        Ok(Self { h2_conn })
     }
 
     pub async fn run<F, Fut>(self, handler: F) -> Result<()>
@@ -52,8 +47,7 @@ where
     {
         let handler = Arc::new(handler);
         let mut h2_conn = self.h2_conn;
-        let active_count = self.active_count;
-        
+
         let mut heartbeat = H2Heartbeat::new(h2_conn.ping_pong());
         
         loop {
@@ -104,11 +98,8 @@ where
                             );
 
                             let handler_clone = Arc::clone(&handler);
-                            let active_count_clone = Arc::clone(&active_count);
-                            active_count_clone.fetch_add(1, Ordering::Relaxed);
                             tokio::spawn(async move {
                                 let _ = handler_clone(transport).await;
-                                active_count_clone.fetch_sub(1, Ordering::Relaxed);
                             });
                         }
                         Some(Err(e)) => {
