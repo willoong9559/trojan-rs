@@ -20,5 +20,4 @@ pub(crate) const MAX_MISSED_PINGS: u32 = 3;
 
 // gRPC 配置
 pub(crate) const GRPC_MAX_MESSAGE_SIZE: usize = 32 * 1024;
-pub(crate) const MAX_SEND_QUEUE_BYTES: usize = 512 * 1024;
 

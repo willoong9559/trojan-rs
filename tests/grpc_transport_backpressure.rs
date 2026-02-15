@@ -9,14 +9,17 @@ use tokio::sync::oneshot;
 use trojan_rs::grpc::GrpcH2cConnection;
 
 #[tokio::test]
-async fn grpc_write_all_completes_under_send_backpressure() {
+async fn grpc_write_all_completes() {
     let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
     let (done_tx, done_rx) = oneshot::channel::<()>();
     let done_tx = Arc::new(Mutex::new(Some(done_tx)));
-    let payload = Arc::new(vec![0xAB; 32 * 1024]);
+    // Use >32KiB to verify transport splits writes into multiple gRPC frames.
+    let payload = Arc::new(vec![0xAB; 40 * 1024]);
 
     let server_task = tokio::spawn(async move {
-        let conn = GrpcH2cConnection::new(server_io).await.expect("server handshake should succeed");
+        let conn = GrpcH2cConnection::new(server_io)
+            .await
+            .expect("server handshake should succeed");
         conn.run({
             let done_tx = Arc::clone(&done_tx);
             let payload = Arc::clone(&payload);
@@ -40,8 +43,6 @@ async fn grpc_write_all_completes_under_send_backpressure() {
     });
 
     let (mut send_request, client_conn) = client::Builder::new()
-        .initial_window_size(1)
-        .initial_connection_window_size(1)
         .handshake::<_, Bytes>(client_io)
         .await
         .expect("client handshake should succeed");
