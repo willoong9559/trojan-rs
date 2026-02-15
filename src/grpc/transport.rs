@@ -1,5 +1,5 @@
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -71,11 +71,14 @@ impl GrpcH2cTransport {
                 buf.put_slice(&payload[..to_copy]);
 
                 if to_copy < payload_len {
-                    self.read_buf = Bytes::copy_from_slice(&payload[to_copy..]);
+                    let payload_start = consumed - payload_len;
+                    let frame = self.read_pending.split_to(consumed).freeze();
+                    self.read_buf = frame.slice(payload_start + to_copy..consumed);
                     self.read_pos = 0;
+                } else {
+                    let _ = self.read_pending.split_to(consumed);
                 }
 
-                self.read_pending.advance(consumed);
                 let frame_overhead = consumed.saturating_sub(payload_len);
                 self.release_recv_capacity(frame_overhead + to_copy);
                 Ok(Some(()))
