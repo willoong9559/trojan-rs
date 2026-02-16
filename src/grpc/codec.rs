@@ -1,5 +1,6 @@
 use bytes::{BytesMut, BufMut};
 use std::io;
+use super::GRPC_MAX_MESSAGE_SIZE;
 
 /// 解析 gRPC 消息帧（兼容 v2ray 格式）
 /// 
@@ -17,6 +18,13 @@ pub fn parse_grpc_message(buf: &BytesMut) -> io::Result<Option<(usize, &[u8])>> 
     }
 
     let grpc_frame_len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+    let max_frame_len = GRPC_MAX_MESSAGE_SIZE + 16;
+    if grpc_frame_len > max_frame_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("gRPC frame length {} exceeds max {}", grpc_frame_len, max_frame_len),
+        ));
+    }
 
     if buf.len() < 5 + grpc_frame_len {
         return Ok(None);
@@ -29,7 +37,11 @@ pub fn parse_grpc_message(buf: &BytesMut) -> io::Result<Option<(usize, &[u8])>> 
         ));
     }
 
-    let (payload_len_u64, varint_bytes) = decode_varint(&buf[6..])?;
+    let (payload_len_u64, varint_bytes) = match decode_varint(&buf[6..]) {
+        Ok(v) => v,
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    };
     let payload_len = payload_len_u64 as usize;
     let data_start = 6 + varint_bytes;
     let data_end = data_start + payload_len;
@@ -98,3 +110,27 @@ fn encode_varint(mut value: u64, buf: &mut BytesMut) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_grpc_message_waits_for_split_varint_header() {
+        let payload = vec![0xAB; 200];
+        let full = encode_grpc_message(&payload);
+
+        // Split inside protobuf varint bytes (after the first varint byte).
+        let split_at = 7;
+        let mut partial = BytesMut::from(&full[..split_at]);
+        let first = parse_grpc_message(&partial).expect("partial parse should not error");
+        assert!(first.is_none(), "partial varint should be treated as incomplete frame");
+
+        partial.extend_from_slice(&full[split_at..]);
+        let parsed = parse_grpc_message(&partial)
+            .expect("full parse should succeed")
+            .expect("full frame should be parsed");
+        let (consumed, parsed_payload) = parsed;
+        assert_eq!(consumed, full.len());
+        assert_eq!(parsed_payload, payload.as_slice());
+    }
+}
