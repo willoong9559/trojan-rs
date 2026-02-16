@@ -1,12 +1,14 @@
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use bytes::{Bytes, BytesMut};
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use h2::{Reason, RecvStream, SendStream};
 
 use super::codec::{encode_grpc_message, parse_grpc_message};
-use super::{GRPC_MAX_MESSAGE_SIZE, READ_BUFFER_SIZE};
+use super::{GRPC_MAX_MESSAGE_SIZE, READ_BUFFER_SIZE, STREAM_WRITE_TIMEOUT_SECS};
 
 /// gRPC 传输层（兼容 v2ray）
 ///
@@ -20,6 +22,7 @@ pub struct GrpcH2cTransport {
     pub(crate) pending_release_capacity: usize,
     pub(crate) pending_frame: Option<Bytes>,
     pub(crate) pending_frame_offset: usize,
+    pub(crate) write_wait_timeout: Option<Pin<Box<tokio::time::Sleep>>>,
     pub(crate) closed: bool,
     pub(crate) trailers_sent: bool,
 }
@@ -35,6 +38,7 @@ impl GrpcH2cTransport {
             pending_release_capacity: 0,
             pending_frame: None,
             pending_frame_offset: 0,
+            write_wait_timeout: None,
             closed: false,
             trailers_sent: false,
         }
@@ -136,10 +140,26 @@ impl GrpcH2cTransport {
             let remaining = frame_len - self.pending_frame_offset;
             let capacity = self.send_stream.capacity();
             if capacity == 0 {
+                if self.write_wait_timeout.is_none() {
+                    self.write_wait_timeout = Some(Box::pin(tokio::time::sleep(Duration::from_secs(
+                        STREAM_WRITE_TIMEOUT_SECS,
+                    ))));
+                }
                 self.send_stream.reserve_capacity(remaining);
                 match self.send_stream.poll_capacity(cx) {
-                    Poll::Ready(Some(Ok(cap))) if cap > 0 => continue,
-                    Poll::Ready(Some(Ok(_))) => return Poll::Pending,
+                    Poll::Ready(Some(Ok(cap))) if cap > 0 => {
+                        self.write_wait_timeout = None;
+                        continue;
+                    }
+                    Poll::Ready(Some(Ok(_))) => {
+                        if self.write_wait_timed_out(cx) {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "gRPC stream write stalled waiting for flow-control capacity",
+                            )));
+                        }
+                        return Poll::Pending;
+                    }
                     Poll::Ready(Some(Err(e))) => {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::Other,
@@ -152,7 +172,15 @@ impl GrpcH2cTransport {
                             "gRPC stream closed",
                         )));
                     }
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        if self.write_wait_timed_out(cx) {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "gRPC stream write stalled waiting for flow-control capacity",
+                            )));
+                        }
+                        return Poll::Pending;
+                    }
                 }
             }
 
@@ -164,6 +192,7 @@ impl GrpcH2cTransport {
 
             match self.send_stream.send_data(chunk, false) {
                 Ok(()) => {
+                    self.write_wait_timeout = None;
                     self.pending_frame_offset += send_size;
                     if self.pending_frame_offset >= frame_len {
                         self.pending_frame = None;
@@ -179,6 +208,13 @@ impl GrpcH2cTransport {
                 }
             }
         }
+    }
+
+    fn write_wait_timed_out(&mut self, cx: &mut Context<'_>) -> bool {
+        if let Some(timeout) = &mut self.write_wait_timeout {
+            return timeout.as_mut().poll(cx).is_ready();
+        }
+        false
     }
 
     fn release_recv_capacity(&mut self, max_release: usize) {

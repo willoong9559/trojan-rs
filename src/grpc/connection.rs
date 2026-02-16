@@ -97,7 +97,13 @@ where
 
                             let handler_clone = Arc::clone(&handler);
                             tokio::spawn(async move {
-                                let _ = handler_clone(transport).await;
+                                if let Err(e) = handler_clone(transport).await {
+                                    if is_timed_out_io_error(&e) {
+                                        warn!(error = %e, "gRPC stream closed due to write stall timeout");
+                                    } else {
+                                        warn!(error = %e, "gRPC stream handler error");
+                                    }
+                                }
                             });
                         }
                         Some(Err(e)) => {
@@ -122,3 +128,11 @@ where
     }
 }
 
+fn is_timed_out_io_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .map(|ioe| ioe.kind() == io::ErrorKind::TimedOut)
+            .unwrap_or(false)
+    })
+}
