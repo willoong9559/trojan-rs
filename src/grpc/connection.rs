@@ -9,7 +9,6 @@ use anyhow::Result;
 use tokio::sync::Semaphore;
 use tracing::{warn, debug};
 
-use super::heartbeat::H2Heartbeat;
 use super::transport::GrpcH2cTransport;
 use super::{
     MAX_CONCURRENT_STREAMS, MAX_HEADER_LIST_SIZE,
@@ -58,98 +57,83 @@ where
         let mut h2_conn = self.h2_conn;
         let stream_semaphore = self.stream_semaphore;
         let active_count = self.active_count;
-        
-        let mut heartbeat = H2Heartbeat::new(h2_conn.ping_pong());
-        
+
         loop {
-            tokio::select! {
-                result = h2_conn.accept() => {
-                    match result {
-                        Some(Ok((request, mut respond))) => {
-                            heartbeat.on_activity();
-                            
-                            if request.method() != http::Method::POST {
-                                let response = Response::builder()
-                                    .status(StatusCode::METHOD_NOT_ALLOWED)
-                                    .body(())
-                                    .unwrap();
-                                let _ = respond.send_response(response, true);
-                                continue;
-                            }
+            match h2_conn.accept().await {
+                Some(Ok((request, mut respond))) => {
+                    if request.method() != http::Method::POST {
+                        let response = Response::builder()
+                            .status(StatusCode::METHOD_NOT_ALLOWED)
+                            .body(())
+                            .unwrap();
+                        let _ = respond.send_response(response, true);
+                        continue;
+                    }
 
-                            let path = request.uri().path();
-                            if !path.ends_with("/Tun") {
-                                let response = Response::builder()
-                                    .status(StatusCode::NOT_FOUND)
-                                    .body(())
-                                    .unwrap();
-                                let _ = respond.send_response(response, true);
-                                continue;
-                            }
+                    let path = request.uri().path();
+                    if !path.ends_with("/Tun") {
+                        let response = Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .body(())
+                            .unwrap();
+                        let _ = respond.send_response(response, true);
+                        continue;
+                    }
 
-                            let permit = match stream_semaphore.clone().try_acquire_owned() {
-                                Ok(permit) => permit,
-                                Err(_) => {
-                                    let response = Response::builder()
-                                        .status(StatusCode::SERVICE_UNAVAILABLE)
-                                        .header("grpc-status", "8")
-                                        .body(())
-                                        .unwrap();
-                                    let _ = respond.send_response(response, true);
-                                    continue;
-                                }
-                            };
-
+                    let permit = match stream_semaphore.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
                             let response = Response::builder()
-                                .status(StatusCode::OK)
-                                .header("content-type", "application/grpc")
-                                .header("te", "trailers")
-                                .header("grpc-accept-encoding", "identity,deflate,gzip")
+                                .status(StatusCode::SERVICE_UNAVAILABLE)
+                                .header("grpc-status", "8")
                                 .body(())
                                 .unwrap();
-
-                            let send_stream = match respond.send_response(response, false) {
-                                Ok(stream) => stream,
-                                Err(e) => {
-                                    warn!(error = %e, "Failed to send gRPC response");
-                                    drop(permit);
-                                    continue;
-                                }
-                            };
-
-                            let transport = GrpcH2cTransport::new(
-                                request.into_body(),
-                                send_stream,
-                            );
-
-                            let handler_clone = Arc::clone(&handler);
-                            let active_count_clone = Arc::clone(&active_count);
-                            active_count_clone.fetch_add(1, Ordering::Relaxed);
-                            tokio::spawn(async move {
-                                let _permit = permit;
-                                let _ = handler_clone(transport).await;
-                                active_count_clone.fetch_sub(1, Ordering::Relaxed);
-                            });
+                            let _ = respond.send_response(response, true);
+                            continue;
                         }
-                        Some(Err(e)) => {
-                            warn!(error = %e, "gRPC connection error");
-                            return Err(anyhow::anyhow!("gRPC connection error: {}", e));
+                    };
+
+                    let response = Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/grpc")
+                        .header("te", "trailers")
+                        .header("grpc-accept-encoding", "identity,deflate,gzip")
+                        .body(())
+                        .unwrap();
+
+                    let send_stream = match respond.send_response(response, false) {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            warn!(error = %e, "Failed to send gRPC response");
+                            drop(permit);
+                            continue;
                         }
-                        None => {
-                            debug!("gRPC connection closed normally");
-                            break;
-                        }
-                    }
+                    };
+
+                    let transport = GrpcH2cTransport::new(
+                        request.into_body(),
+                        send_stream,
+                    );
+
+                    let handler_clone = Arc::clone(&handler);
+                    let active_count_clone = Arc::clone(&active_count);
+                    active_count_clone.fetch_add(1, Ordering::Relaxed);
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let _ = handler_clone(transport).await;
+                        active_count_clone.fetch_sub(1, Ordering::Relaxed);
+                    });
                 }
-                
-                result = heartbeat.poll() => {
-                    if let Err(e) = result {
-                        return Err(anyhow::anyhow!("gRPC {}", e));
-                    }
+                Some(Err(e)) => {
+                    warn!(error = %e, "gRPC connection error");
+                    return Err(anyhow::anyhow!("gRPC connection error: {}", e));
+                }
+                None => {
+                    debug!("gRPC connection closed normally");
+                    break;
                 }
             }
         }
         Ok(())
     }
 }
-
