@@ -65,9 +65,10 @@ pub struct TrojanRequest {
 }
 
 impl TrojanRequest {
-    pub fn decode(buf: &[u8]) -> Result<(Self, usize)> {
-        if buf.len() < 59 {
-            return Err(anyhow!("Buffer too small"));
+    pub fn decode(buf: &[u8]) -> Result<Option<(Self, usize)>> {
+        // Minimum bytes required up to ATYP field: password(56) + CRLF(2) + cmd(1) + atyp(1)
+        if buf.len() < 60 {
+            return Ok(None);
         }
 
         let mut cursor = 0;
@@ -76,11 +77,17 @@ impl TrojanRequest {
         password.copy_from_slice(&buf[cursor..cursor + 56]);
         cursor += 56;
 
+        if buf.len() < cursor + 2 {
+            return Ok(None);
+        }
         if buf[cursor] != b'\r' || buf[cursor + 1] != b'\n' {
             return Err(anyhow!("Invalid CRLF after password"));
         }
         cursor += 2;
 
+        if buf.len() <= cursor {
+            return Ok(None);
+        }
         let cmd = match buf[cursor] {
             1 => TrojanCmd::Connect,
             3 => TrojanCmd::UdpAssociate,
@@ -88,13 +95,16 @@ impl TrojanRequest {
         };
         cursor += 1;
 
+        if buf.len() <= cursor {
+            return Ok(None);
+        }
         let atyp = buf[cursor];
         cursor += 1;
 
         let addr = match atyp {
             1 => {
                 if buf.len() < cursor + 6 {
-                    return Err(anyhow!("Buffer too small for IPv4"));
+                    return Ok(None);
                 }
                 let mut ip = [0u8; 4];
                 ip.copy_from_slice(&buf[cursor..cursor + 4]);
@@ -105,12 +115,12 @@ impl TrojanRequest {
             }
             3 => {
                 if buf.len() <= cursor {
-                    return Err(anyhow!("Buffer too small for domain length"));
+                    return Ok(None);
                 }
                 let domain_len = buf[cursor] as usize;
                 cursor += 1;
                 if buf.len() < cursor + domain_len + 2 {
-                    return Err(anyhow!("Buffer too small for domain"));
+                    return Ok(None);
                 }
                 let domain = std::str::from_utf8(&buf[cursor..cursor + domain_len])
                     .map_err(|e| anyhow!("Invalid UTF-8 domain: {}", e))?
@@ -122,7 +132,7 @@ impl TrojanRequest {
             }
             4 => {
                 if buf.len() < cursor + 18 {
-                    return Err(anyhow!("Buffer too small for IPv6"));
+                    return Ok(None);
                 }
                 let mut ip = [0u8; 16];
                 ip.copy_from_slice(&buf[cursor..cursor + 16]);
@@ -134,19 +144,22 @@ impl TrojanRequest {
             _ => return Err(anyhow!("Invalid address type")),
         };
 
-        if buf.len() < cursor + 2 || buf[cursor] != b'\r' || buf[cursor + 1] != b'\n' {
+        if buf.len() < cursor + 2 {
+            return Ok(None);
+        }
+        if buf[cursor] != b'\r' || buf[cursor + 1] != b'\n' {
             return Err(anyhow!("Invalid CRLF after address"));
         }
         cursor += 2;
 
         let payload = Bytes::copy_from_slice(&buf[cursor..]);
 
-        Ok((TrojanRequest {
+        Ok(Some((TrojanRequest {
             password,
             cmd,
             addr,
             payload,
-        }, cursor))
+        }, cursor)))
     }
 }
 
@@ -167,15 +180,34 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut stream: S,
     peer_addr: String,
 ) -> Result<()> {
-    // 读取 Trojan 请求
-    let mut buf = vec![0u8; BUF_SIZE];
-    let n = stream.read(&mut buf).await?;
-    
-    if n == 0 {
-        return Err(anyhow!("Connection closed before receiving request"));
-    }
+    // Read until a full Trojan request header is available.
+    let request = {
+        let mut read_buf = vec![0u8; BUF_SIZE];
+        let mut buffer = Vec::with_capacity(BUF_SIZE);
 
-    let (request, _consumed) = TrojanRequest::decode(&buf[..n])?;
+        loop {
+            if buffer.len() >= BUF_SIZE {
+                return Err(anyhow!("Trojan request exceeds maximum buffer size"));
+            }
+
+            let remaining = BUF_SIZE - buffer.len();
+            let read_size = remaining.min(read_buf.len());
+            let n = stream.read(&mut read_buf[..read_size]).await?;
+
+            if n == 0 {
+                if buffer.is_empty() {
+                    return Err(anyhow!("Connection closed before receiving request"));
+                }
+                return Err(anyhow!("Connection closed before receiving complete request"));
+            }
+
+            buffer.extend_from_slice(&read_buf[..n]);
+
+            if let Some((request, _consumed)) = TrojanRequest::decode(&buffer)? {
+                break request;
+            }
+        }
+    };
 
     // 验证密码
     if request.password != server.password {
