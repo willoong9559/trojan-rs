@@ -254,10 +254,7 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     )
     .await
     {
-        Ok(Ok(stream)) => {
-            let _ = stream.set_nodelay(true);
-            stream
-        }
+        Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
             log::warn!(peer = %peer_addr, error = %e, "TCP connect failed");
             return Err(e.into());
@@ -356,7 +353,6 @@ impl Server {
         loop {
             match server.listener.accept().await {
                 Ok((stream, addr)) => {
-                    let _ = stream.set_nodelay(true);
                     log::connection(&addr.to_string(), "new");
                     let server_clone = Arc::clone(&server);
                     
