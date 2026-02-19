@@ -1,5 +1,5 @@
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use bytes::{BytesMut, Buf, Bytes};
+use bytes::{BytesMut, Bytes};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::io;
@@ -9,7 +9,7 @@ use std::time::Duration;
 use h2::{SendStream, RecvStream, Reason};
 use tracing::warn;
 
-use super::codec::{parse_grpc_message, encode_grpc_message};
+use super::codec::{decode_next_grpc_message, encode_grpc_message};
 use super::{
     MAX_FRAME_SIZE, GRPC_MAX_MESSAGE_SIZE, MAX_SEND_QUEUE_BYTES, READ_BUFFER_SIZE,
     STREAM_WRITE_TIMEOUT_SECS,
@@ -247,19 +247,18 @@ impl AsyncRead for GrpcH2cTransport {
         }
 
         loop {
-            match parse_grpc_message(&self.read_pending) {
-                Ok(Some((consumed, payload))) => {
+            match decode_next_grpc_message(&mut self.read_pending) {
+                Ok(Some(decoded)) => {
+                    let payload = decoded.payload;
                     let to_copy = payload.len().min(buf.remaining());
                     buf.put_slice(&payload[..to_copy]);
                     
                     if to_copy < payload.len() {
-                        self.read_buf = Bytes::copy_from_slice(&payload[to_copy..]);
+                        self.read_buf = payload.slice(to_copy..);
                         self.read_pos = 0;
                     }
-                    
-                    self.read_pending.advance(consumed);
-                    
-                    let to_release = self.pending_release_capacity.min(consumed);
+
+                    let to_release = self.pending_release_capacity.min(decoded.consumed);
                     if to_release > 0 {
                         if let Err(e) = self.recv_stream.flow_control().release_capacity(to_release) {
                             warn!(error = %e, to_release, "Failed to release HTTP/2 flow control capacity");

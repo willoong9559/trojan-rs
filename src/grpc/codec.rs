@@ -1,10 +1,17 @@
-use bytes::{BytesMut, BufMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::io;
 
-/// 解析 gRPC 消息帧（兼容 v2ray 格式）
-/// 
+pub struct DecodedGrpcMessage {
+    pub consumed: usize,
+    pub payload: Bytes,
+}
+
+/// 流式解析下一条 gRPC 消息帧（兼容 v2ray 格式）
+///
 /// 格式：5字节 gRPC 头部 + protobuf 头部 + 数据
-pub fn parse_grpc_message(buf: &BytesMut) -> io::Result<Option<(usize, &[u8])>> {
+/// - 输入数据不足时返回 Ok(None)
+/// - 解析成功后会从 buf 中就地消费已解析帧
+pub fn decode_next_grpc_message(buf: &mut BytesMut) -> io::Result<Option<DecodedGrpcMessage>> {
     if buf.len() < 6 {
         return Ok(None);
     }
@@ -12,39 +19,46 @@ pub fn parse_grpc_message(buf: &BytesMut) -> io::Result<Option<(usize, &[u8])>> 
     if buf[0] != 0x00 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "compressed gRPC not supported"
+            "compressed gRPC not supported",
         ));
     }
 
     let grpc_frame_len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+    let consumed = 5 + grpc_frame_len;
 
-    if buf.len() < 5 + grpc_frame_len {
+    if buf.len() < consumed {
         return Ok(None);
     }
 
-    if buf[5] != 0x0A {
+    let mut frame = buf.split_to(consumed);
+    frame.advance(5);
+
+    if frame.is_empty() || frame[0] != 0x0A {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unexpected protobuf tag: 0x{:02X}, expected 0x0A", buf[5])
+            "unexpected protobuf tag, expected 0x0A",
         ));
     }
 
-    let (payload_len_u64, varint_bytes) = decode_varint(&buf[6..])?;
+    let (payload_len_u64, varint_bytes) = decode_varint(&frame[1..])?;
     let payload_len = payload_len_u64 as usize;
-    let data_start = 6 + varint_bytes;
+    let data_start = 1 + varint_bytes;
     let data_end = data_start + payload_len;
 
-    if data_end > 5 + grpc_frame_len {
+    if data_end > frame.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("payload length {} exceeds gRPC frame length {}", payload_len, grpc_frame_len)
+            format!(
+                "payload length {} exceeds gRPC frame length {}",
+                payload_len, grpc_frame_len
+            ),
         ));
     }
 
-    let payload = &buf[data_start..data_end];
-    let consumed = 5 + grpc_frame_len;
-    
-    Ok(Some((consumed, payload)))
+    frame.advance(data_start);
+    let payload = frame.split_to(payload_len).freeze();
+
+    Ok(Some(DecodedGrpcMessage { consumed, payload }))
 }
 
 /// 编码 gRPC 消息帧
@@ -97,4 +111,3 @@ fn encode_varint(mut value: u64, buf: &mut BytesMut) {
         }
     }
 }
-
