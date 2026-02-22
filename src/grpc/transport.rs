@@ -1,5 +1,5 @@
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use bytes::{BytesMut, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::io;
@@ -9,7 +9,7 @@ use std::time::Duration;
 use h2::{SendStream, RecvStream, Reason};
 use tracing::warn;
 
-use super::codec::{decode_next_grpc_message, encode_grpc_message};
+use super::codec::{encode_grpc_message, parse_grpc_header};
 use super::{
     MAX_FRAME_SIZE, GRPC_MAX_MESSAGE_SIZE, MAX_SEND_QUEUE_BYTES, READ_BUFFER_SIZE,
     STREAM_WRITE_TIMEOUT_SECS,
@@ -22,8 +22,7 @@ pub struct GrpcH2cTransport {
     pub(crate) recv_stream: RecvStream,
     pub(crate) send_stream: SendStream<Bytes>,
     pub(crate) read_pending: BytesMut,
-    pub(crate) read_buf: Bytes,
-    pub(crate) read_pos: usize,
+    pub(crate) read_remaining: usize,
     pub(crate) pending_release_capacity: usize,
     pub(crate) send_queue: VecDeque<Bytes>,
     pub(crate) send_queue_bytes: usize,
@@ -40,8 +39,7 @@ impl GrpcH2cTransport {
             recv_stream,
             send_stream,
             read_pending: BytesMut::with_capacity(READ_BUFFER_SIZE),
-            read_buf: Bytes::new(),
-            read_pos: 0,
+            read_remaining: 0,
             pending_release_capacity: 0,
             send_queue: VecDeque::new(),
             send_queue_bytes: 0,
@@ -225,89 +223,108 @@ impl AsyncRead for GrpcH2cTransport {
             return Poll::Ready(Ok(()));
         }
 
-        if self.read_pos < self.read_buf.len() {
-            let remaining = &self.read_buf[self.read_pos..];
-            let to_copy = remaining.len().min(buf.remaining());
-            buf.put_slice(&remaining[..to_copy]);
-            self.read_pos += to_copy;
-
-            if self.pending_release_capacity > 0 {
-                let to_release = self.pending_release_capacity.min(to_copy);
-                if let Err(e) = self.recv_stream.flow_control().release_capacity(to_release) {
-                    warn!(error = %e, to_release, "Failed to release HTTP/2 flow control capacity");
-                }
-                self.pending_release_capacity -= to_release;
-            }
-
-            if self.read_pos >= self.read_buf.len() {
-                self.read_buf = Bytes::new();
-                self.read_pos = 0;
-            }
-            return Poll::Ready(Ok(()));
-        }
-
         loop {
-            match decode_next_grpc_message(&mut self.read_pending) {
-                Ok(Some(decoded)) => {
-                    let payload = decoded.payload;
-                    let to_copy = payload.len().min(buf.remaining());
-                    buf.put_slice(&payload[..to_copy]);
-                    
-                    if to_copy < payload.len() {
-                        self.read_buf = payload.slice(to_copy..);
-                        self.read_pos = 0;
-                    }
-
-                    let to_release = self.pending_release_capacity.min(decoded.consumed);
-                    if to_release > 0 {
-                        if let Err(e) = self.recv_stream.flow_control().release_capacity(to_release) {
-                            warn!(error = %e, to_release, "Failed to release HTTP/2 flow control capacity");
-                        }
-                        self.pending_release_capacity -= to_release;
-                    }
-                    
+            if self.read_remaining > 0 {
+                if !self.read_pending.is_empty() {
+                    let to_copy = self
+                        .read_remaining
+                        .min(buf.remaining())
+                        .min(self.read_pending.len());
+                    buf.put_slice(&self.read_pending[..to_copy]);
+                    self.read_pending.advance(to_copy);
+                    self.read_remaining -= to_copy;
+                    self.release_flow_control_capacity(to_copy);
                     return Poll::Ready(Ok(()));
                 }
-                Ok(None) => {}
-                Err(e) => return Poll::Ready(Err(e)),
-            }
 
-            match self.recv_stream.poll_data(cx) {
-                Poll::Ready(Some(Ok(chunk))) => {
-                    let chunk_len = chunk.len();
-
-                    if self.read_pending.len() + chunk_len > READ_BUFFER_SIZE {
-                        warn!(
-                            pending = self.read_pending.len(),
-                            incoming = chunk_len,
-                            limit = READ_BUFFER_SIZE,
-                            "gRPC read buffer overflow"
-                        );
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "gRPC read buffer overflow",
-                        )));
-                    }
-                    
-                    self.read_pending.extend_from_slice(&chunk);
-                    self.pending_release_capacity += chunk_len;
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    self.closed = true;
-                    if is_normal_stream_close(&e) {
+                match self.poll_recv_data(cx) {
+                    Poll::Ready(Ok(true)) => continue,
+                    Poll::Ready(Ok(false)) => {
+                        if self.read_remaining > 0 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "gRPC stream closed in the middle of a message payload",
+                            )));
+                        }
                         return Poll::Ready(Ok(()));
                     }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            } else {
+                match parse_grpc_header(&self.read_pending) {
+                    Ok(Some(header)) => {
+                        self.read_pending.advance(header.header_len);
+                        self.release_flow_control_capacity(header.header_len);
+                        self.read_remaining = header.payload_len;
+                        if self.read_remaining == 0 {
+                            continue;
+                        }
+                    }
+                    Ok(None) => match self.poll_recv_data(cx) {
+                        Poll::Ready(Ok(true)) => continue,
+                        Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
+                    },
+                    Err(e) => return Poll::Ready(Err(e)),
+                }
+            }
+        }
+    }
+}
+
+impl GrpcH2cTransport {
+    fn release_flow_control_capacity(&mut self, amount: usize) {
+        if amount == 0 || self.pending_release_capacity == 0 {
+            return;
+        }
+        let to_release = self.pending_release_capacity.min(amount);
+        if let Err(e) = self.recv_stream.flow_control().release_capacity(to_release) {
+            warn!(error = %e, to_release, "Failed to release HTTP/2 flow control capacity");
+        }
+        self.pending_release_capacity -= to_release;
+    }
+
+    // 返回:
+    // - Ok(true): 读取到了新数据
+    // - Ok(false): 对端正常关闭
+    fn poll_recv_data(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        match self.recv_stream.poll_data(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                let chunk_len = chunk.len();
+                if self.read_pending.len() + chunk_len > READ_BUFFER_SIZE {
+                    warn!(
+                        pending = self.read_pending.len(),
+                        incoming = chunk_len,
+                        limit = READ_BUFFER_SIZE,
+                        "gRPC read buffer overflow"
+                    );
                     return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("gRPC recv error: {}", e),
+                        io::ErrorKind::InvalidData,
+                        "gRPC read buffer overflow",
                     )));
                 }
-                Poll::Ready(None) => {
-                    self.closed = true;
-                    return Poll::Ready(Ok(()));
-                }
-                Poll::Pending => return Poll::Pending,
+                self.read_pending.extend_from_slice(&chunk);
+                self.pending_release_capacity += chunk_len;
+                Poll::Ready(Ok(true))
             }
+            Poll::Ready(Some(Err(e))) => {
+                self.closed = true;
+                if is_normal_stream_close(&e) {
+                    Poll::Ready(Ok(false))
+                } else {
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("gRPC recv error: {}", e),
+                    )))
+                }
+            }
+            Poll::Ready(None) => {
+                self.closed = true;
+                Poll::Ready(Ok(false))
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
