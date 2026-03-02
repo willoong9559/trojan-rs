@@ -13,6 +13,6 @@ pub(crate) const INITIAL_CONNECTION_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
 pub(crate) const MAX_FRAME_SIZE: u32 = 64 * 1024;
 
 // gRPC 配置
-pub(crate) const GRPC_MAX_MESSAGE_SIZE: usize = 32 * 1024;
+pub(crate) const GRPC_MAX_MESSAGE_SIZE: usize = 8 * 1024;
 pub(crate) const MAX_SEND_QUEUE_BYTES: usize = 512 * 1024;
 pub(crate) const STREAM_WRITE_TIMEOUT_SECS: u64 = 30;

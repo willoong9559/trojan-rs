@@ -203,6 +203,42 @@ impl GrpcH2cTransport {
         }
         false
     }
+
+    fn grpc_varint_len(mut value: usize) -> usize {
+        let mut len = 1usize;
+        while value >= 0x80 {
+            value >>= 7;
+            len += 1;
+        }
+        len
+    }
+
+    // 帧结构: compression(1) + length(4) + protobuf tag(1) + varint(payload_len) + payload
+    fn grpc_frame_len(payload_len: usize) -> usize {
+        6 + Self::grpc_varint_len(payload_len) + payload_len
+    }
+
+    // 在给定队列预算内，返回可安全编码发送的最大 payload 字节数。
+    fn max_payload_for_queue_budget(payload_cap: usize, queue_budget: usize) -> usize {
+        if payload_cap == 0 {
+            return 0;
+        }
+        if Self::grpc_frame_len(1) > queue_budget {
+            return 0;
+        }
+
+        let mut lo = 1usize;
+        let mut hi = payload_cap;
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2;
+            if Self::grpc_frame_len(mid) <= queue_budget {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    }
 }
 
 fn is_normal_stream_close(error: &h2::Error) -> bool {
@@ -372,7 +408,16 @@ impl AsyncWrite for GrpcH2cTransport {
             }
         }
 
-        let to_write = buf.len().min(GRPC_MAX_MESSAGE_SIZE);
+        let payload_cap = buf.len().min(GRPC_MAX_MESSAGE_SIZE);
+        let queue_budget = MAX_SEND_QUEUE_BYTES.saturating_sub(self.send_queue_bytes);
+        let to_write = Self::max_payload_for_queue_budget(payload_cap, queue_budget);
+        if to_write == 0 {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "gRPC send queue cannot fit even the smallest frame",
+            )));
+        }
+
         let frame = encode_grpc_message(&buf[..to_write]);
         let frame_bytes = frame.len();
         self.send_queue.push_back(frame.freeze());
