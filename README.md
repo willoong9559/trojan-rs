@@ -79,8 +79,9 @@ cargo rustc --release -- -C target-cpu=native -C opt-level=3
 host = "0.0.0.0"
 port = "443"
 password = "mysecretpassword"
-enable_ws = true
-enable_grpc = false
+enable_udp = true
+enable_ws = false
+enable_grpc = true
 
 [tls]
 cert = "/path/to/cert.pem"
