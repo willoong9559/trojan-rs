@@ -27,3 +27,11 @@ thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 pin-project-lite = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+incremental = false
+panic = "unwind"
+strip = true
