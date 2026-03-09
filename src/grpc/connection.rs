@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use h2::server;
 use http::{Response, StatusCode};
 use anyhow::Result;
-use tokio::sync::Semaphore;
 use tracing::{warn, debug};
 
 use super::transport::GrpcH2cTransport;
@@ -21,7 +20,6 @@ use super::{
 /// 管理整个 HTTP/2 连接，接受多个流，每个流对应一个独立的 Trojan 隧道
 pub struct GrpcH2cConnection<S> {
     h2_conn: server::Connection<S, Bytes>,
-    stream_semaphore: Arc<Semaphore>,
     active_count: Arc<AtomicUsize>,
 }
 
@@ -43,7 +41,6 @@ where
         
         Ok(Self { 
             h2_conn,
-            stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_STREAMS)),
             active_count: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -55,7 +52,6 @@ where
     {
         let handler = Arc::new(handler);
         let mut h2_conn = self.h2_conn;
-        let stream_semaphore = self.stream_semaphore;
         let active_count = self.active_count;
 
         loop {
@@ -80,19 +76,6 @@ where
                         continue;
                     }
 
-                    let permit = match stream_semaphore.clone().try_acquire_owned() {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            let response = Response::builder()
-                                .status(StatusCode::SERVICE_UNAVAILABLE)
-                                .header("grpc-status", "8")
-                                .body(())
-                                .unwrap();
-                            let _ = respond.send_response(response, true);
-                            continue;
-                        }
-                    };
-
                     let response = Response::builder()
                         .status(StatusCode::OK)
                         .header("content-type", "application/grpc")
@@ -105,7 +88,6 @@ where
                         Ok(stream) => stream,
                         Err(e) => {
                             warn!(error = %e, "Failed to send gRPC response");
-                            drop(permit);
                             continue;
                         }
                     };
@@ -119,7 +101,6 @@ where
                     let active_count_clone = Arc::clone(&active_count);
                     active_count_clone.fetch_add(1, Ordering::Relaxed);
                     tokio::spawn(async move {
-                        let _permit = permit;
                         let _ = handler_clone(transport).await;
                         active_count_clone.fetch_sub(1, Ordering::Relaxed);
                     });
