@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use h2::server;
 use http::{Response, StatusCode};
 use anyhow::Result;
-use tracing::{warn, debug};
+use tracing::{debug, warn};
 
 use super::transport::GrpcH2cTransport;
 use super::{
@@ -66,7 +66,7 @@ where
                         continue;
                     }
 
-                    let path = request.uri().path();
+                    let path = request.uri().path().to_owned();
                     if !path.ends_with("/Tun") {
                         let response = Response::builder()
                             .status(StatusCode::NOT_FOUND)
@@ -99,10 +99,25 @@ where
 
                     let handler_clone = Arc::clone(&handler);
                     let active_count_clone = Arc::clone(&active_count);
-                    active_count_clone.fetch_add(1, Ordering::Relaxed);
+                    let active_streams = active_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                    debug!(active_streams, path, "Accepted gRPC stream");
                     tokio::spawn(async move {
-                        let _ = handler_clone(transport).await;
-                        active_count_clone.fetch_sub(1, Ordering::Relaxed);
+                        let result = handler_clone(transport).await;
+                        let remaining_streams =
+                            active_count_clone.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+
+                        match result {
+                            Ok(()) => {
+                                debug!(active_streams = remaining_streams, "gRPC stream handler finished");
+                            }
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    active_streams = remaining_streams,
+                                    "gRPC stream handler failed",
+                                );
+                            }
+                        }
                     });
                 }
                 Some(Err(e)) => {

@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::time::Duration;
 use h2::{SendStream, RecvStream, Reason};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::codec::{encode_grpc_message, parse_grpc_header};
 use super::{
@@ -109,6 +109,13 @@ impl GrpcH2cTransport {
             let capacity = self.send_stream.capacity();
             if capacity == 0 {
                 if self.write_wait_timeout.is_none() {
+                    debug!(
+                        queued_bytes = self.send_queue_bytes,
+                        queued_frames = self.send_queue.len(),
+                        frame_len = frame.len(),
+                        frame_offset = self.current_frame_offset,
+                        "Waiting for gRPC stream flow-control capacity",
+                    );
                     self.write_wait_timeout = Some(Box::pin(tokio::time::sleep(Duration::from_secs(
                         STREAM_WRITE_TIMEOUT_SECS,
                     ))));
@@ -120,7 +127,16 @@ impl GrpcH2cTransport {
                         continue;
                     }
                     Poll::Ready(Some(Ok(_))) | Poll::Pending => {
+                        let frame_len = frame.len();
+                        let frame_offset = self.current_frame_offset;
                         if self.write_wait_timed_out(cx) {
+                            warn!(
+                                queued_bytes = self.send_queue_bytes,
+                                queued_frames = self.send_queue.len(),
+                                frame_len,
+                                frame_offset,
+                                "Timed out waiting for gRPC stream flow-control capacity",
+                            );
                             return Poll::Ready(Err(io::Error::new(
                                 io::ErrorKind::TimedOut,
                                 "gRPC stream write stalled waiting for flow-control capacity",
@@ -166,6 +182,11 @@ impl GrpcH2cTransport {
 
     fn poll_wait_send_capacity(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.write_wait_timeout.is_none() {
+            debug!(
+                queued_bytes = self.send_queue_bytes,
+                queued_frames = self.send_queue.len(),
+                "Waiting for gRPC send capacity with a saturated local queue",
+            );
             self.write_wait_timeout = Some(Box::pin(tokio::time::sleep(Duration::from_secs(
                 STREAM_WRITE_TIMEOUT_SECS,
             ))));
@@ -178,6 +199,11 @@ impl GrpcH2cTransport {
             }
             Poll::Ready(Some(Ok(_))) | Poll::Pending => {
                 if self.write_wait_timed_out(cx) {
+                    warn!(
+                        queued_bytes = self.send_queue_bytes,
+                        queued_frames = self.send_queue.len(),
+                        "Timed out waiting for gRPC send capacity with a saturated local queue",
+                    );
                     Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "gRPC send queue saturated and no flow-control progress",

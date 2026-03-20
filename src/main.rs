@@ -286,7 +286,7 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
             log::warn!(peer = %peer_addr, "Connection timeout due to inactivity");
         }
         Err(e) => {
-            log::debug!(peer = %peer_addr, error = %e, "Copy bidirectional error");
+            log::warn!(peer = %peer_addr, error = %e, "Copy bidirectional error");
         }
     }
 
