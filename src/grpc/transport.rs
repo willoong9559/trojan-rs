@@ -29,7 +29,8 @@ pub struct GrpcH2cTransport {
     pub(crate) current_frame: Option<Bytes>,
     pub(crate) current_frame_offset: usize,
     pub(crate) write_wait_timeout: Option<Pin<Box<tokio::time::Sleep>>>,
-    pub(crate) closed: bool,
+    pub(crate) recv_closed: bool,
+    pub(crate) send_closed: bool,
     pub(crate) trailers_sent: bool,
 }
 
@@ -46,7 +47,8 @@ impl GrpcH2cTransport {
             current_frame: None,
             current_frame_offset: 0,
             write_wait_timeout: None,
-            closed: false,
+            recv_closed: false,
+            send_closed: false,
             trailers_sent: false,
         }
     }
@@ -145,12 +147,14 @@ impl GrpcH2cTransport {
                         return Poll::Pending;
                     }
                     Poll::Ready(Some(Err(e))) => {
+                        self.send_closed = true;
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::Other,
                             format!("gRPC capacity error: {}", e),
                         )));
                     }
                     Poll::Ready(None) => {
+                        self.send_closed = true;
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::BrokenPipe,
                             "gRPC stream closed",
@@ -171,6 +175,7 @@ impl GrpcH2cTransport {
                     }
                 }
                 Err(e) => {
+                    self.send_closed = true;
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         format!("gRPC send error: {}", e),
@@ -216,10 +221,13 @@ impl GrpcH2cTransport {
                 io::ErrorKind::Other,
                 format!("gRPC capacity error: {}", e),
             ))),
-            Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "gRPC stream closed",
-            ))),
+            Poll::Ready(None) => {
+                self.send_closed = true;
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "gRPC stream closed",
+                )))
+            }
         }
     }
 
@@ -281,7 +289,7 @@ impl AsyncRead for GrpcH2cTransport {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if self.closed {
+        if self.recv_closed && self.read_remaining == 0 && self.read_pending.is_empty() {
             return Poll::Ready(Ok(()));
         }
 
@@ -297,6 +305,13 @@ impl AsyncRead for GrpcH2cTransport {
                     self.read_remaining -= to_copy;
                     self.release_flow_control_capacity(to_copy);
                     return Poll::Ready(Ok(()));
+                }
+
+                if self.recv_closed {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "gRPC stream closed in the middle of a message payload",
+                    )));
                 }
 
                 match self.poll_recv_data(cx) {
@@ -323,12 +338,17 @@ impl AsyncRead for GrpcH2cTransport {
                             continue;
                         }
                     }
-                    Ok(None) => match self.poll_recv_data(cx) {
-                        Poll::Ready(Ok(true)) => continue,
-                        Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                        Poll::Pending => return Poll::Pending,
-                    },
+                    Ok(None) => {
+                        if self.recv_closed {
+                            return Poll::Ready(Ok(()));
+                        }
+                        match self.poll_recv_data(cx) {
+                            Poll::Ready(Ok(true)) => continue,
+                            Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
                     Err(e) => return Poll::Ready(Err(e)),
                 }
             }
@@ -372,7 +392,7 @@ impl GrpcH2cTransport {
                 Poll::Ready(Ok(true))
             }
             Poll::Ready(Some(Err(e))) => {
-                self.closed = true;
+                self.recv_closed = true;
                 if is_normal_stream_close(&e) {
                     Poll::Ready(Ok(false))
                 } else {
@@ -383,7 +403,7 @@ impl GrpcH2cTransport {
                 }
             }
             Poll::Ready(None) => {
-                self.closed = true;
+                self.recv_closed = true;
                 Poll::Ready(Ok(false))
             }
             Poll::Pending => Poll::Pending,
@@ -397,7 +417,7 @@ impl AsyncWrite for GrpcH2cTransport {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.closed {
+        if self.send_closed {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "transport closed"
@@ -469,16 +489,16 @@ impl AsyncWrite for GrpcH2cTransport {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        self.closed = true;
+        self.send_closed = true;
+
+        if self.trailers_sent {
+            return Poll::Ready(Ok(()));
+        }
 
         match self.as_mut().poll_flush(cx) {
             Poll::Ready(Ok(())) => {
                 if self.current_frame.is_some() || !self.send_queue.is_empty() {
                     return Poll::Pending;
-                }
-
-                if self.trailers_sent {
-                    return Poll::Ready(Ok(()));
                 }
 
                 let mut trailers = http::HeaderMap::new();
@@ -490,7 +510,7 @@ impl AsyncWrite for GrpcH2cTransport {
                     }
                     Err(e) => {
                         self.trailers_sent = true;
-                        if e.is_remote() || e.is_io() {
+                        if is_benign_trailer_send_error(&e) {
                             Poll::Ready(Ok(()))
                         } else {
                             Poll::Ready(Err(io::Error::new(
@@ -507,6 +527,13 @@ impl AsyncWrite for GrpcH2cTransport {
     }
 }
 
+fn is_benign_trailer_send_error(error: &h2::Error) -> bool {
+    error.is_remote()
+        || error.is_io()
+        || error.is_reset()
+        || error.to_string().contains("unexpected frame type")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,7 +544,7 @@ mod tests {
     use http::Request;
     use std::env;
     use std::time::Instant;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{oneshot, Mutex};
     use tokio::time::{timeout, Duration};
 
@@ -592,6 +619,93 @@ mod tests {
         assert!(result.is_ok(), "{}", result.err().unwrap_or_default());
 
         body_drain_task.abort();
+        server_task.abort();
+        client_conn_task.abort();
+    }
+
+    #[tokio::test]
+    async fn read_eof_must_not_close_write_half() {
+        let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
+        let (done_tx, done_rx) = oneshot::channel::<Result<(), String>>();
+        let done_tx = std::sync::Arc::new(Mutex::new(Some(done_tx)));
+
+        let server_task = tokio::spawn(async move {
+            let conn = GrpcH2cConnection::new(server_io)
+                .await
+                .expect("server handshake should succeed");
+            let _ = conn
+                .run({
+                    let done_tx = std::sync::Arc::clone(&done_tx);
+                    move |mut transport| {
+                        let done_tx = std::sync::Arc::clone(&done_tx);
+                        async move {
+                            let mut probe = [0u8; 1];
+                            let result = timeout(Duration::from_secs(3), async {
+                                let eof = transport.read(&mut probe).await?;
+                                if eof != 0 {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!("expected EOF, got {eof} bytes"),
+                                    ));
+                                }
+                                transport.write_all(b"hello").await?;
+                                transport.shutdown().await
+                            })
+                            .await
+                            .map_err(|_| "server timeout".to_string())
+                            .and_then(|r| r.map_err(|e| format!("server error: {e}")));
+                            if let Some(tx) = done_tx.lock().await.take() {
+                                let _ = tx.send(result);
+                            }
+                            Ok(())
+                        }
+                    }
+                })
+                .await;
+        });
+
+        let (mut send_request, client_conn) = client::Builder::new()
+            .handshake::<_, Bytes>(client_io)
+            .await
+            .expect("client handshake should succeed");
+        let client_conn_task = tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/Tun")
+            .body(())
+            .expect("request should be valid");
+        let (response_future, _request_stream) = send_request
+            .send_request(request, true)
+            .expect("request send should succeed");
+        let response = timeout(Duration::from_secs(3), response_future)
+            .await
+            .expect("response headers timeout")
+            .expect("response future failed");
+        let mut body = response.into_body();
+
+        let mut received = Vec::new();
+        loop {
+            match timeout(Duration::from_secs(3), poll_fn(|cx| body.poll_data(cx))).await {
+                Ok(Some(Ok(chunk))) => {
+                    received.extend_from_slice(&chunk);
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                }
+                Ok(Some(Err(e))) => panic!("response body error: {e}"),
+                Ok(None) => break,
+                Err(_) => panic!("response body timeout"),
+            }
+        }
+
+        let result = timeout(Duration::from_secs(3), done_rx)
+            .await
+            .expect("done signal timeout")
+            .expect("done channel closed");
+        assert!(result.is_ok(), "{}", result.err().unwrap_or_default());
+        assert_eq!(received, super::super::codec::encode_grpc_message(b"hello").to_vec());
+
         server_task.abort();
         client_conn_task.abort();
     }
