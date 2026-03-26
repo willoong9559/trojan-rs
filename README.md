@@ -18,7 +18,7 @@
 
 ```bash
 # 克隆仓库
-git clone <repo_url>
+git clone https://github.com/willoong9559/trojan-rs.git
 cd trojan-rs
 
 # 构建发布版本
