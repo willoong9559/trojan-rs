@@ -7,6 +7,7 @@ use h2::server;
 use http::{Response, StatusCode};
 use anyhow::Result;
 use tracing::{debug, warn};
+use tokio::sync::Notify;
 
 use super::transport::GrpcH2cTransport;
 use super::{
@@ -53,6 +54,7 @@ where
         let handler = Arc::new(handler);
         let mut h2_conn = self.h2_conn;
         let active_count = self.active_count;
+        let all_streams_done = Arc::new(Notify::new());
 
         loop {
             match h2_conn.accept().await {
@@ -99,6 +101,7 @@ where
 
                     let handler_clone = Arc::clone(&handler);
                     let active_count_clone = Arc::clone(&active_count);
+                    let all_streams_done_clone = Arc::clone(&all_streams_done);
                     let active_streams = active_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
                     debug!(active_streams, path, "Accepted gRPC stream");
                     tokio::spawn(async move {
@@ -118,6 +121,10 @@ where
                                 );
                             }
                         }
+
+                        if remaining_streams == 0 {
+                            all_streams_done_clone.notify_waiters();
+                        }
                     });
                 }
                 Some(Err(e)) => {
@@ -130,6 +137,100 @@ where
                 }
             }
         }
+
+        while active_count.load(Ordering::Relaxed) > 0 {
+            all_streams_done.notified().await;
+        }
+
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use h2::client;
+    use http::Request;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncWriteExt;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn stream_failure_does_not_fail_connection() {
+        let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
+        let stream_count = Arc::new(AtomicUsize::new(0));
+
+        let server_task = tokio::spawn(async move {
+            let conn = GrpcH2cConnection::new(server_io)
+                .await
+                .expect("server handshake should succeed");
+            conn
+                .run({
+                    let stream_count = Arc::clone(&stream_count);
+                    move |mut transport| {
+                        let stream_count = Arc::clone(&stream_count);
+                        async move {
+                            match stream_count.fetch_add(1, Ordering::Relaxed) {
+                                0 => Err(anyhow::anyhow!("intentional stream failure")),
+                                _ => {
+                                    transport.shutdown().await?;
+                                    Ok(())
+                                }
+                            }
+                        }
+                    }
+                })
+                .await
+        });
+
+        let (mut send_request, client_conn) = client::Builder::new()
+            .handshake::<_, Bytes>(client_io)
+            .await
+            .expect("client handshake should succeed");
+        let client_conn_task = tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/Tun")
+                .body(())
+                .expect("request should be valid")
+        };
+
+        let (failed_response, _) = send_request
+            .send_request(request(), true)
+            .expect("first request send should succeed");
+        let failed_response = timeout(Duration::from_secs(3), failed_response)
+            .await
+            .expect("first response headers timeout")
+            .expect("first response future failed");
+        drop(failed_response);
+
+        let (ok_response, _) = send_request
+            .send_request(request(), true)
+            .expect("second request send should succeed");
+        let ok_response = timeout(Duration::from_secs(3), ok_response)
+            .await
+            .expect("second response headers timeout")
+            .expect("second response future failed");
+        let mut ok_body = ok_response.into_body();
+        let trailers = timeout(Duration::from_secs(3), ok_body.trailers())
+            .await
+            .expect("trailers timeout")
+            .expect("trailers future failed")
+            .expect("expected grpc trailers");
+        assert_eq!(trailers.get("grpc-status").unwrap(), "0");
+
+        drop(send_request);
+        let server_result = timeout(Duration::from_secs(3), server_task)
+            .await
+            .expect("server task timeout")
+            .expect("server task join failed");
+        assert!(server_result.is_ok(), "connection should stay healthy: {server_result:?}");
+
+        client_conn_task.abort();
     }
 }
