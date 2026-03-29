@@ -1,15 +1,17 @@
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use bytes::{Buf, Bytes, BytesMut};
+use std::sync::Arc;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::io;
-use std::collections::VecDeque;
 use h2::{SendStream, RecvStream, Reason};
 use tracing::{debug, warn};
 
+use crate::relay::{RelayIo, WriteBufferWatermark, WriteBufferWaker};
+
 use super::codec::{encode_grpc_message, parse_grpc_header};
 use super::{
-    MAX_FRAME_SIZE, GRPC_MAX_MESSAGE_SIZE, MAX_SEND_QUEUE_BYTES, READ_BUFFER_SIZE,
+    GRPC_MAX_MESSAGE_SIZE, STREAM_BUFFER_HIGH_WATERMARK, STREAM_BUFFER_LOW_WATERMARK,
 };
 
 /// gRPC 传输层（兼容 v2ray）
@@ -20,103 +22,98 @@ pub struct GrpcH2cTransport {
     pub(crate) send_stream: SendStream<Bytes>,
     pub(crate) read_pending: BytesMut,
     pub(crate) read_remaining: usize,
-    pub(crate) pending_release_capacity: usize,
-    pub(crate) send_queue: VecDeque<Bytes>,
-    pub(crate) send_queue_bytes: usize,
-    pub(crate) current_frame: Option<Bytes>,
-    pub(crate) current_frame_offset: usize,
+    pub(crate) unconsumed_bytes: usize,
+    pub(crate) pending_send_buffer: BytesMut,
+    pub(crate) waiting_for_send_capacity: bool,
+    pub(crate) read_disable_count: usize,
+    pub(crate) recv_high_watermark_triggered: bool,
+    pub(crate) send_high_watermark_triggered: bool,
     pub(crate) recv_closed: bool,
     pub(crate) send_closed: bool,
     pub(crate) trailers_sent: bool,
+    connection_send_watermark: Arc<WriteBufferWatermark>,
+    stream_write_waker: Arc<WriteBufferWaker>,
+    read_waker: Option<Waker>,
 }
 
 impl GrpcH2cTransport {
-    pub(crate) fn new(recv_stream: RecvStream, send_stream: SendStream<Bytes>) -> Self {
+    pub(crate) fn new(
+        recv_stream: RecvStream,
+        send_stream: SendStream<Bytes>,
+        connection_send_watermark: Arc<WriteBufferWatermark>,
+    ) -> Self {
+        let stream_write_waker = Arc::new(WriteBufferWaker::default());
+        connection_send_watermark.register_waker(&stream_write_waker);
         Self {
             recv_stream,
             send_stream,
-            read_pending: BytesMut::with_capacity(READ_BUFFER_SIZE),
+            read_pending: BytesMut::new(),
             read_remaining: 0,
-            pending_release_capacity: 0,
-            send_queue: VecDeque::new(),
-            send_queue_bytes: 0,
-            current_frame: None,
-            current_frame_offset: 0,
+            unconsumed_bytes: 0,
+            pending_send_buffer: BytesMut::new(),
+            waiting_for_send_capacity: false,
+            read_disable_count: 0,
+            recv_high_watermark_triggered: false,
+            send_high_watermark_triggered: false,
             recv_closed: false,
             send_closed: false,
             trailers_sent: false,
+            connection_send_watermark,
+            stream_write_waker,
+            read_waker: None,
         }
     }
 
-    fn poll_send_queued(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        loop {
-            if let Some(ref frame) = self.current_frame {
-                if self.current_frame_offset > frame.len() {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "invalid send state: frame offset exceeds frame length",
-                    )));
-                }
-                let remaining = frame.len() - self.current_frame_offset;
-                if remaining > 0 {
-                    let frame_len = frame.len();
-                    match self.poll_send_current_frame(cx)? {
-                        Poll::Ready(()) => {
-                            self.send_queue_bytes = self.send_queue_bytes.saturating_sub(frame_len);
-                            self.current_frame = None;
-                            self.current_frame_offset = 0;
-                        }
-                        Poll::Pending => return Poll::Pending,
-                    }
-                } else {
-                    self.current_frame = None;
-                    self.current_frame_offset = 0;
-                }
-            }
-
-            match self.send_queue.pop_front() {
-                Some(frame) => {
-                    self.current_frame = Some(frame);
-                    self.current_frame_offset = 0;
-                }
-                None => return Poll::Ready(Ok(())),
-            }
+    fn replace_waker(slot: &mut Option<Waker>, waker: &Waker) {
+        match slot {
+            Some(existing) if existing.will_wake(waker) => {}
+            _ => *slot = Some(waker.clone()),
         }
     }
 
-    fn poll_send_current_frame(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let frame = match &self.current_frame {
-            Some(f) => f,
-            None => return Poll::Ready(Ok(())),
-        };
+    fn register_read_waker(&mut self, waker: &Waker) {
+        Self::replace_waker(&mut self.read_waker, waker);
+    }
 
-        if self.current_frame_offset > frame.len() {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid send state: frame offset exceeds frame length",
-            )));
+    fn register_write_waker(&mut self, waker: &Waker) {
+        self.stream_write_waker.register(waker);
+    }
+
+    fn wake_read_task(&mut self) {
+        if let Some(waker) = self.read_waker.take() {
+            waker.wake();
         }
+    }
 
+    fn wake_write_task(&self) {
+        self.stream_write_waker.wake();
+    }
+
+    fn poll_send_pending_buffer(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
-            let remaining = frame.len() - self.current_frame_offset;
+            let remaining = self.pending_send_buffer.len();
             if remaining == 0 {
                 return Poll::Ready(Ok(()));
             }
 
             let capacity = self.send_stream.capacity();
             if capacity == 0 {
-                debug!(
-                    queued_bytes = self.send_queue_bytes,
-                    queued_frames = self.send_queue.len(),
-                    frame_len = frame.len(),
-                    frame_offset = self.current_frame_offset,
-                    "Waiting for gRPC stream flow-control capacity",
-                );
-                self.send_stream.reserve_capacity(remaining.min(MAX_FRAME_SIZE as usize));
+                if !self.waiting_for_send_capacity {
+                    debug!(
+                        queued_bytes = self.buffered_send_bytes(),
+                        "Waiting for gRPC stream flow-control capacity",
+                    );
+                    self.waiting_for_send_capacity = true;
+                }
+                self.send_stream.reserve_capacity(remaining);
                 match self.send_stream.poll_capacity(cx) {
-                    Poll::Ready(Some(Ok(cap))) if cap > 0 => continue,
+                    Poll::Ready(Some(Ok(cap))) if cap > 0 => {
+                        self.waiting_for_send_capacity = false;
+                        continue;
+                    }
                     Poll::Ready(Some(Ok(_))) | Poll::Pending => return Poll::Pending,
                     Poll::Ready(Some(Err(e))) => {
+                        self.waiting_for_send_capacity = false;
                         self.send_closed = true;
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::Other,
@@ -124,6 +121,7 @@ impl GrpcH2cTransport {
                         )));
                     }
                     Poll::Ready(None) => {
+                        self.waiting_for_send_capacity = false;
                         self.send_closed = true;
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::BrokenPipe,
@@ -134,14 +132,12 @@ impl GrpcH2cTransport {
             }
 
             let send_size = remaining.min(capacity);
-            let chunk = frame.slice(self.current_frame_offset..self.current_frame_offset + send_size);
+            let chunk = self.pending_send_buffer.split_to(send_size).freeze();
             
             match self.send_stream.send_data(chunk, false) {
                 Ok(()) => {
-                    self.current_frame_offset += send_size;
-                    if self.current_frame_offset >= frame.len() {
-                        return Poll::Ready(Ok(()));
-                    }
+                    self.waiting_for_send_capacity = false;
+                    self.update_send_watermarks();
                 }
                 Err(e) => {
                     self.send_closed = true;
@@ -154,64 +150,108 @@ impl GrpcH2cTransport {
         }
     }
 
-    fn poll_wait_send_capacity(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        debug!(
-            queued_bytes = self.send_queue_bytes,
-            queued_frames = self.send_queue.len(),
-            "Waiting for gRPC send capacity with a saturated local queue",
-        );
-        self.send_stream.reserve_capacity(MAX_FRAME_SIZE as usize);
-        match self.send_stream.poll_capacity(cx) {
-            Poll::Ready(Some(Ok(cap))) if cap > 0 => Poll::Ready(Ok(())),
-            Poll::Ready(Some(Ok(_))) | Poll::Pending => Poll::Pending,
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("gRPC capacity error: {}", e),
-            ))),
-            Poll::Ready(None) => {
-                self.send_closed = true;
-                Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "gRPC stream closed",
-                )))
+    fn buffered_read_bytes(&self) -> usize {
+        self.read_pending.len()
+    }
+
+    fn buffered_send_bytes(&self) -> usize {
+        self.pending_send_buffer.len()
+    }
+
+    fn buffers_overrun(&self) -> bool {
+        self.read_disable_count > 0
+    }
+
+    fn should_allow_peer_additional_stream_window(&self) -> bool {
+        !self.buffers_overrun() && !self.recv_high_watermark_triggered
+    }
+
+    fn maybe_grant_peer_additional_stream_window(&mut self) {
+        if !self.should_allow_peer_additional_stream_window() {
+            return;
+        }
+        self.grant_peer_additional_stream_window();
+    }
+
+    fn grant_peer_additional_stream_window(&mut self) {
+        if self.unconsumed_bytes == 0 {
+            return;
+        }
+        let amount = self.unconsumed_bytes;
+        self.unconsumed_bytes = 0;
+        if let Err(e) = self.recv_stream.flow_control().release_capacity(amount) {
+            warn!(error = %e, amount, "Failed to release HTTP/2 flow control capacity");
+        }
+    }
+
+    pub(crate) fn read_disable(&mut self, disable: bool) {
+        if disable {
+            let was_enabled = self.read_disable_count == 0;
+            self.read_disable_count = self.read_disable_count.saturating_add(1);
+            if was_enabled {
+                debug!("gRPC reads disabled");
             }
+            return;
+        }
+
+        if self.read_disable_count == 0 {
+            return;
+        }
+
+        self.read_disable_count -= 1;
+        if self.read_disable_count == 0 {
+            debug!("gRPC reads re-enabled");
+            self.maybe_grant_peer_additional_stream_window();
+            self.wake_read_task();
         }
     }
 
-    fn grpc_varint_len(mut value: usize) -> usize {
-        let mut len = 1usize;
-        while value >= 0x80 {
-            value >>= 7;
-            len += 1;
+    fn update_recv_watermarks(&mut self) {
+        let buffered_read_bytes = self.buffered_read_bytes();
+        if !self.recv_high_watermark_triggered
+            && buffered_read_bytes >= STREAM_BUFFER_HIGH_WATERMARK
+        {
+            self.recv_high_watermark_triggered = true;
+            debug!(
+                buffered_read_bytes,
+                "gRPC recv buffer reached high watermark",
+            );
+        } else if self.recv_high_watermark_triggered
+            && buffered_read_bytes <= STREAM_BUFFER_LOW_WATERMARK
+        {
+            self.recv_high_watermark_triggered = false;
+            debug!(
+                buffered_read_bytes,
+                "gRPC recv buffer dropped below low watermark",
+            );
         }
-        len
     }
 
-    // 帧结构: compression(1) + length(4) + protobuf tag(1) + varint(payload_len) + payload
-    fn grpc_frame_len(payload_len: usize) -> usize {
-        6 + Self::grpc_varint_len(payload_len) + payload_len
+    fn recoup_unconsumed_bytes_on_close(&mut self) {
+        self.recv_high_watermark_triggered = false;
+        self.grant_peer_additional_stream_window();
     }
 
-    // 在给定队列预算内，返回可安全编码发送的最大 payload 字节数。
-    fn max_payload_for_queue_budget(payload_cap: usize, queue_budget: usize) -> usize {
-        if payload_cap == 0 {
-            return 0;
+    fn update_send_watermarks(&mut self) {
+        let queued_bytes = self.buffered_send_bytes();
+        if !self.send_high_watermark_triggered
+            && queued_bytes >= STREAM_BUFFER_HIGH_WATERMARK
+        {
+            self.send_high_watermark_triggered = true;
+            debug!(queued_bytes, "gRPC send buffer reached high watermark");
+        } else if self.send_high_watermark_triggered
+            && queued_bytes <= STREAM_BUFFER_LOW_WATERMARK
+        {
+            self.send_high_watermark_triggered = false;
+            debug!(queued_bytes, "gRPC send buffer dropped below low watermark");
+            self.wake_write_task();
         }
-        if Self::grpc_frame_len(1) > queue_budget {
-            return 0;
-        }
+    }
 
-        let mut lo = 1usize;
-        let mut hi = payload_cap;
-        while lo < hi {
-            let mid = (lo + hi + 1) / 2;
-            if Self::grpc_frame_len(mid) <= queue_budget {
-                lo = mid;
-            } else {
-                hi = mid - 1;
-            }
-        }
-        lo
+    fn enqueue_send_frame(&mut self, payload: &[u8]) {
+        let frame = encode_grpc_message(payload);
+        self.pending_send_buffer.extend_from_slice(&frame);
+        self.update_send_watermarks();
     }
 }
 
@@ -229,6 +269,8 @@ impl AsyncRead for GrpcH2cTransport {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        self.register_read_waker(cx.waker());
+
         if self.recv_closed && self.read_remaining == 0 && self.read_pending.is_empty() {
             return Poll::Ready(Ok(()));
         }
@@ -243,7 +285,8 @@ impl AsyncRead for GrpcH2cTransport {
                     buf.put_slice(&self.read_pending[..to_copy]);
                     self.read_pending.advance(to_copy);
                     self.read_remaining -= to_copy;
-                    self.release_flow_control_capacity(to_copy);
+                    self.update_recv_watermarks();
+                    self.maybe_grant_peer_additional_stream_window();
                     return Poll::Ready(Ok(()));
                 }
 
@@ -252,6 +295,10 @@ impl AsyncRead for GrpcH2cTransport {
                         io::ErrorKind::UnexpectedEof,
                         "gRPC stream closed in the middle of a message payload",
                     )));
+                }
+
+                if self.buffers_overrun() {
+                    return Poll::Pending;
                 }
 
                 match self.poll_recv_data(cx) {
@@ -272,7 +319,8 @@ impl AsyncRead for GrpcH2cTransport {
                 match parse_grpc_header(&self.read_pending) {
                     Ok(Some(header)) => {
                         self.read_pending.advance(header.header_len);
-                        self.release_flow_control_capacity(header.header_len);
+                        self.update_recv_watermarks();
+                        self.maybe_grant_peer_additional_stream_window();
                         self.read_remaining = header.payload_len;
                         if self.read_remaining == 0 {
                             continue;
@@ -281,6 +329,9 @@ impl AsyncRead for GrpcH2cTransport {
                     Ok(None) => {
                         if self.recv_closed {
                             return Poll::Ready(Ok(()));
+                        }
+                        if self.buffers_overrun() {
+                            return Poll::Pending;
                         }
                         match self.poll_recv_data(cx) {
                             Poll::Ready(Ok(true)) => continue,
@@ -297,17 +348,6 @@ impl AsyncRead for GrpcH2cTransport {
 }
 
 impl GrpcH2cTransport {
-    fn release_flow_control_capacity(&mut self, amount: usize) {
-        if amount == 0 || self.pending_release_capacity == 0 {
-            return;
-        }
-        let to_release = self.pending_release_capacity.min(amount);
-        if let Err(e) = self.recv_stream.flow_control().release_capacity(to_release) {
-            warn!(error = %e, to_release, "Failed to release HTTP/2 flow control capacity");
-        }
-        self.pending_release_capacity -= to_release;
-    }
-
     // 返回:
     // - Ok(true): 读取到了新数据
     // - Ok(false): 对端正常关闭
@@ -315,24 +355,15 @@ impl GrpcH2cTransport {
         match self.recv_stream.poll_data(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
                 let chunk_len = chunk.len();
-                if self.read_pending.len() + chunk_len > READ_BUFFER_SIZE {
-                    warn!(
-                        pending = self.read_pending.len(),
-                        incoming = chunk_len,
-                        limit = READ_BUFFER_SIZE,
-                        "gRPC read buffer overflow"
-                    );
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "gRPC read buffer overflow",
-                    )));
-                }
                 self.read_pending.extend_from_slice(&chunk);
-                self.pending_release_capacity += chunk_len;
+                self.unconsumed_bytes += chunk_len;
+                self.update_recv_watermarks();
+                self.maybe_grant_peer_additional_stream_window();
                 Poll::Ready(Ok(true))
             }
             Poll::Ready(Some(Err(e))) => {
                 self.recv_closed = true;
+                self.recoup_unconsumed_bytes_on_close();
                 if is_normal_stream_close(&e) {
                     Poll::Ready(Ok(false))
                 } else {
@@ -344,6 +375,7 @@ impl GrpcH2cTransport {
             }
             Poll::Ready(None) => {
                 self.recv_closed = true;
+                self.recoup_unconsumed_bytes_on_close();
                 Poll::Ready(Ok(false))
             }
             Poll::Pending => Poll::Pending,
@@ -368,51 +400,29 @@ impl AsyncWrite for GrpcH2cTransport {
             return Poll::Ready(Ok(0));
         }
 
-        match self.poll_send_queued(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => return Poll::Pending,
-        }
+        self.register_write_waker(cx.waker());
 
-        if self.send_queue_bytes >= MAX_SEND_QUEUE_BYTES {
-            match self.poll_wait_send_capacity(cx) {
-                Poll::Ready(Ok(())) => {
-                    match self.poll_send_queued(cx) {
-                        Poll::Ready(Ok(())) => {}
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                        Poll::Pending => return Poll::Pending,
-                    }
-                    if self.send_queue_bytes >= MAX_SEND_QUEUE_BYTES {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            "gRPC send queue is saturated without progress",
-                        )));
-                    }
+        match self.poll_send_pending_buffer(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Pending => {
+                if !self.pending_send_buffer.is_empty() {
+                    return Poll::Pending;
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
             }
-        }
-
-        let payload_cap = buf.len().min(GRPC_MAX_MESSAGE_SIZE);
-        let queue_budget = MAX_SEND_QUEUE_BYTES.saturating_sub(self.send_queue_bytes);
-        let to_write = Self::max_payload_for_queue_budget(payload_cap, queue_budget);
-        if to_write == 0 {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "gRPC send queue cannot fit even the smallest frame",
-            )));
-        }
-
-        let frame = encode_grpc_message(&buf[..to_write]);
-        let frame_bytes = frame.len();
-        self.send_queue.push_back(frame.freeze());
-        self.send_queue_bytes += frame_bytes;
-
-        match self.poll_send_queued(cx) {
-            Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Pending => {}
+        }
+
+        self.update_send_watermarks();
+        if self.send_high_watermark_triggered || self.connection_send_watermark.is_backpressured() {
+            return Poll::Pending;
+        }
+
+        let to_write = buf.len().min(GRPC_MAX_MESSAGE_SIZE);
+        self.enqueue_send_frame(&buf[..to_write]);
+
+        match self.poll_send_pending_buffer(cx) {
+            Poll::Ready(Ok(())) | Poll::Pending => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
         }
 
         Poll::Ready(Ok(to_write))
@@ -422,7 +432,13 @@ impl AsyncWrite for GrpcH2cTransport {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        self.poll_send_queued(cx)
+        self.register_write_waker(cx.waker());
+        match self.poll_send_pending_buffer(cx) {
+            Poll::Ready(Ok(())) if self.connection_send_watermark.is_backpressured() => {
+                Poll::Pending
+            }
+            other => other,
+        }
     }
 
     fn poll_shutdown(
@@ -437,7 +453,7 @@ impl AsyncWrite for GrpcH2cTransport {
 
         match self.as_mut().poll_flush(cx) {
             Poll::Ready(Ok(())) => {
-                if self.current_frame.is_some() || !self.send_queue.is_empty() {
+                if !self.pending_send_buffer.is_empty() {
                     return Poll::Pending;
                 }
 
@@ -474,19 +490,78 @@ fn is_benign_trailer_send_error(error: &h2::Error) -> bool {
         || error.to_string().contains("unexpected frame type")
 }
 
+impl RelayIo for GrpcH2cTransport {
+    fn read_disable(&mut self, disable: bool) {
+        GrpcH2cTransport::read_disable(self, disable);
+    }
+
+    fn is_write_backpressured(&self) -> bool {
+        self.connection_send_watermark.is_backpressured() || self.send_high_watermark_triggered
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use super::super::GrpcH2cConnection;
     use bytes::Bytes;
     use futures_util::future::poll_fn;
+    use futures_util::task::{waker, ArcWake};
     use h2::client;
     use http::Request;
     use std::env;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Instant;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{oneshot, Mutex};
     use tokio::time::{timeout, Duration};
+
+    #[derive(Default)]
+    struct CountingWaker {
+        wake_count: AtomicUsize,
+    }
+
+    impl ArcWake for CountingWaker {
+        fn wake_by_ref(arc_self: &std::sync::Arc<Self>) {
+            arc_self.wake_count.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn connection_write_watermark_fans_out_to_all_streams() {
+        let connection = WriteBufferWatermark::new(
+            crate::relay::NETWORK_BUFFER_HIGH_WATERMARK,
+            crate::relay::NETWORK_BUFFER_LOW_WATERMARK,
+        );
+        let stream_a = Arc::new(WriteBufferWaker::default());
+        let stream_b = Arc::new(WriteBufferWaker::default());
+        connection.register_waker(&stream_a);
+        connection.register_waker(&stream_b);
+
+        let counter_a = std::sync::Arc::new(CountingWaker::default());
+        let counter_b = std::sync::Arc::new(CountingWaker::default());
+        let waker_a = waker(counter_a.clone());
+        let waker_b = waker(counter_b.clone());
+        stream_a.register(&waker_a);
+        stream_b.register(&waker_b);
+
+        connection.update_buffered_bytes(0, crate::relay::NETWORK_BUFFER_HIGH_WATERMARK);
+        assert!(connection.is_backpressured());
+        assert_eq!(counter_a.wake_count.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(counter_b.wake_count.load(AtomicOrdering::Relaxed), 1);
+
+        let waker_a = waker(counter_a.clone());
+        let waker_b = waker(counter_b.clone());
+        stream_a.register(&waker_a);
+        stream_b.register(&waker_b);
+        connection.update_buffered_bytes(
+            crate::relay::NETWORK_BUFFER_HIGH_WATERMARK,
+            crate::relay::NETWORK_BUFFER_LOW_WATERMARK,
+        );
+        assert!(!connection.is_backpressured());
+        assert_eq!(counter_a.wake_count.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(counter_b.wake_count.load(AtomicOrdering::Relaxed), 2);
+    }
 
     #[tokio::test]
     async fn transport_write_all_succeeds() {
@@ -651,7 +726,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_full_path_must_not_hang_write() {
+    async fn recv_high_watermark_stays_latched_until_low_watermark() {
         let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
         let (done_tx, done_rx) = oneshot::channel::<Result<(), String>>();
         let done_tx = std::sync::Arc::new(Mutex::new(Some(done_tx)));
@@ -666,11 +741,106 @@ mod tests {
                     move |mut transport| {
                         let done_tx = std::sync::Arc::clone(&done_tx);
                         async move {
-                            transport.send_queue_bytes = MAX_SEND_QUEUE_BYTES;
+                            transport.read_remaining = STREAM_BUFFER_LOW_WATERMARK + 2;
+                            transport
+                                .read_pending
+                                .resize(STREAM_BUFFER_LOW_WATERMARK + 2, 0xAB);
+                            transport.recv_high_watermark_triggered = true;
+
+                            let result = timeout(Duration::from_secs(3), async {
+                                let mut probe = [0u8; 1];
+                                let first = transport.read(&mut probe).await?;
+                                if first != 1
+                                    || !transport.recv_high_watermark_triggered
+                                    || transport.read_disable_count != 0
+                                {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "recv high watermark cleared too early",
+                                    ));
+                                }
+
+                                let second = transport.read(&mut probe).await?;
+                                if second != 1
+                                    || transport.recv_high_watermark_triggered
+                                    || transport.read_disable_count != 0
+                                {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "recv high watermark did not clear at low watermark",
+                                    ));
+                                }
+
+                                Ok::<(), io::Error>(())
+                            })
+                            .await
+                            .map_err(|_| "server timeout".to_string())
+                            .and_then(|r| r.map_err(|e| format!("server error: {e}")));
+                            if let Some(tx) = done_tx.lock().await.take() {
+                                let _ = tx.send(result);
+                            }
+                            Ok(())
+                        }
+                    }
+                })
+                .await;
+        });
+
+        let (mut send_request, client_conn) = client::Builder::new()
+            .handshake::<_, Bytes>(client_io)
+            .await
+            .expect("client handshake should succeed");
+        let client_conn_task = tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/Tun")
+            .body(())
+            .expect("request should be valid");
+        let (response_future, _request_stream) = send_request
+            .send_request(request, true)
+            .expect("request send should succeed");
+        let _ = timeout(Duration::from_secs(3), response_future)
+            .await
+            .expect("response headers timeout")
+            .expect("response future failed");
+
+        let result = timeout(Duration::from_secs(3), done_rx)
+            .await
+            .expect("done signal timeout")
+            .expect("done channel closed");
+        assert!(result.is_ok(), "{}", result.err().unwrap_or_default());
+
+        server_task.abort();
+        client_conn_task.abort();
+    }
+
+    #[tokio::test]
+    async fn send_high_watermark_backpressures_write() {
+        let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
+        let (done_tx, done_rx) = oneshot::channel::<Result<(), String>>();
+        let done_tx = std::sync::Arc::new(Mutex::new(Some(done_tx)));
+
+        let server_task = tokio::spawn(async move {
+            let conn = GrpcH2cConnection::new(server_io)
+                .await
+                .expect("server handshake should succeed");
+            let _ = conn
+                .run({
+                    let done_tx = std::sync::Arc::clone(&done_tx);
+                    move |mut transport| {
+                        let done_tx = std::sync::Arc::clone(&done_tx);
+                        async move {
+                            transport
+                                .pending_send_buffer
+                                .resize(STREAM_BUFFER_HIGH_WATERMARK, 0);
+                            transport.send_high_watermark_triggered = true;
                             let result = timeout(Duration::from_millis(300), transport.write_all(b"hello"))
                                 .await
-                                .map_err(|_| "write_all hung in queue-full path".to_string())
-                                .map(|_| ());
+                                .map(|_| Err("write_all completed without backpressure".to_string()))
+                                .unwrap_or_else(|_| Ok(()));
                             if let Some(tx) = done_tx.lock().await.take() {
                                 let _ = tx.send(result);
                             }
@@ -744,29 +914,27 @@ mod tests {
                         let done_tx = std::sync::Arc::clone(&done_tx);
                         let payload = std::sync::Arc::clone(&payload);
                         async move {
-                            let result = timeout(Duration::from_secs(5), async {
+                            let result = match timeout(Duration::from_secs(12), async {
                                 for _ in 0..iterations {
                                     transport.write_all(&payload).await?;
                                 }
-                                transport.flush().await?;
                                 Ok::<(), io::Error>(())
                             })
                             .await
-                            .map_err(|_| "burst writes timeout".to_string())
-                            .and_then(|r| match r {
-                                Ok(()) => Ok(()),
-                                Err(e)
-                                    if matches!(
-                                        e.kind(),
-                                        io::ErrorKind::TimedOut
-                                            | io::ErrorKind::WouldBlock
-                                            | io::ErrorKind::BrokenPipe
-                                    ) =>
+                            {
+                                Err(_) => Err("burst write_all timeout".to_string()),
+                                Ok(Err(e)) => Err(format!("unexpected burst write error: {e}")),
+                                Ok(Ok(())) => match timeout(Duration::from_secs(12), async {
+                                    transport.flush().await?;
+                                    Ok::<(), io::Error>(())
+                                })
+                                .await
                                 {
-                                    Ok(())
-                                }
-                                Err(e) => Err(format!("unexpected burst error: {e}")),
-                            });
+                                    Err(_) => Err("burst flush timeout".to_string()),
+                                    Ok(Err(e)) => Err(format!("unexpected burst flush error: {e}")),
+                                    Ok(Ok(())) => Ok(()),
+                                },
+                            };
                             if let Some(tx) = done_tx.lock().await.take() {
                                 let _ = tx.send(result);
                             }
@@ -809,7 +977,7 @@ mod tests {
             }
         });
 
-        let result = timeout(Duration::from_secs(6), done_rx)
+        let result = timeout(Duration::from_secs(25), done_rx)
             .await
             .expect("done signal timeout")
             .expect("done channel closed");
@@ -821,7 +989,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_full_returns_wouldblock_error() {
+    async fn send_high_watermark_stays_latched_until_low_watermark() {
         let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
         let (done_tx, done_rx) = oneshot::channel::<Result<(), String>>();
         let done_tx = std::sync::Arc::new(Mutex::new(Some(done_tx)));
@@ -836,15 +1004,14 @@ mod tests {
                     move |mut transport| {
                         let done_tx = std::sync::Arc::clone(&done_tx);
                         async move {
-                            transport.send_queue_bytes = MAX_SEND_QUEUE_BYTES;
+                            transport
+                                .pending_send_buffer
+                                .resize(STREAM_BUFFER_HIGH_WATERMARK - 1, 0);
+                            transport.send_high_watermark_triggered = true;
                             let result = timeout(Duration::from_secs(1), transport.write(b"hello"))
                                 .await
-                                .map_err(|_| "write timeout".to_string())
-                                .and_then(|r| match r {
-                                    Ok(_) => Err("expected WouldBlock but write succeeded".to_string()),
-                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
-                                    Err(e) => Err(format!("expected WouldBlock, got: {e}")),
-                                });
+                                .map(|_| Err("write completed without waiting for capacity".to_string()))
+                                .unwrap_or_else(|_| Ok(()));
                             if let Some(tx) = done_tx.lock().await.take() {
                                 let _ = tx.send(result);
                             }

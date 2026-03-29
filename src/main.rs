@@ -13,7 +13,7 @@ use logger::log;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use anyhow::{Result, anyhow};
@@ -169,13 +169,13 @@ async fn handle_connection<S>(
     peer_addr: String,
 ) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: relay::RelayIo + Send + 'static,
 {
     // 只需要一套 Trojan 协议处理逻辑
     process_trojan(server, stream, peer_addr).await
 }
 
-async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+async fn process_trojan<S: relay::RelayIo + Send + 'static>(
     server: Arc<Server>,
     mut stream: S,
     peer_addr: String,
@@ -239,7 +239,7 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
 // 统一的 CONNECT 处理
 
-async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
+async fn handle_connect<S: relay::RelayIo>(
     client_stream: S,
     target_addr: socks5::Address,
     initial_payload: Bytes,
@@ -248,7 +248,7 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     log::info!(peer = %peer_addr, target = %target_addr.to_key(), "Connecting to target");
     
     let remote_addr = target_addr.to_socket_addr().await?;
-    let mut remote_stream = match tokio::time::timeout(
+    let remote_stream = match tokio::time::timeout(
         tokio::time::Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS),
         TcpStream::connect(remote_addr),
     )
@@ -270,6 +270,7 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
             ));
         }
     };
+    let mut remote_stream = relay::NetworkBufferedIo::new(remote_stream);
     log::info!(peer = %peer_addr, remote = %remote_addr, "Connected to remote server");
 
     if !initial_payload.is_empty() {
@@ -295,13 +296,13 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
 
 
 // 连接检测与分发
-pub async fn accept_connection<S>(
+async fn accept_connection<S>(
     server: Arc<Server>,
     stream: S,
     peer_addr: String,
 ) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: relay::RelayIo + Send + 'static,
 {
     match server.transport_mode {
         TransportMode::Grpc => {
@@ -327,12 +328,25 @@ where
             result
         }
         TransportMode::WebSocket => {
-            let ws_stream = tokio_tungstenite::accept_async(stream).await?;
-            let ws_transport = ws::WebSocketTransport::new(ws_stream);
+            let raw_write_buffer_watermark = Arc::new(relay::WriteBufferWatermark::new(
+                relay::NETWORK_BUFFER_HIGH_WATERMARK,
+                relay::NETWORK_BUFFER_LOW_WATERMARK,
+            ));
+            let ws_stream = tokio_tungstenite::accept_async(
+                relay::NetworkBufferedIo::with_write_buffer_watermark(
+                    stream,
+                    Arc::clone(&raw_write_buffer_watermark),
+                ),
+            )
+            .await?;
+            let ws_transport = ws::WebSocketTransport::new(
+                ws_stream,
+                raw_write_buffer_watermark,
+            );
             handle_connection(server, ws_transport, peer_addr).await
         }
         TransportMode::Tcp => {
-            handle_connection(server, stream, peer_addr).await
+            handle_connection(server, relay::NetworkBufferedIo::new(stream), peer_addr).await
         }
     }
 }

@@ -2,9 +2,12 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::{WebSocketStream as TungsteniteStream, tungstenite::Message};
 use futures_util::{Stream, Sink};
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 use std::io;
 use bytes::Bytes;
+
+use crate::relay::{RelayIo, WriteBufferWatermark};
 
 pub struct WebSocketTransport<S> {
     ws_stream: Pin<Box<TungsteniteStream<S>>>,
@@ -12,6 +15,9 @@ pub struct WebSocketTransport<S> {
     read_pos: usize,
     write_buffer: Vec<u8>,  // 保持 Vec<u8>， WebSocket 库需要
     write_pending: bool,
+    write_buffer_watermark: Arc<WriteBufferWatermark>,
+    read_disable_count: usize,
+    read_waker: Option<Waker>,
     closed: bool,
 }
 
@@ -19,14 +25,33 @@ impl<S> WebSocketTransport<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    pub fn new(ws_stream: TungsteniteStream<S>) -> Self {
+    pub fn new(
+        ws_stream: TungsteniteStream<S>,
+        write_buffer_watermark: Arc<WriteBufferWatermark>,
+    ) -> Self {
         Self {
             ws_stream: Box::pin(ws_stream),
             read_buffer: Bytes::new(),
             read_pos: 0,
             write_buffer: Vec::new(),
             write_pending: false,
+            write_buffer_watermark,
+            read_disable_count: 0,
+            read_waker: None,
             closed: false,
+        }
+    }
+
+    fn register_read_waker(&mut self, waker: &Waker) {
+        match self.read_waker.as_ref() {
+            Some(existing) if existing.will_wake(waker) => {}
+            _ => self.read_waker = Some(waker.clone()),
+        }
+    }
+
+    fn wake_read_task(&mut self) {
+        if let Some(waker) = self.read_waker.take() {
+            waker.wake();
         }
     }
 }
@@ -40,6 +65,11 @@ where
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if self.read_disable_count > 0 {
+            self.register_read_waker(cx.waker());
+            return Poll::Pending;
+        }
+
         if self.closed {
             return Poll::Ready(Ok(()));
         }
@@ -215,5 +245,30 @@ where
         // 刷新所有待发送的数据
         // WebSocket 连接的关闭由底层流处理，这里只需要确保数据已刷新
         self.as_mut().poll_flush(cx)
+    }
+}
+
+impl<S> RelayIo for WebSocketTransport<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    fn read_disable(&mut self, disable: bool) {
+        if disable {
+            self.read_disable_count = self.read_disable_count.saturating_add(1);
+            return;
+        }
+
+        if self.read_disable_count == 0 {
+            return;
+        }
+
+        self.read_disable_count -= 1;
+        if self.read_disable_count == 0 {
+            self.wake_read_task();
+        }
+    }
+
+    fn is_write_backpressured(&self) -> bool {
+        self.write_pending || self.write_buffer_watermark.is_backpressured()
     }
 }
