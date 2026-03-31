@@ -20,7 +20,7 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "1.0"
 tonic = "0.14"
 tokio-stream = "0.1.18"
-futures = "0.3.31"
+futures = "0.3.32"
 h2 = "0.4.13"
 http = "1.4.0"
 thiserror = "2.0"
