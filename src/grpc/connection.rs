@@ -11,8 +11,7 @@ use tokio::sync::Notify;
 
 use super::transport::GrpcH2cTransport;
 use super::{
-    MAX_CONCURRENT_STREAMS, MAX_HEADER_LIST_SIZE,
-    INITIAL_WINDOW_SIZE, INITIAL_CONNECTION_WINDOW_SIZE,
+    MAX_CONCURRENT_STREAMS,
     MAX_FRAME_SIZE, MAX_SEND_QUEUE_BYTES,
 };
 
@@ -30,9 +29,6 @@ where
 {
     pub async fn new(stream: S) -> io::Result<Self> {
         let h2_conn = server::Builder::new()
-            .max_header_list_size(MAX_HEADER_LIST_SIZE)
-            .initial_window_size(INITIAL_WINDOW_SIZE)
-            .initial_connection_window_size(INITIAL_CONNECTION_WINDOW_SIZE)
             .max_frame_size(MAX_FRAME_SIZE)
             .max_concurrent_streams(MAX_CONCURRENT_STREAMS as u32)
             .max_send_buffer_size(MAX_SEND_QUEUE_BYTES)
