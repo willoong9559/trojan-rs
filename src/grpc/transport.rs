@@ -12,6 +12,9 @@ use super::{
     MAX_FRAME_SIZE, GRPC_MAX_MESSAGE_SIZE, MAX_SEND_QUEUE_BYTES, READ_BUFFER_SIZE,
 };
 
+const MAX_BUF: usize = READ_BUFFER_SIZE * 2;
+const INIT_BUF: usize = 16 * 1024;
+
 /// gRPC 传输层（兼容 v2ray）
 /// 
 /// 实现 AsyncRead + AsyncWrite，可以像普通 TCP 流一样使用
@@ -35,7 +38,7 @@ impl GrpcH2cTransport {
         Self {
             recv_stream,
             send_stream,
-            read_pending: BytesMut::with_capacity(READ_BUFFER_SIZE),
+            read_pending: BytesMut::with_capacity(INIT_BUF),
             read_remaining: 0,
             pending_release_capacity: 0,
             send_queue: VecDeque::new(),
@@ -45,6 +48,16 @@ impl GrpcH2cTransport {
             recv_closed: false,
             send_closed: false,
             trailers_sent: false,
+        }
+    }
+
+    fn reset_read_buffer_if_needed(&mut self) {
+        if self.read_remaining == 0
+            && self.pending_release_capacity == 0
+            && self.read_pending.is_empty()
+            && self.read_pending.capacity() > MAX_BUF
+        {
+            self.read_pending = BytesMut::with_capacity(INIT_BUF);
         }
     }
 
@@ -135,7 +148,7 @@ impl GrpcH2cTransport {
 
             let send_size = remaining.min(capacity);
             let chunk = frame.slice(self.current_frame_offset..self.current_frame_offset + send_size);
-            
+
             match self.send_stream.send_data(chunk, false) {
                 Ok(()) => {
                     self.current_frame_offset += send_size;
@@ -244,6 +257,7 @@ impl AsyncRead for GrpcH2cTransport {
                     self.read_pending.advance(to_copy);
                     self.read_remaining -= to_copy;
                     self.release_flow_control_capacity(to_copy);
+                    self.reset_read_buffer_if_needed();
                     return Poll::Ready(Ok(()));
                 }
 
@@ -274,6 +288,7 @@ impl AsyncRead for GrpcH2cTransport {
                         self.read_pending.advance(header.header_len);
                         self.release_flow_control_capacity(header.header_len);
                         self.read_remaining = header.payload_len;
+                        self.reset_read_buffer_if_needed();
                         if self.read_remaining == 0 {
                             continue;
                         }
@@ -315,11 +330,11 @@ impl GrpcH2cTransport {
         match self.recv_stream.poll_data(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
                 let chunk_len = chunk.len();
-                if self.read_pending.len() + chunk_len > READ_BUFFER_SIZE {
+                if self.read_pending.len() + chunk_len > MAX_BUF {
                     warn!(
                         pending = self.read_pending.len(),
                         incoming = chunk_len,
-                        limit = READ_BUFFER_SIZE,
+                        limit = MAX_BUF,
                         "gRPC read buffer overflow"
                     );
                     return Poll::Ready(Err(io::Error::new(
