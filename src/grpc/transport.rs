@@ -72,10 +72,8 @@ impl GrpcH2cTransport {
                 }
                 let remaining = frame.len() - self.current_frame_offset;
                 if remaining > 0 {
-                    let frame_len = frame.len();
                     match self.poll_send_current_frame(cx)? {
                         Poll::Ready(()) => {
-                            self.send_queue_bytes = self.send_queue_bytes.saturating_sub(frame_len);
                             self.current_frame = None;
                             self.current_frame_offset = 0;
                         }
@@ -152,6 +150,7 @@ impl GrpcH2cTransport {
             match self.send_stream.send_data(chunk, false) {
                 Ok(()) => {
                     self.current_frame_offset += send_size;
+                    self.send_queue_bytes = self.send_queue_bytes.saturating_sub(send_size);
                     if self.current_frame_offset >= frame.len() {
                         return Poll::Ready(Ok(()));
                     }
@@ -398,10 +397,7 @@ impl AsyncWrite for GrpcH2cTransport {
                         Poll::Pending => return Poll::Pending,
                     }
                     if self.send_queue_bytes >= MAX_SEND_QUEUE_BYTES {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            "gRPC send queue is saturated without progress",
-                        )));
+                        return Poll::Pending;
                     }
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -413,10 +409,7 @@ impl AsyncWrite for GrpcH2cTransport {
         let queue_budget = MAX_SEND_QUEUE_BYTES.saturating_sub(self.send_queue_bytes);
         let to_write = Self::max_payload_for_queue_budget(payload_cap, queue_budget);
         if to_write == 0 {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "gRPC send queue cannot fit even the smallest frame",
-            )));
+            return Poll::Pending;
         }
 
         let frame = encode_grpc_message(&buf[..to_write]);
@@ -666,80 +659,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_full_path_must_not_hang_write() {
-        let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
-        let (done_tx, done_rx) = oneshot::channel::<Result<(), String>>();
-        let done_tx = std::sync::Arc::new(Mutex::new(Some(done_tx)));
-
-        let server_task = tokio::spawn(async move {
-            let conn = GrpcH2cConnection::new(server_io)
-                .await
-                .expect("server handshake should succeed");
-            let _ = conn
-                .run({
-                    let done_tx = std::sync::Arc::clone(&done_tx);
-                    move |mut transport| {
-                        let done_tx = std::sync::Arc::clone(&done_tx);
-                        async move {
-                            transport.send_queue_bytes = MAX_SEND_QUEUE_BYTES;
-                            let result = timeout(Duration::from_millis(300), transport.write_all(b"hello"))
-                                .await
-                                .map_err(|_| "write_all hung in queue-full path".to_string())
-                                .map(|_| ());
-                            if let Some(tx) = done_tx.lock().await.take() {
-                                let _ = tx.send(result);
-                            }
-                            Ok(())
-                        }
-                    }
-                })
-                .await;
-        });
-
-        let (mut send_request, client_conn) = client::Builder::new()
-            .handshake::<_, Bytes>(client_io)
-            .await
-            .expect("client handshake should succeed");
-        let client_conn_task = tokio::spawn(async move {
-            let _ = client_conn.await;
-        });
-
-        let request = Request::builder()
-            .method("POST")
-            .uri("/Tun")
-            .body(())
-            .expect("request should be valid");
-        let (response_future, _request_stream) = send_request
-            .send_request(request, true)
-            .expect("request send should succeed");
-        let response = timeout(Duration::from_secs(3), response_future)
-            .await
-            .expect("response headers timeout")
-            .expect("response future failed");
-        let mut body = response.into_body();
-        let body_drain_task = tokio::spawn(async move {
-            loop {
-                match poll_fn(|cx| body.poll_data(cx)).await {
-                    Some(Ok(chunk)) => {
-                        let _ = body.flow_control().release_capacity(chunk.len());
-                    }
-                    Some(Err(_)) | None => break,
-                }
-            }
-        });
-
-        let result = timeout(Duration::from_secs(3), done_rx)
-            .await
-            .expect("done signal timeout")
-            .expect("done channel closed");
-        assert!(result.is_ok(), "{}", result.err().unwrap_or_default());
-
-        body_drain_task.abort();
-        server_task.abort();
-        client_conn_task.abort();
-    }
-
-    #[tokio::test]
     async fn burst_writes_should_complete_without_stall() {
         let (server_io, client_io) = tokio::io::duplex(8 * 1024 * 1024);
         let (done_tx, done_rx) = oneshot::channel::<Result<(), String>>();
@@ -836,7 +755,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_full_returns_wouldblock_error() {
+    async fn queue_full_write_waits_for_capacity() {
         let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
         let (done_tx, done_rx) = oneshot::channel::<Result<(), String>>();
         let done_tx = std::sync::Arc::new(Mutex::new(Some(done_tx)));
@@ -851,15 +770,13 @@ mod tests {
                     move |mut transport| {
                         let done_tx = std::sync::Arc::clone(&done_tx);
                         async move {
+                            transport.current_frame = Some(Bytes::from(vec![0u8; MAX_SEND_QUEUE_BYTES]));
                             transport.send_queue_bytes = MAX_SEND_QUEUE_BYTES;
-                            let result = timeout(Duration::from_secs(1), transport.write(b"hello"))
-                                .await
-                                .map_err(|_| "write timeout".to_string())
-                                .and_then(|r| match r {
-                                    Ok(_) => Err("expected WouldBlock but write succeeded".to_string()),
-                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
-                                    Err(e) => Err(format!("expected WouldBlock, got: {e}")),
-                                });
+                            let result = match timeout(Duration::from_secs(1), transport.write(b"hello")).await {
+                                Err(_) => Ok(()),
+                                Ok(Ok(_)) => Err("write returned unexpectedly".to_string()),
+                                Ok(Err(e)) => Err(format!("write returned error instead of pending: {e}")),
+                            };
                             if let Some(tx) = done_tx.lock().await.take() {
                                 let _ = tx.send(result);
                             }

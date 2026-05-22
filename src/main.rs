@@ -286,13 +286,21 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
             log::warn!(peer = %peer_addr, "Connection timeout due to inactivity");
         }
         Err(e) => {
-            log::warn!(peer = %peer_addr, error = %e, "Copy bidirectional error");
+            if is_benign_copy_error(&e) {
+                log::info!(peer = %peer_addr, error = %e, "Connection closed by peer");
+            } else {
+                log::warn!(peer = %peer_addr, error = %e, "Copy bidirectional error");
+            }
         }
     }
 
     Ok(())
 }
 
+fn is_benign_copy_error(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::BrokenPipe)
+        && error.to_string() == "gRPC stream closed"
+}
 
 // 连接检测与分发
 pub async fn accept_connection<S>(
