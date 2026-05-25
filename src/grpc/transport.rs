@@ -55,7 +55,7 @@ impl GrpcH2cTransport {
         if self.read_remaining == 0
             && self.pending_release_capacity == 0
             && self.read_pending.is_empty()
-            && self.read_pending.capacity() > MAX_BUF
+            && self.read_pending.capacity() >= MAX_BUF
         {
             self.read_pending = BytesMut::with_capacity(INIT_BUF);
         }

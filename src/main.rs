@@ -24,6 +24,7 @@ const BUF_SIZE: usize = 32 * 1024;
 
 const CONNECTION_TIMEOUT_SECS: u64 = 300;
 const TCP_CONNECT_TIMEOUT_SECS: u64 = 10;
+const REQUEST_HEADER_TIMEOUT_SECS: u64 = 15;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TransportMode {
@@ -181,33 +182,41 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     peer_addr: String,
 ) -> Result<()> {
     // Read until a full Trojan request header is available.
-    let request = {
-        let mut read_buf = vec![0u8; BUF_SIZE];
-        let mut buffer = Vec::with_capacity(BUF_SIZE);
+    let request = tokio::time::timeout(
+        tokio::time::Duration::from_secs(REQUEST_HEADER_TIMEOUT_SECS),
+        async {
+            let mut read_buf = vec![0u8; BUF_SIZE];
+            let mut buffer = Vec::with_capacity(BUF_SIZE);
 
-        loop {
-            if buffer.len() >= BUF_SIZE {
-                return Err(anyhow!("Trojan request exceeds maximum buffer size"));
-            }
-
-            let remaining = BUF_SIZE - buffer.len();
-            let read_size = remaining.min(read_buf.len());
-            let n = stream.read(&mut read_buf[..read_size]).await?;
-
-            if n == 0 {
-                if buffer.is_empty() {
-                    return Err(anyhow!("Connection closed before receiving request"));
+            loop {
+                if buffer.len() >= BUF_SIZE {
+                    return Err(anyhow!("Trojan request exceeds maximum buffer size"));
                 }
-                return Err(anyhow!("Connection closed before receiving complete request"));
-            }
 
-            buffer.extend_from_slice(&read_buf[..n]);
+                let remaining = BUF_SIZE - buffer.len();
+                let read_size = remaining.min(read_buf.len());
+                let n = stream.read(&mut read_buf[..read_size]).await?;
 
-            if let Some((request, _consumed)) = TrojanRequest::decode(&buffer)? {
-                break request;
+                if n == 0 {
+                    if buffer.is_empty() {
+                        return Err(anyhow!("Connection closed before receiving request"));
+                    }
+                    return Err(anyhow!("Connection closed before receiving complete request"));
+                }
+
+                buffer.extend_from_slice(&read_buf[..n]);
+
+                if let Some((request, _consumed)) = TrojanRequest::decode(&buffer)? {
+                    break Ok(request);
+                }
             }
         }
-    };
+    )
+    .await
+    .map_err(|_| anyhow!(
+        "Timed out waiting for Trojan request header after {} seconds",
+        REQUEST_HEADER_TIMEOUT_SECS
+    ))??;
 
     // 验证密码
     if request.password != server.password {
