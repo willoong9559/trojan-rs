@@ -1,5 +1,5 @@
-use clap::Parser;
 use anyhow::{anyhow, Result};
+use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
@@ -25,6 +25,18 @@ pub struct ServerConfig {
     /// Enable gRPC mode
     #[arg(long, default_value_t = false)]
     pub enable_grpc: bool,
+
+    /// Expected WebSocket Host header
+    #[arg(long)]
+    pub ws_host: Option<String>,
+
+    /// Expected WebSocket request path
+    #[arg(long)]
+    pub ws_path: Option<String>,
+
+    /// Expected gRPC service name
+    #[arg(long)]
+    pub grpc_service_name: Option<String>,
 
     /// Enable UDP support
     #[arg(long, default_value_t = true)]
@@ -87,6 +99,15 @@ impl ServerConfig {
             if !config.enable_grpc {
                 config.enable_grpc = file_config.enable_grpc;
             }
+            if config.ws_host.is_none() {
+                config.ws_host = file_config.ws_host;
+            }
+            if config.ws_path.is_none() {
+                config.ws_path = file_config.ws_path;
+            }
+            if config.grpc_service_name.is_none() {
+                config.grpc_service_name = file_config.grpc_service_name;
+            }
             if config.enable_udp {
                 config.enable_udp = file_config.enable_udp;
             }
@@ -103,12 +124,20 @@ impl ServerConfig {
 
         // 验证密码不为空
         if config.password.is_empty() {
-            return Err(anyhow!("Password must be provided either via --password or config file"));
+            return Err(anyhow!(
+                "Password must be provided either via --password or config file"
+            ));
         }
 
         if config.enable_ws && config.enable_grpc {
-            return Err(anyhow!("WebSocket mode and gRPC mode cannot be enabled simultaneously"));
+            return Err(anyhow!(
+                "WebSocket mode and gRPC mode cannot be enabled simultaneously"
+            ));
         }
+
+        config.ws_host = normalize_optional_value(config.ws_host, "WebSocket host")?;
+        config.ws_path = normalize_ws_path(config.ws_path)?;
+        config.grpc_service_name = normalize_grpc_service_name(config.grpc_service_name)?;
 
         Ok(config)
     }
@@ -136,6 +165,15 @@ pub struct ServerSettings {
 
     #[serde(default)]
     pub enable_grpc: bool,
+
+    #[serde(default)]
+    pub ws_host: Option<String>,
+
+    #[serde(default)]
+    pub ws_path: Option<String>,
+
+    #[serde(default)]
+    pub grpc_service_name: Option<String>,
 
     #[serde(default = "default_enable_udp")]
     pub enable_udp: bool,
@@ -179,6 +217,9 @@ impl TomlConfig {
                 password: "your_password_here".to_string(),
                 enable_ws: true,
                 enable_grpc: false,
+                ws_host: Some("cdn.example.com".to_string()),
+                ws_path: Some("/ws".to_string()),
+                grpc_service_name: Some("GunService".to_string()),
                 enable_udp: true,
             },
             tls: Some(TlsSettings {
@@ -203,6 +244,9 @@ impl TomlConfig {
             password: self.server.password,
             enable_ws: self.server.enable_ws,
             enable_grpc: self.server.enable_grpc,
+            ws_host: self.server.ws_host,
+            ws_path: self.server.ws_path,
+            grpc_service_name: self.server.grpc_service_name,
             enable_udp: self.server.enable_udp,
             cert: self.tls.as_ref().map(|t| t.cert.clone()),
             key: self.tls.as_ref().map(|t| t.key.clone()),
@@ -210,5 +254,84 @@ impl TomlConfig {
             generate_config: None,
             log_level: self.log.map(|l| l.level),
         }
+    }
+}
+
+fn normalize_optional_value(value: Option<String>, field_name: &str) -> Result<Option<String>> {
+    match value {
+        Some(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err(anyhow!("{field_name} cannot be empty"));
+            }
+            Ok(Some(trimmed.to_string()))
+        }
+        None => Ok(None),
+    }
+}
+
+fn normalize_ws_path(value: Option<String>) -> Result<Option<String>> {
+    match value {
+        Some(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err(anyhow!("WebSocket path cannot be empty"));
+            }
+
+            let normalized = if trimmed.starts_with('/') {
+                trimmed.to_string()
+            } else {
+                format!("/{trimmed}")
+            };
+
+            if normalized.contains('?') || normalized.contains('#') {
+                return Err(anyhow!(
+                    "WebSocket path must not include a query string or fragment"
+                ));
+            }
+
+            Ok(Some(normalized))
+        }
+        None => Ok(None),
+    }
+}
+
+fn normalize_grpc_service_name(value: Option<String>) -> Result<Option<String>> {
+    match normalize_optional_value(value, "gRPC service name")? {
+        Some(service_name) => {
+            if service_name.contains('/') {
+                return Err(anyhow!("gRPC service name must not contain '/'"));
+            }
+            Ok(Some(service_name))
+        }
+        None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_grpc_service_name, normalize_optional_value, normalize_ws_path};
+
+    #[test]
+    fn websocket_path_is_normalized_with_leading_slash() {
+        assert_eq!(
+            normalize_ws_path(Some("ws".to_string())).unwrap(),
+            Some("/ws".to_string())
+        );
+    }
+
+    #[test]
+    fn websocket_path_rejects_query_string() {
+        assert!(normalize_ws_path(Some("/ws?ed=1".to_string())).is_err());
+    }
+
+    #[test]
+    fn grpc_service_name_rejects_path_separator() {
+        assert!(normalize_grpc_service_name(Some("Gun/Service".to_string())).is_err());
+    }
+
+    #[test]
+    fn optional_value_rejects_empty_input() {
+        assert!(normalize_optional_value(Some("   ".to_string()), "test field").is_err());
     }
 }

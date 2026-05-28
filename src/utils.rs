@@ -1,5 +1,5 @@
-use sha2::{Sha224, Digest};
-use hex;  
+use hex;
+use sha2::{Digest, Sha224};
 
 // Hash password using SHA224
 pub fn hash_password(password: &str) -> [u8; 28] {

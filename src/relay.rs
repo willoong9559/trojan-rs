@@ -1,10 +1,10 @@
+use pin_project_lite::pin_project;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use pin_project_lite::pin_project;
 
 pin_project! {
     struct TimedStream<S> {
@@ -17,7 +17,11 @@ pin_project! {
 
 impl<S> TimedStream<S> {
     fn new(inner: S, start_time: Instant, last_activity: Arc<AtomicU64>) -> Self {
-        Self { inner, start_time, last_activity }
+        Self {
+            inner,
+            start_time,
+            last_activity,
+        }
     }
 }
 
@@ -30,7 +34,8 @@ impl<S: AsyncRead> AsyncRead for TimedStream<S> {
         let this = self.project();
         let result = this.inner.poll_read(cx, buf);
         if matches!(&result, Poll::Ready(Ok(())) if !buf.filled().is_empty()) {
-            this.last_activity.store(this.start_time.elapsed().as_secs(), Ordering::Relaxed);
+            this.last_activity
+                .store(this.start_time.elapsed().as_secs(), Ordering::Relaxed);
         }
         result
     }
@@ -45,7 +50,8 @@ impl<S: AsyncWrite> AsyncWrite for TimedStream<S> {
         let this = self.project();
         let result = this.inner.poll_write(cx, buf);
         if matches!(&result, Poll::Ready(Ok(n)) if *n > 0) {
-            this.last_activity.store(this.start_time.elapsed().as_secs(), Ordering::Relaxed);
+            this.last_activity
+                .store(this.start_time.elapsed().as_secs(), Ordering::Relaxed);
         }
         result
     }

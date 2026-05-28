@@ -1,24 +1,30 @@
-mod utils;
-mod udp;
-mod socks5;
 mod config;
-mod tls;
-mod ws;
-mod grpc;
 mod error;
+mod grpc;
 mod logger;
 mod relay;
+mod socks5;
+mod tls;
+mod udp;
+mod utils;
+mod ws;
 
 use logger::log;
 
+use anyhow::{anyhow, Result};
+use bytes::Bytes;
+use http::{header::HOST, uri::Authority, StatusCode};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use anyhow::{Result, anyhow};
 use tokio_rustls::TlsAcceptor;
-use bytes::Bytes;
+use tokio_tungstenite::tungstenite::handshake::server::{
+    ErrorResponse as WebSocketErrorResponse, Request as WebSocketRequest,
+    Response as WebSocketResponse,
+};
 
 const BUF_SIZE: usize = 32 * 1024;
 
@@ -37,6 +43,9 @@ pub struct Server {
     pub listener: TcpListener,
     pub password: [u8; 56],
     pub transport_mode: TransportMode,
+    pub ws_host: Option<String>,
+    pub ws_path: Option<String>,
+    pub grpc_service_name: Option<String>,
     pub enable_udp: bool,
     pub udp_associations: Arc<Mutex<HashMap<String, udp::UdpAssociation>>>,
     pub tls_acceptor: Option<TlsAcceptor>,
@@ -155,20 +164,19 @@ impl TrojanRequest {
 
         let payload = Bytes::copy_from_slice(&buf[cursor..]);
 
-        Ok(Some((TrojanRequest {
-            password,
-            cmd,
-            addr,
-            payload,
-        }, cursor)))
+        Ok(Some((
+            TrojanRequest {
+                password,
+                cmd,
+                addr,
+                payload,
+            },
+            cursor,
+        )))
     }
 }
 
-async fn handle_connection<S>(
-    server: Arc<Server>,
-    stream: S,
-    peer_addr: String,
-) -> Result<()>
+async fn handle_connection<S>(server: Arc<Server>, stream: S, peer_addr: String) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -201,7 +209,9 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     if buffer.is_empty() {
                         return Err(anyhow!("Connection closed before receiving request"));
                     }
-                    return Err(anyhow!("Connection closed before receiving complete request"));
+                    return Err(anyhow!(
+                        "Connection closed before receiving complete request"
+                    ));
                 }
 
                 buffer.extend_from_slice(&read_buf[..n]);
@@ -210,13 +220,15 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     break Ok(request);
                 }
             }
-        }
+        },
     )
     .await
-    .map_err(|_| anyhow!(
-        "Timed out waiting for Trojan request header after {} seconds",
-        REQUEST_HEADER_TIMEOUT_SECS
-    ))??;
+    .map_err(|_| {
+        anyhow!(
+            "Timed out waiting for Trojan request header after {} seconds",
+            REQUEST_HEADER_TIMEOUT_SECS
+        )
+    })??;
 
     // 验证密码
     if request.password != server.password {
@@ -229,7 +241,7 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         log::warn!(peer = %peer_addr, transport = transport, "Incorrect password");
         return Err(anyhow!("Incorrect password"));
     }
-    
+
     log::authentication(&peer_addr, true);
 
     match request.cmd {
@@ -241,7 +253,13 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 log::warn!(peer = %peer_addr, "UDP associate request rejected: UDP support is disabled");
                 return Err(anyhow!("UDP support is disabled"));
             }
-            udp::handle_udp_associate(Arc::clone(&server.udp_associations), stream, request.addr, peer_addr).await
+            udp::handle_udp_associate(
+                Arc::clone(&server.udp_associations),
+                stream,
+                request.addr,
+                peer_addr,
+            )
+            .await
         }
     }
 }
@@ -255,7 +273,7 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     peer_addr: String,
 ) -> Result<()> {
     log::info!(peer = %peer_addr, target = %target_addr.to_key(), "Connecting to target");
-    
+
     let remote_addr = target_addr.to_socket_addr().await?;
     let mut remote_stream = match tokio::time::timeout(
         tokio::time::Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS),
@@ -289,7 +307,9 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
         client_stream,
         remote_stream,
         CONNECTION_TIMEOUT_SECS,
-    ).await {
+    )
+    .await
+    {
         Ok(true) => {}
         Ok(false) => {
             log::warn!(peer = %peer_addr, "Connection timeout due to inactivity");
@@ -311,12 +331,99 @@ fn is_benign_copy_error(error: &std::io::Error) -> bool {
         && error.to_string() == "gRPC stream closed"
 }
 
+fn validate_websocket_request(
+    request: &WebSocketRequest,
+    response: WebSocketResponse,
+    peer_addr: &str,
+    expected_host: Option<&str>,
+    expected_path: Option<&str>,
+) -> std::result::Result<WebSocketResponse, WebSocketErrorResponse> {
+    if let Some(expected_path) = expected_path {
+        let actual_path = request.uri().path();
+        if actual_path != expected_path {
+            log::warn!(
+                peer = %peer_addr,
+                expected_path = expected_path,
+                actual_path = actual_path,
+                "Rejected WebSocket handshake due to path mismatch"
+            );
+            return Err(websocket_error_response(
+                StatusCode::NOT_FOUND,
+                "Invalid WebSocket path",
+            ));
+        }
+    }
+
+    if let Some(expected_host) = expected_host {
+        let actual_host = match request
+            .headers()
+            .get(HOST)
+            .and_then(|value| value.to_str().ok())
+        {
+            Some(host) => host,
+            None => {
+                log::warn!(peer = %peer_addr, "Rejected WebSocket handshake due to missing Host header");
+                return Err(websocket_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Missing WebSocket Host header",
+                ));
+            }
+        };
+
+        if !websocket_host_matches(expected_host, actual_host) {
+            log::warn!(
+                peer = %peer_addr,
+                expected_host = expected_host,
+                actual_host = actual_host,
+                "Rejected WebSocket handshake due to Host mismatch"
+            );
+            return Err(websocket_error_response(
+                StatusCode::FORBIDDEN,
+                "Invalid WebSocket Host header",
+            ));
+        }
+    }
+
+    Ok(response)
+}
+
+fn websocket_error_response(status: StatusCode, message: &str) -> WebSocketErrorResponse {
+    http::Response::builder()
+        .status(status)
+        .body(Some(message.to_string()))
+        .expect("websocket rejection response should be valid")
+}
+
+fn websocket_host_matches(expected_host: &str, actual_host: &str) -> bool {
+    let Some(expected) = parse_authority(expected_host) else {
+        return false;
+    };
+    let Some(actual) = parse_authority(actual_host) else {
+        return false;
+    };
+
+    expected.host == actual.host
+        && expected
+            .port
+            .map_or(true, |expected_port| actual.port == Some(expected_port))
+}
+
+fn parse_authority(value: &str) -> Option<ParsedAuthority> {
+    let authority = Authority::from_str(value.trim()).ok()?;
+    Some(ParsedAuthority {
+        host: authority.host().to_ascii_lowercase(),
+        port: authority.port_u16(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedAuthority {
+    host: String,
+    port: Option<u16>,
+}
+
 // 连接检测与分发
-pub async fn accept_connection<S>(
-    server: Arc<Server>,
-    stream: S,
-    peer_addr: String,
-) -> Result<()>
+pub async fn accept_connection<S>(server: Arc<Server>, stream: S, peer_addr: String) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -324,15 +431,19 @@ where
         TransportMode::Grpc => {
             let peer_addr_for_log = peer_addr.clone();
             log::info!(peer = %peer_addr_for_log, "gRPC connection established, waiting for streams");
-            let grpc_conn = grpc::GrpcH2cConnection::new(stream).await?;
-            let result = grpc_conn.run(move |transport| {
-                let server = Arc::clone(&server);
-                let peer_addr = peer_addr.clone();
-                async move {
-                    handle_connection(server, transport, peer_addr).await
-                }
-            }).await;
-            
+            let grpc_conn = if let Some(service_name) = server.grpc_service_name.clone() {
+                grpc::GrpcH2cConnection::with_service_name(stream, Some(service_name)).await?
+            } else {
+                grpc::GrpcH2cConnection::new(stream).await?
+            };
+            let result = grpc_conn
+                .run(move |transport| {
+                    let server = Arc::clone(&server);
+                    let peer_addr = peer_addr.clone();
+                    async move { handle_connection(server, transport, peer_addr).await }
+                })
+                .await;
+
             match &result {
                 Ok(()) => {
                     log::info!(peer = %peer_addr_for_log, "gRPC connection closed normally");
@@ -344,13 +455,26 @@ where
             result
         }
         TransportMode::WebSocket => {
-            let ws_stream = tokio_tungstenite::accept_async(stream).await?;
+            let peer_addr_for_log = peer_addr.clone();
+            let expected_host = server.ws_host.clone();
+            let expected_path = server.ws_path.clone();
+            let ws_stream = tokio_tungstenite::accept_hdr_async(
+                stream,
+                move |request: &WebSocketRequest, response: WebSocketResponse| {
+                    validate_websocket_request(
+                        request,
+                        response,
+                        &peer_addr_for_log,
+                        expected_host.as_deref(),
+                        expected_path.as_deref(),
+                    )
+                },
+            )
+            .await?;
             let ws_transport = ws::WebSocketTransport::new(ws_stream);
             handle_connection(server, ws_transport, peer_addr).await
         }
-        TransportMode::Tcp => {
-            handle_connection(server, stream, peer_addr).await
-        }
+        TransportMode::Tcp => handle_connection(server, stream, peer_addr).await,
     }
 }
 
@@ -364,7 +488,7 @@ impl Server {
             TransportMode::Grpc => "gRPC",
         };
         let tls_enabled = server.tls_acceptor.is_some();
-        
+
         log::info!(address = %addr, mode = mode, tls = tls_enabled, "Server started");
 
         // UDP清理任务
@@ -376,7 +500,7 @@ impl Server {
                     let _ = stream.set_nodelay(true);
                     log::connection(&addr.to_string(), "new");
                     let server_clone = Arc::clone(&server);
-                    
+
                     tokio::spawn(async move {
                         let peer_addr = addr.to_string();
                         let result = async {
@@ -442,6 +566,9 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         listener,
         password,
         transport_mode,
+        ws_host: config.ws_host,
+        ws_path: config.ws_path,
+        grpc_service_name: config.grpc_service_name,
         enable_udp: config.enable_udp,
         udp_associations: Arc::new(Mutex::new(HashMap::new())),
         tls_acceptor,
@@ -452,9 +579,79 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
 async fn main() -> Result<()> {
     let log_level = logger::get_log_level_from_args();
     logger::init_logger(log_level);
-    
+
     let config = config::ServerConfig::load()?;
-    
+
     let server = build_server(config).await?;
     server.run().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_websocket_request, websocket_host_matches};
+    use http::{Request, Response, StatusCode};
+
+    #[test]
+    fn websocket_host_match_allows_missing_expected_port() {
+        assert!(websocket_host_matches(
+            "cdn.example.com",
+            "cdn.example.com:443"
+        ));
+    }
+
+    #[test]
+    fn websocket_host_match_requires_matching_explicit_port() {
+        assert!(!websocket_host_matches(
+            "cdn.example.com:8443",
+            "cdn.example.com:443"
+        ));
+    }
+
+    #[test]
+    fn websocket_validation_rejects_wrong_path() {
+        let request = Request::builder()
+            .uri("/grpc")
+            .header("host", "cdn.example.com")
+            .body(())
+            .unwrap();
+        let response = Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .body(())
+            .unwrap();
+
+        let error = validate_websocket_request(
+            &request,
+            response,
+            "127.0.0.1:1000",
+            Some("cdn.example.com"),
+            Some("/ws"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn websocket_validation_rejects_wrong_host() {
+        let request = Request::builder()
+            .uri("/ws")
+            .header("host", "other.example.com")
+            .body(())
+            .unwrap();
+        let response = Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .body(())
+            .unwrap();
+
+        let error = validate_websocket_request(
+            &request,
+            response,
+            "127.0.0.1:1000",
+            Some("cdn.example.com"),
+            Some("/ws"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.status(), StatusCode::FORBIDDEN);
+    }
 }

@@ -1,5 +1,5 @@
+use anyhow::{anyhow, Result};
 use std::net::{IpAddr, SocketAddr};
-use anyhow::{Result, anyhow};
 
 const DNS_RESOLVE_TIMEOUT_SECS: u64 = 10;
 
@@ -44,8 +44,15 @@ impl Address {
                     tokio::net::lookup_host((domain.as_str(), *port)),
                 )
                 .await
-                .map_err(|_| anyhow!("DNS resolution timeout after {} seconds", DNS_RESOLVE_TIMEOUT_SECS))??;
-                addrs.into_iter().next()
+                .map_err(|_| {
+                    anyhow!(
+                        "DNS resolution timeout after {} seconds",
+                        DNS_RESOLVE_TIMEOUT_SECS
+                    )
+                })??;
+                addrs
+                    .into_iter()
+                    .next()
                     .ok_or_else(|| anyhow!("Failed to resolve domain: {}", domain))
             }
         }
@@ -56,13 +63,11 @@ impl Address {
     pub fn to_association_key(&self, client_info: &str) -> String {
         format!("{}_{}", client_info, self.to_key())
     }
-    
+
     pub fn to_key(&self) -> String {
         match self {
-            Address::IPv4(ip, port) => format!("{}:{}", 
-                std::net::Ipv4Addr::from(*ip), port),
-            Address::IPv6(ip, port) => format!("[{}]:{}", 
-                std::net::Ipv6Addr::from(*ip), port),
+            Address::IPv4(ip, port) => format!("{}:{}", std::net::Ipv4Addr::from(*ip), port),
+            Address::IPv6(ip, port) => format!("[{}]:{}", std::net::Ipv6Addr::from(*ip), port),
             Address::Domain(domain, port) => format!("{}:{}", domain, port),
         }
     }

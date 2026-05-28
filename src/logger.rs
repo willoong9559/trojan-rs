@@ -1,10 +1,5 @@
-use tracing_subscriber::{
-    fmt,
-    layer::SubscriberExt,
-    util::SubscriberInitExt,
-    EnvFilter,
-};
 use toml;
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 /// 日志级别
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,23 +43,26 @@ impl Default for LogLevel {
 
 pub fn get_log_level_from_args() -> Option<LogLevel> {
     let args: Vec<String> = std::env::args().collect();
-    
-    let log_level_from_cli = args.iter()
+
+    let log_level_from_cli = args
+        .iter()
         .position(|a| a == "--log-level")
         .and_then(|i| args.get(i + 1))
         .and_then(|s| LogLevel::from_str(s));
-    
+
     if log_level_from_cli.is_some() {
         return log_level_from_cli;
     }
-    
+
     args.iter()
         .position(|a| a == "--config-file" || a == "-c")
         .and_then(|i| args.get(i + 1))
         .and_then(|config_path| {
-            std::fs::read_to_string(config_path).ok()
+            std::fs::read_to_string(config_path)
+                .ok()
                 .and_then(|content| {
-                    toml::from_str::<toml::Value>(&content).ok()
+                    toml::from_str::<toml::Value>(&content)
+                        .ok()
                         .and_then(|v| v.get("log")?.get("level")?.as_str().map(|s| s.to_string()))
                         .and_then(|s| LogLevel::from_str(&s))
                 })
@@ -115,7 +113,12 @@ pub mod log {
     #[allow(dead_code)]
     pub fn transport(transport: &str, event: &str, details: Option<&str>) {
         if let Some(details) = details {
-            info!(transport = transport, event = event, details = details, "Transport");
+            info!(
+                transport = transport,
+                event = event,
+                details = details,
+                "Transport"
+            );
         } else {
             info!(transport = transport, event = event, "Transport");
         }
@@ -131,4 +134,3 @@ pub mod log {
         }
     }
 }
-

@@ -1,6 +1,6 @@
+mod codec;
 mod connection;
 mod transport;
-mod codec;
 
 pub use connection::GrpcH2cConnection;
 

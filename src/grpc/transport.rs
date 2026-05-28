@@ -1,22 +1,20 @@
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use bytes::{Buf, Bytes, BytesMut};
+use h2::{Reason, RecvStream, SendStream};
+use std::collections::VecDeque;
+use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::io;
-use std::collections::VecDeque;
-use h2::{SendStream, RecvStream, Reason};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{debug, warn};
 
 use super::codec::{encode_grpc_message, parse_grpc_header};
-use super::{
-    MAX_FRAME_SIZE, GRPC_MAX_MESSAGE_SIZE, MAX_SEND_QUEUE_BYTES, READ_BUFFER_SIZE,
-};
+use super::{GRPC_MAX_MESSAGE_SIZE, MAX_FRAME_SIZE, MAX_SEND_QUEUE_BYTES, READ_BUFFER_SIZE};
 
 const MAX_BUF: usize = READ_BUFFER_SIZE * 2;
 const INIT_BUF: usize = 16 * 1024;
 
 /// gRPC 传输层（兼容 v2ray）
-/// 
+///
 /// 实现 AsyncRead + AsyncWrite，可以像普通 TCP 流一样使用
 pub struct GrpcH2cTransport {
     pub(crate) recv_stream: RecvStream,
@@ -123,7 +121,8 @@ impl GrpcH2cTransport {
                     frame_offset = self.current_frame_offset,
                     "Waiting for gRPC stream flow-control capacity",
                 );
-                self.send_stream.reserve_capacity(remaining.min(MAX_FRAME_SIZE as usize));
+                self.send_stream
+                    .reserve_capacity(remaining.min(MAX_FRAME_SIZE as usize));
                 match self.send_stream.poll_capacity(cx) {
                     Poll::Ready(Some(Ok(cap))) if cap > 0 => continue,
                     Poll::Ready(Some(Ok(_))) | Poll::Pending => return Poll::Pending,
@@ -145,7 +144,8 @@ impl GrpcH2cTransport {
             }
 
             let send_size = remaining.min(capacity);
-            let chunk = frame.slice(self.current_frame_offset..self.current_frame_offset + send_size);
+            let chunk =
+                frame.slice(self.current_frame_offset..self.current_frame_offset + send_size);
 
             match self.send_stream.send_data(chunk, false) {
                 Ok(()) => {
@@ -374,7 +374,7 @@ impl AsyncWrite for GrpcH2cTransport {
         if self.send_closed {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "transport closed"
+                "transport closed",
             )));
         }
 
@@ -426,17 +426,11 @@ impl AsyncWrite for GrpcH2cTransport {
         Poll::Ready(Ok(to_write))
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.poll_send_queued(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.send_closed = true;
 
         if self.trailers_sent {
@@ -484,8 +478,8 @@ fn is_benign_trailer_send_error(error: &h2::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::GrpcH2cConnection;
+    use super::*;
     use bytes::Bytes;
     use futures_util::future::poll_fn;
     use h2::client;
@@ -515,11 +509,12 @@ mod tests {
                         let done_tx = std::sync::Arc::clone(&done_tx);
                         let payload = std::sync::Arc::clone(&payload);
                         async move {
-                            let result = timeout(Duration::from_secs(3), transport.write_all(&payload))
-                                .await
-                                .map_err(|_| "write_all timeout".to_string())
-                                .and_then(|r| r.map_err(|e| format!("write_all error: {e}")))
-                                .map(|_| ());
+                            let result =
+                                timeout(Duration::from_secs(3), transport.write_all(&payload))
+                                    .await
+                                    .map_err(|_| "write_all timeout".to_string())
+                                    .and_then(|r| r.map_err(|e| format!("write_all error: {e}")))
+                                    .map(|_| ());
                             if let Some(tx) = done_tx.lock().await.take() {
                                 let _ = tx.send(result);
                             }
@@ -652,7 +647,10 @@ mod tests {
             .expect("done signal timeout")
             .expect("done channel closed");
         assert!(result.is_ok(), "{}", result.err().unwrap_or_default());
-        assert_eq!(received, super::super::codec::encode_grpc_message(b"hello").to_vec());
+        assert_eq!(
+            received,
+            super::super::codec::encode_grpc_message(b"hello").to_vec()
+        );
 
         server_task.abort();
         client_conn_task.abort();
@@ -770,13 +768,19 @@ mod tests {
                     move |mut transport| {
                         let done_tx = std::sync::Arc::clone(&done_tx);
                         async move {
-                            transport.current_frame = Some(Bytes::from(vec![0u8; MAX_SEND_QUEUE_BYTES]));
+                            transport.current_frame =
+                                Some(Bytes::from(vec![0u8; MAX_SEND_QUEUE_BYTES]));
                             transport.send_queue_bytes = MAX_SEND_QUEUE_BYTES;
-                            let result = match timeout(Duration::from_secs(1), transport.write(b"hello")).await {
-                                Err(_) => Ok(()),
-                                Ok(Ok(_)) => Err("write returned unexpectedly".to_string()),
-                                Ok(Err(e)) => Err(format!("write returned error instead of pending: {e}")),
-                            };
+                            let result =
+                                match timeout(Duration::from_secs(1), transport.write(b"hello"))
+                                    .await
+                                {
+                                    Err(_) => Ok(()),
+                                    Ok(Ok(_)) => Err("write returned unexpectedly".to_string()),
+                                    Ok(Err(e)) => {
+                                        Err(format!("write returned error instead of pending: {e}"))
+                                    }
+                                };
                             if let Some(tx) = done_tx.lock().await.take() {
                                 let _ = tx.send(result);
                             }
@@ -924,16 +928,19 @@ mod tests {
                                 let done_tx = std::sync::Arc::clone(&done_tx);
                                 let payload = std::sync::Arc::clone(&payload);
                                 async move {
-                                    let result = timeout(Duration::from_secs(timeout_secs), async {
-                                        for _ in 0..iterations {
-                                            transport.write_all(&payload).await?;
-                                        }
-                                        transport.flush().await?;
-                                        Ok::<(), io::Error>(())
-                                    })
-                                    .await
-                                    .map_err(|_| format!("stream-{idx} timeout"))
-                                    .and_then(|r| r.map_err(|e| format!("stream-{idx} write error: {e}")));
+                                    let result =
+                                        timeout(Duration::from_secs(timeout_secs), async {
+                                            for _ in 0..iterations {
+                                                transport.write_all(&payload).await?;
+                                            }
+                                            transport.flush().await?;
+                                            Ok::<(), io::Error>(())
+                                        })
+                                        .await
+                                        .map_err(|_| format!("stream-{idx} timeout"))
+                                        .and_then(|r| {
+                                            r.map_err(|e| format!("stream-{idx} write error: {e}"))
+                                        });
                                     if let Some(tx) = done_tx.lock().await.take() {
                                         let _ = tx.send(result);
                                     }
@@ -957,9 +964,10 @@ mod tests {
                     .uri("/Tun")
                     .body(())
                     .map_err(|e| format!("stream-{idx} request build: {e}"))?;
-                let (response_future, _request_stream) = send_request
-                    .send_request(request, true)
-                    .map_err(|e| format!("stream-{idx} send request: {e}"))?;
+                let (response_future, _request_stream) =
+                    send_request
+                        .send_request(request, true)
+                        .map_err(|e| format!("stream-{idx} send request: {e}"))?;
                 let response = timeout(Duration::from_secs(3), response_future)
                     .await
                     .map_err(|_| format!("stream-{idx} response header timeout"))?

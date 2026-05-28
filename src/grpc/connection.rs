@@ -1,26 +1,24 @@
-use tokio::io::{AsyncRead, AsyncWrite};
+use anyhow::Result;
 use bytes::Bytes;
-use std::io;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use h2::server;
 use http::{Response, StatusCode};
-use anyhow::Result;
-use tracing::{debug, warn};
+use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Notify;
+use tracing::{debug, warn};
 
 use super::transport::GrpcH2cTransport;
-use super::{
-    MAX_CONCURRENT_STREAMS,
-    MAX_FRAME_SIZE, MAX_SEND_QUEUE_BYTES,
-};
+use super::{MAX_CONCURRENT_STREAMS, MAX_FRAME_SIZE, MAX_SEND_QUEUE_BYTES};
 
 /// gRPC HTTP/2 连接管理器
-/// 
+///
 /// 管理整个 HTTP/2 连接，接受多个流，每个流对应一个独立的 Trojan 隧道
 pub struct GrpcH2cConnection<S> {
     h2_conn: server::Connection<S, Bytes>,
     active_count: Arc<AtomicUsize>,
+    expected_service_name: Option<String>,
 }
 
 impl<S> GrpcH2cConnection<S>
@@ -28,6 +26,13 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     pub async fn new(stream: S) -> io::Result<Self> {
+        Self::with_service_name(stream, None).await
+    }
+
+    pub async fn with_service_name(
+        stream: S,
+        expected_service_name: Option<String>,
+    ) -> io::Result<Self> {
         let h2_conn = server::Builder::new()
             .max_frame_size(MAX_FRAME_SIZE)
             .max_concurrent_streams(MAX_CONCURRENT_STREAMS as u32)
@@ -35,10 +40,11 @@ where
             .handshake(stream)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 handshake: {}", e)))?;
-        
-        Ok(Self { 
+
+        Ok(Self {
             h2_conn,
             active_count: Arc::new(AtomicUsize::new(0)),
+            expected_service_name,
         })
     }
 
@@ -50,6 +56,7 @@ where
         let handler = Arc::new(handler);
         let mut h2_conn = self.h2_conn;
         let active_count = self.active_count;
+        let expected_service_name = self.expected_service_name;
         let all_streams_done = Arc::new(Notify::new());
 
         loop {
@@ -65,7 +72,7 @@ where
                     }
 
                     let path = request.uri().path().to_owned();
-                    if !path.ends_with("/Tun") {
+                    if !grpc_path_matches(&path, expected_service_name.as_deref()) {
                         let response = Response::builder()
                             .status(StatusCode::NOT_FOUND)
                             .body(())
@@ -90,10 +97,7 @@ where
                         }
                     };
 
-                    let transport = GrpcH2cTransport::new(
-                        request.into_body(),
-                        send_stream,
-                    );
+                    let transport = GrpcH2cTransport::new(request.into_body(), send_stream);
 
                     let handler_clone = Arc::clone(&handler);
                     let active_count_clone = Arc::clone(&active_count);
@@ -102,12 +106,16 @@ where
                     debug!(active_streams, path, "Accepted gRPC stream");
                     tokio::spawn(async move {
                         let result = handler_clone(transport).await;
-                        let remaining_streams =
-                            active_count_clone.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+                        let remaining_streams = active_count_clone
+                            .fetch_sub(1, Ordering::Relaxed)
+                            .saturating_sub(1);
 
                         match result {
                             Ok(()) => {
-                                debug!(active_streams = remaining_streams, "gRPC stream handler finished");
+                                debug!(
+                                    active_streams = remaining_streams,
+                                    "gRPC stream handler finished"
+                                );
                             }
                             Err(e) => {
                                 warn!(
@@ -142,6 +150,27 @@ where
     }
 }
 
+fn grpc_path_matches(path: &str, expected_service_name: Option<&str>) -> bool {
+    match expected_service_name {
+        Some(expected_service_name) => {
+            grpc_service_name_from_path(path) == Some(expected_service_name)
+        }
+        None => path.ends_with("/Tun"),
+    }
+}
+
+fn grpc_service_name_from_path(path: &str) -> Option<&str> {
+    let mut segments = path.trim_start_matches('/').split('/');
+    let service_name = segments.next()?;
+    let method_name = segments.next()?;
+
+    if service_name.is_empty() || method_name != "Tun" || segments.next().is_some() {
+        return None;
+    }
+
+    Some(service_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +181,23 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::time::{timeout, Duration};
 
+    #[test]
+    fn grpc_path_parser_extracts_service_name() {
+        assert_eq!(
+            grpc_service_name_from_path("/GunService/Tun"),
+            Some("GunService")
+        );
+        assert_eq!(grpc_service_name_from_path("/GunService/Other"), None);
+        assert_eq!(grpc_service_name_from_path("/nested/GunService/Tun"), None);
+    }
+
+    #[test]
+    fn grpc_path_match_keeps_legacy_tun_compatibility_without_service_name() {
+        assert!(grpc_path_matches("/Tun", None));
+        assert!(grpc_path_matches("/GunService/Tun", None));
+        assert!(!grpc_path_matches("/GunService/Other", None));
+    }
+
     #[tokio::test]
     async fn stream_failure_does_not_fail_connection() {
         let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
@@ -161,23 +207,22 @@ mod tests {
             let conn = GrpcH2cConnection::new(server_io)
                 .await
                 .expect("server handshake should succeed");
-            conn
-                .run({
+            conn.run({
+                let stream_count = Arc::clone(&stream_count);
+                move |mut transport| {
                     let stream_count = Arc::clone(&stream_count);
-                    move |mut transport| {
-                        let stream_count = Arc::clone(&stream_count);
-                        async move {
-                            match stream_count.fetch_add(1, Ordering::Relaxed) {
-                                0 => Err(anyhow::anyhow!("intentional stream failure")),
-                                _ => {
-                                    transport.shutdown().await?;
-                                    Ok(())
-                                }
+                    async move {
+                        match stream_count.fetch_add(1, Ordering::Relaxed) {
+                            0 => Err(anyhow::anyhow!("intentional stream failure")),
+                            _ => {
+                                transport.shutdown().await?;
+                                Ok(())
                             }
                         }
                     }
-                })
-                .await
+                }
+            })
+            .await
         });
 
         let (mut send_request, client_conn) = client::Builder::new()
@@ -221,6 +266,53 @@ mod tests {
         assert_eq!(trailers.get("grpc-status").unwrap(), "0");
 
         drop(ok_body);
+        drop(send_request);
+        server_task.abort();
+        client_conn_task.abort();
+    }
+
+    #[tokio::test]
+    async fn rejects_unexpected_grpc_service_name() {
+        let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
+
+        let server_task = tokio::spawn(async move {
+            let conn =
+                GrpcH2cConnection::with_service_name(server_io, Some("GunService".to_string()))
+                    .await
+                    .expect("server handshake should succeed");
+            conn.run(|mut transport| async move {
+                transport.shutdown().await?;
+                Ok(())
+            })
+            .await
+        });
+
+        let (mut send_request, client_conn) = client::Builder::new()
+            .handshake::<_, Bytes>(client_io)
+            .await
+            .expect("client handshake should succeed");
+        let client_conn_task = tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+
+        let (response, _) = send_request
+            .send_request(
+                Request::builder()
+                    .method("POST")
+                    .uri("/OtherService/Tun")
+                    .body(())
+                    .expect("request should be valid"),
+                true,
+            )
+            .expect("request send should succeed");
+
+        let response = timeout(Duration::from_secs(3), response)
+            .await
+            .expect("response headers timeout")
+            .expect("response future failed");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
         drop(send_request);
         server_task.abort();
         client_conn_task.abort();

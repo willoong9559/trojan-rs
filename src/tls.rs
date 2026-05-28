@@ -1,19 +1,26 @@
-use std::sync::Arc;
-use tokio_rustls::{TlsAcceptor};
-use rustls::{ServerConfig};
+use anyhow::{anyhow, Result};
+use rustls::ServerConfig;
 use rustls_pemfile::certs;
 use std::fs::File;
 use std::io::BufReader;
-use anyhow::{anyhow, Result};
+use std::sync::Arc;
+use tokio_rustls::TlsAcceptor;
 
-use crate::TransportMode;
 use crate::logger::log;
+use crate::TransportMode;
 
-pub fn get_tls_acceptor(cert_path: Option<String>, key_path: Option<String>, transport_mode: TransportMode) -> Option<TlsAcceptor> {
+pub fn get_tls_acceptor(
+    cert_path: Option<String>,
+    key_path: Option<String>,
+    transport_mode: TransportMode,
+) -> Option<TlsAcceptor> {
     match (cert_path, key_path) {
         (Some(cert_path_str), Some(key_path_str)) => {
             log::info!(cert = %cert_path_str, key = %key_path_str, "Loading TLS certificates");
-            Some(load_tls_config_with_transport_mode(&cert_path_str, &key_path_str, transport_mode).unwrap())
+            Some(
+                load_tls_config_with_transport_mode(&cert_path_str, &key_path_str, transport_mode)
+                    .unwrap(),
+            )
         }
         _ => {
             return None;
@@ -21,7 +28,11 @@ pub fn get_tls_acceptor(cert_path: Option<String>, key_path: Option<String>, tra
     }
 }
 
-fn load_tls_config_with_transport_mode(cert_path: &str, key_path: &str, transport_mode: TransportMode) -> Result<TlsAcceptor> {
+fn load_tls_config_with_transport_mode(
+    cert_path: &str,
+    key_path: &str,
+    transport_mode: TransportMode,
+) -> Result<TlsAcceptor> {
     let mut config = load_tls_config(cert_path, key_path)?;
     config.alpn_protocols = match transport_mode {
         TransportMode::Grpc | TransportMode::Tcp => {
@@ -37,8 +48,7 @@ fn load_tls_config_with_transport_mode(cert_path: &str, key_path: &str, transpor
 fn load_tls_config(cert_path: &str, key_path: &str) -> Result<ServerConfig> {
     let cert_file = File::open(cert_path)?;
     let mut reader = BufReader::new(cert_file);
-    let certs = certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()?;
+    let certs = certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
 
     if certs.is_empty() {
         return Err(anyhow!("No certificates found in {}", cert_path));
@@ -53,6 +63,6 @@ fn load_tls_config(cert_path: &str, key_path: &str) -> Result<ServerConfig> {
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
-    
+
     Ok(config)
 }

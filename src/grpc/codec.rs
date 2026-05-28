@@ -75,7 +75,10 @@ fn decode_varint_partial(data: &[u8]) -> io::Result<Option<(u64, usize)>> {
 
     for (i, &byte) in data.iter().enumerate() {
         if i >= 10 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "varint too long"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "varint too long",
+            ));
         }
 
         result |= ((byte & 0x7F) as u64) << shift;

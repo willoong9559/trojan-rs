@@ -53,4 +53,3 @@ impl From<toml::de::Error> for TrojanError {
         TrojanError::Config(format!("TOML parse error: {}", err))
     }
 }
-
