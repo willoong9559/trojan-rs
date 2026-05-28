@@ -69,9 +69,9 @@ cargo rustc --release -- -C target-cpu=native -C opt-level=3
 > - 如果同时提供 `--cert` 和 `--key`，服务器将自动启用 TLS 模式
 > - `--enable-ws` 和 `--enable-grpc` 不能同时启用
 > - 命令行参数会覆盖配置文件中的对应设置
-> - 配置了 `ws_host` / `ws_path` 后，WebSocket 模式会严格校验 `Host` 头和请求路径
+> - 配置了 `ws_host` 后，WebSocket 模式会校验 `Host` 头
+> - 配置了 `ws_path` 后，WebSocket 模式会校验请求路径
 > - 配置了 `grpc_service_name` 后，gRPC 模式会严格校验 service name
-> - 未配置这些校验字段时，会保持兼容行为
 > - TLS 证书和私钥必须为 PEM 格式（rustls 仅支持 PEM 格式）
 
 #### 配置文件示例
@@ -82,7 +82,7 @@ cargo rustc --release -- -C target-cpu=native -C opt-level=3
 [server]
 host = "0.0.0.0"
 port = "443"
-password = "mysecretpassword"
+password = "password"
 enable_udp = true
 enable_ws = false
 enable_grpc = true
