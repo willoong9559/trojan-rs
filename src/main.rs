@@ -13,18 +13,12 @@ use logger::log;
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use http::{header::HOST, uri::Authority, StatusCode};
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
-use tokio_tungstenite::tungstenite::handshake::server::{
-    ErrorResponse as WebSocketErrorResponse, Request as WebSocketRequest,
-    Response as WebSocketResponse,
-};
 
 const BUF_SIZE: usize = 32 * 1024;
 
@@ -331,97 +325,6 @@ fn is_benign_copy_error(error: &std::io::Error) -> bool {
         && error.to_string() == "gRPC stream closed"
 }
 
-fn validate_websocket_request(
-    request: &WebSocketRequest,
-    response: WebSocketResponse,
-    peer_addr: &str,
-    expected_host: Option<&str>,
-    expected_path: Option<&str>,
-) -> std::result::Result<WebSocketResponse, WebSocketErrorResponse> {
-    if let Some(expected_path) = expected_path {
-        let actual_path = request.uri().path();
-        if actual_path != expected_path {
-            log::warn!(
-                peer = %peer_addr,
-                expected_path = expected_path,
-                actual_path = actual_path,
-                "Rejected WebSocket handshake due to path mismatch"
-            );
-            return Err(websocket_error_response(
-                StatusCode::NOT_FOUND,
-                "Invalid WebSocket path",
-            ));
-        }
-    }
-
-    if let Some(expected_host) = expected_host {
-        let actual_host = match request
-            .headers()
-            .get(HOST)
-            .and_then(|value| value.to_str().ok())
-        {
-            Some(host) => host,
-            None => {
-                log::warn!(peer = %peer_addr, "Rejected WebSocket handshake due to missing Host header");
-                return Err(websocket_error_response(
-                    StatusCode::BAD_REQUEST,
-                    "Missing WebSocket Host header",
-                ));
-            }
-        };
-
-        if !websocket_host_matches(expected_host, actual_host) {
-            log::warn!(
-                peer = %peer_addr,
-                expected_host = expected_host,
-                actual_host = actual_host,
-                "Rejected WebSocket handshake due to Host mismatch"
-            );
-            return Err(websocket_error_response(
-                StatusCode::FORBIDDEN,
-                "Invalid WebSocket Host header",
-            ));
-        }
-    }
-
-    Ok(response)
-}
-
-fn websocket_error_response(status: StatusCode, message: &str) -> WebSocketErrorResponse {
-    http::Response::builder()
-        .status(status)
-        .body(Some(message.to_string()))
-        .expect("websocket rejection response should be valid")
-}
-
-fn websocket_host_matches(expected_host: &str, actual_host: &str) -> bool {
-    let Some(expected) = parse_authority(expected_host) else {
-        return false;
-    };
-    let Some(actual) = parse_authority(actual_host) else {
-        return false;
-    };
-
-    expected.host == actual.host
-        && expected
-            .port
-            .map_or(true, |expected_port| actual.port == Some(expected_port))
-}
-
-fn parse_authority(value: &str) -> Option<ParsedAuthority> {
-    let authority = Authority::from_str(value.trim()).ok()?;
-    Some(ParsedAuthority {
-        host: authority.host().to_ascii_lowercase(),
-        port: authority.port_u16(),
-    })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedAuthority {
-    host: String,
-    port: Option<u16>,
-}
-
 // 连接检测与分发
 pub async fn accept_connection<S>(server: Arc<Server>, stream: S, peer_addr: String) -> Result<()>
 where
@@ -455,23 +358,13 @@ where
             result
         }
         TransportMode::WebSocket => {
-            let peer_addr_for_log = peer_addr.clone();
-            let expected_host = server.ws_host.clone();
-            let expected_path = server.ws_path.clone();
-            let ws_stream = tokio_tungstenite::accept_hdr_async(
+            let ws_transport = ws::accept_connection(
                 stream,
-                move |request: &WebSocketRequest, response: WebSocketResponse| {
-                    validate_websocket_request(
-                        request,
-                        response,
-                        &peer_addr_for_log,
-                        expected_host.as_deref(),
-                        expected_path.as_deref(),
-                    )
-                },
+                peer_addr.clone(),
+                server.ws_host.clone(),
+                server.ws_path.clone(),
             )
             .await?;
-            let ws_transport = ws::WebSocketTransport::new(ws_stream);
             handle_connection(server, ws_transport, peer_addr).await
         }
         TransportMode::Tcp => handle_connection(server, stream, peer_addr).await,
@@ -584,74 +477,4 @@ async fn main() -> Result<()> {
 
     let server = build_server(config).await?;
     server.run().await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{validate_websocket_request, websocket_host_matches};
-    use http::{Request, Response, StatusCode};
-
-    #[test]
-    fn websocket_host_match_allows_missing_expected_port() {
-        assert!(websocket_host_matches(
-            "cdn.example.com",
-            "cdn.example.com:443"
-        ));
-    }
-
-    #[test]
-    fn websocket_host_match_requires_matching_explicit_port() {
-        assert!(!websocket_host_matches(
-            "cdn.example.com:8443",
-            "cdn.example.com:443"
-        ));
-    }
-
-    #[test]
-    fn websocket_validation_rejects_wrong_path() {
-        let request = Request::builder()
-            .uri("/grpc")
-            .header("host", "cdn.example.com")
-            .body(())
-            .unwrap();
-        let response = Response::builder()
-            .status(StatusCode::SWITCHING_PROTOCOLS)
-            .body(())
-            .unwrap();
-
-        let error = validate_websocket_request(
-            &request,
-            response,
-            "127.0.0.1:1000",
-            Some("cdn.example.com"),
-            Some("/ws"),
-        )
-        .unwrap_err();
-
-        assert_eq!(error.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn websocket_validation_rejects_wrong_host() {
-        let request = Request::builder()
-            .uri("/ws")
-            .header("host", "other.example.com")
-            .body(())
-            .unwrap();
-        let response = Response::builder()
-            .status(StatusCode::SWITCHING_PROTOCOLS)
-            .body(())
-            .unwrap();
-
-        let error = validate_websocket_request(
-            &request,
-            response,
-            "127.0.0.1:1000",
-            Some("cdn.example.com"),
-            Some("/ws"),
-        )
-        .unwrap_err();
-
-        assert_eq!(error.status(), StatusCode::FORBIDDEN);
-    }
 }
