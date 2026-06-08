@@ -251,6 +251,7 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 Arc::clone(&server.udp_associations),
                 stream,
                 request.addr,
+                request.payload,
                 peer_addr,
             )
             .await

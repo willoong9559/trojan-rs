@@ -236,6 +236,7 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     udp_associations: Arc<Mutex<HashMap<String, UdpAssociation>>>,
     client_stream: S,
     _bind_addr: socks5::Address,
+    initial_payload: Bytes,
     peer_addr: String,
 ) -> Result<()> {
     log::info!(peer = %peer_addr, "Starting UDP associate");
@@ -331,13 +332,49 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     }
                 }
             }
+
+            if let Err(e) = client_write.flush().await {
+                log::debug!(peer = %peer_addr_for_write, error = %e, "Error flushing UDP response to client, dropping UDP");
+                return;
+            }
         }
     });
 
     let result = async {
         let mut read_buf = vec![0u8; BUF_SIZE];
         let mut buffer = BytesMut::with_capacity(BUF_SIZE);
+        buffer.extend_from_slice(&initial_payload);
+
         'main_loop: loop {
+            while !buffer.is_empty() {
+                match UdpPacket::decode(&buffer) {
+                    DecodeResult::Ok(udp_packet, consumed) => {
+                        let _ = buffer.split_to(consumed);
+
+                        udp_association.update_activity().await;
+
+                        match udp_packet.addr.to_socket_addr().await {
+                            Ok(remote_addr) => {
+                                if let Err(e) = udp_association.socket
+                                    .send_to(&udp_packet.payload, remote_addr).await {
+                                    log::debug!(peer = %peer_addr, error = %e, "Failed to send UDP packet");
+                                }
+                            }
+                            Err(e) => {
+                                log::debug!(peer = %peer_addr, error = %e, "Failed to resolve UDP target address");
+                            }
+                        }
+                    }
+                    DecodeResult::NeedMoreData => {
+                        break;
+                    }
+                    DecodeResult::Invalid => {
+                        log::debug!(peer = %peer_addr, "Invalid UDP packet, closing connection");
+                        break 'main_loop;
+                    }
+                }
+            }
+
             tokio::select! {
                 read_result = client_read.read(&mut read_buf) => {
                     match read_result {
@@ -346,35 +383,6 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                         }
                         Ok(n) => {
                             buffer.extend_from_slice(&read_buf[..n]);
-
-                            loop {
-                                match UdpPacket::decode(&buffer) {
-                                    DecodeResult::Ok(udp_packet, consumed) => {
-                                        let _ = buffer.split_to(consumed);
-
-                                        udp_association.update_activity().await;
-
-                                        match udp_packet.addr.to_socket_addr().await {
-                                            Ok(remote_addr) => {
-                                                if let Err(e) = udp_association.socket
-                                                    .send_to(&udp_packet.payload, remote_addr).await {
-                                                    log::debug!(peer = %peer_addr, error = %e, "Failed to send UDP packet");
-                                                }
-                                            }
-                                            Err(e) => {
-                                                log::debug!(peer = %peer_addr, error = %e, "Failed to resolve UDP target address");
-                                            }
-                                        }
-                                    }
-                                    DecodeResult::NeedMoreData => {
-                                        break;
-                                    }
-                                    DecodeResult::Invalid => {
-                                        log::debug!(peer = %peer_addr, "Invalid UDP packet, closing connection");
-                                        break 'main_loop;
-                                    }
-                                }
-                            }
                         }
                         Err(e) => {
                             log::debug!(peer = %peer_addr, error = %e, "Error reading from client stream");
@@ -466,4 +474,70 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+    use tokio::io::AsyncWriteExt;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn udp_associate_sends_initial_payload_packet() {
+        let udp_server = match UdpSocket::bind("127.0.0.1:0").await {
+            Ok(socket) => socket,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("UDP server bind should succeed: {e}"),
+        };
+        match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(socket) => drop(socket),
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("UDP associate bind should succeed: {e}"),
+        }
+
+        let udp_server_addr = udp_server
+            .local_addr()
+            .expect("UDP server local address should be available");
+
+        let initial_packet = UdpPacket {
+            addr: socks5::Address::IPv4(
+                match udp_server_addr.ip() {
+                    IpAddr::V4(ip) => ip.octets(),
+                    IpAddr::V6(_) => panic!("test UDP server must be IPv4"),
+                },
+                udp_server_addr.port(),
+            ),
+            length: 4,
+            payload: Bytes::from_static(b"ping"),
+        }
+        .encode();
+
+        let (client_stream, mut client_side) = tokio::io::duplex(1024);
+        let udp_associations = Arc::new(Mutex::new(HashMap::new()));
+        let handle = tokio::spawn(handle_udp_associate(
+            Arc::clone(&udp_associations),
+            client_stream,
+            socks5::Address::IPv4([0, 0, 0, 0], 0),
+            Bytes::from(initial_packet),
+            "127.0.0.1:12345".to_string(),
+        ));
+
+        let mut received = [0u8; 16];
+        let (len, _) = timeout(Duration::from_secs(3), udp_server.recv_from(&mut received))
+            .await
+            .expect("UDP packet from initial payload should arrive")
+            .expect("UDP receive should succeed");
+
+        assert_eq!(&received[..len], b"ping");
+
+        client_side
+            .shutdown()
+            .await
+            .expect("client side shutdown should succeed");
+        handle
+            .await
+            .expect("UDP associate task should join")
+            .unwrap();
+    }
 }
