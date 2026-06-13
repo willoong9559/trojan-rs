@@ -7,10 +7,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Notify;
-use tracing::{debug, warn};
+use tokio::time::Duration;
+use tracing::{debug, info, warn};
 
 use super::transport::GrpcH2cTransport;
 use super::{MAX_CONCURRENT_STREAMS, MAX_FRAME_SIZE, MAX_SEND_QUEUE_BYTES};
+
+const GRPC_CONNECTION_IDLE_TIMEOUT_SECS: u64 = 600;
 
 /// gRPC HTTP/2 连接管理器
 ///
@@ -53,6 +56,18 @@ where
         F: Fn(GrpcH2cTransport) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<()>> + Send + 'static,
     {
+        self.run_with_idle_timeout(
+            handler,
+            Duration::from_secs(GRPC_CONNECTION_IDLE_TIMEOUT_SECS),
+        )
+        .await
+    }
+
+    async fn run_with_idle_timeout<F, Fut>(self, handler: F, idle_timeout: Duration) -> Result<()>
+    where
+        F: Fn(GrpcH2cTransport) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
         let handler = Arc::new(handler);
         let mut h2_conn = self.h2_conn;
         let active_count = self.active_count;
@@ -60,7 +75,25 @@ where
         let all_streams_done = Arc::new(Notify::new());
 
         loop {
-            match h2_conn.accept().await {
+            let accepted = if active_count.load(Ordering::Relaxed) == 0 {
+                tokio::select! {
+                    accepted = h2_conn.accept() => accepted,
+                    _ = tokio::time::sleep(idle_timeout) => {
+                        info!(
+                            idle_timeout_secs = idle_timeout.as_secs(),
+                            "Closing idle gRPC connection"
+                        );
+                        break;
+                    }
+                }
+            } else {
+                tokio::select! {
+                    accepted = h2_conn.accept() => accepted,
+                    _ = all_streams_done.notified() => continue,
+                }
+            };
+
+            match accepted {
                 Some(Ok((request, mut respond))) => {
                     if request.method() != http::Method::POST {
                         let response = Response::builder()
@@ -127,7 +160,7 @@ where
                         }
 
                         if remaining_streams == 0 {
-                            all_streams_done_clone.notify_waiters();
+                            all_streams_done_clone.notify_one();
                         }
                     });
                 }
@@ -315,6 +348,35 @@ mod tests {
 
         drop(send_request);
         server_task.abort();
+        client_conn_task.abort();
+    }
+
+    #[tokio::test]
+    async fn closes_idle_connection_without_active_streams() {
+        let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
+
+        let server_task = tokio::spawn(async move {
+            let conn = GrpcH2cConnection::new(server_io)
+                .await
+                .expect("server handshake should succeed");
+            conn.run_with_idle_timeout(|_| async { Ok(()) }, Duration::from_millis(50))
+                .await
+        });
+
+        let (_send_request, client_conn) = client::Builder::new()
+            .handshake::<_, Bytes>(client_io)
+            .await
+            .expect("client handshake should succeed");
+        let client_conn_task = tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+
+        timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("server idle timeout should complete")
+            .expect("server task should not panic")
+            .expect("server run should succeed");
+
         client_conn_task.abort();
     }
 }
