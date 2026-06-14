@@ -14,6 +14,8 @@ use logger::log;
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::time::Duration;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -24,6 +26,7 @@ const BUF_SIZE: usize = 32 * 1024;
 
 const CONNECTION_TIMEOUT_SECS: u64 = 300;
 const TCP_CONNECT_TIMEOUT_SECS: u64 = 10;
+const HAPPY_EYEBALLS_STAGGER_MS: u64 = 250;
 const REQUEST_HEADER_TIMEOUT_SECS: u64 = 15;
 
 #[derive(Debug, Clone, Copy)]
@@ -269,29 +272,9 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<()> {
     log::info!(peer = %peer_addr, target = %target_addr.to_key(), "Connecting to target");
 
-    let remote_addr = target_addr.to_socket_addr().await?;
-    let mut remote_stream = match tokio::time::timeout(
-        tokio::time::Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS),
-        TcpStream::connect(remote_addr),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => {
-            let _ = stream.set_nodelay(true);
-            stream
-        }
-        Ok(Err(e)) => {
-            log::warn!(peer = %peer_addr, error = %e, "TCP connect failed");
-            return Err(e.into());
-        }
-        Err(_) => {
-            log::warn!(peer = %peer_addr, timeout_secs = TCP_CONNECT_TIMEOUT_SECS, "TCP connect timeout");
-            return Err(anyhow!(
-                "TCP connect timeout after {} seconds",
-                TCP_CONNECT_TIMEOUT_SECS
-            ));
-        }
-    };
+    let remote_addrs = target_addr.resolve_socket_addrs().await?;
+    let (mut remote_stream, remote_addr) =
+        connect_first_available(&peer_addr, &remote_addrs).await?;
     log::info!(peer = %peer_addr, remote = %remote_addr, "Connected to remote server");
 
     if !initial_payload.is_empty() {
@@ -319,6 +302,74 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     }
 
     Ok(())
+}
+
+async fn connect_first_available(
+    peer_addr: &str,
+    addrs: &[SocketAddr],
+) -> Result<(TcpStream, SocketAddr)> {
+    if addrs.is_empty() {
+        return Err(anyhow!("No addresses to connect"));
+    }
+
+    let connect_timeout = Duration::from_secs(TCP_CONNECT_TIMEOUT_SECS);
+    let stagger = Duration::from_millis(HAPPY_EYEBALLS_STAGGER_MS);
+    let mut attempts = tokio::task::JoinSet::new();
+
+    for (i, &addr) in addrs.iter().enumerate() {
+        let delay = stagger * i as u32;
+        attempts.spawn(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            let result = tokio::time::timeout(connect_timeout, TcpStream::connect(addr)).await;
+            (addr, result)
+        });
+    }
+
+    let mut last_error: Option<anyhow::Error> = None;
+    while let Some(join_result) = attempts.join_next().await {
+        match join_result {
+            Ok((addr, Ok(Ok(stream)))) => {
+                attempts.abort_all();
+                let _ = stream.set_nodelay(true);
+                return Ok((stream, addr));
+            }
+            Ok((addr, Ok(Err(e)))) => {
+                log::debug!(
+                    peer = %peer_addr,
+                    remote = %addr,
+                    error = %e,
+                    "TCP connect failed, waiting for other addresses"
+                );
+                last_error = Some(e.into());
+            }
+            Ok((addr, Err(_))) => {
+                log::debug!(
+                    peer = %peer_addr,
+                    remote = %addr,
+                    timeout_secs = TCP_CONNECT_TIMEOUT_SECS,
+                    "TCP connect timeout, waiting for other addresses"
+                );
+                last_error = Some(anyhow!(
+                    "TCP connect timeout after {} seconds to {}",
+                    TCP_CONNECT_TIMEOUT_SECS,
+                    addr
+                ));
+            }
+            Err(e) => {
+                if e.is_cancelled() {
+                    continue;
+                }
+                last_error = Some(e.into());
+            }
+        }
+    }
+
+    if let Some(error) = &last_error {
+        log::warn!(peer = %peer_addr, error = %error, "TCP connect failed for all resolved addresses");
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("All connect attempts failed")))
 }
 
 fn is_benign_copy_error(error: &std::io::Error) -> bool {

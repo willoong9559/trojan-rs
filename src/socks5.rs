@@ -28,15 +28,15 @@ impl Address {
         }
     }
 
-    pub async fn to_socket_addr(&self) -> Result<SocketAddr> {
+    pub async fn resolve_socket_addrs(&self) -> Result<Vec<SocketAddr>> {
         match self {
             Address::IPv4(ip, port) => {
                 let addr = IpAddr::V4(std::net::Ipv4Addr::from(*ip));
-                Ok(SocketAddr::new(addr, *port))
+                Ok(vec![SocketAddr::new(addr, *port)])
             }
             Address::IPv6(ip, port) => {
                 let addr = IpAddr::V6(std::net::Ipv6Addr::from(*ip));
-                Ok(SocketAddr::new(addr, *port))
+                Ok(vec![SocketAddr::new(addr, *port)])
             }
             Address::Domain(domain, port) => {
                 let addrs = tokio::time::timeout(
@@ -50,12 +50,21 @@ impl Address {
                         DNS_RESOLVE_TIMEOUT_SECS
                     )
                 })??;
-                addrs
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| anyhow!("Failed to resolve domain: {}", domain))
+                let addrs: Vec<SocketAddr> = addrs.collect();
+                if addrs.is_empty() {
+                    return Err(anyhow!("Failed to resolve domain: {}", domain));
+                }
+                Ok(addrs)
             }
         }
+    }
+
+    pub async fn to_socket_addr(&self) -> Result<SocketAddr> {
+        self.resolve_socket_addrs()
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("Failed to resolve address"))
     }
 
     // For UDP associations, we don't use the target address as the key
