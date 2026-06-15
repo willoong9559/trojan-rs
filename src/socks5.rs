@@ -3,6 +3,32 @@ use std::net::{IpAddr, SocketAddr};
 
 const DNS_RESOLVE_TIMEOUT_SECS: u64 = 10;
 
+/// Order resolved addresses for happy eyeballs: IPv6, IPv4, IPv6, IPv4, ...
+/// so the first IPv4 attempt starts soon instead of after every AAAA record.
+fn sort_addrs_for_happy_eyeballs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut v6_addrs = Vec::new();
+    let mut v4_addrs = Vec::new();
+
+    for addr in addrs {
+        match addr {
+            SocketAddr::V6(_) => v6_addrs.push(addr),
+            SocketAddr::V4(_) => v4_addrs.push(addr),
+        }
+    }
+
+    let mut result = Vec::with_capacity(v6_addrs.len() + v4_addrs.len());
+    let max_len = v6_addrs.len().max(v4_addrs.len());
+    for i in 0..max_len {
+        if i < v6_addrs.len() {
+            result.push(v6_addrs[i]);
+        }
+        if i < v4_addrs.len() {
+            result.push(v4_addrs[i]);
+        }
+    }
+    result
+}
+
 // SOCKS5 Address types
 #[derive(Debug, Clone, Copy)]
 pub enum _AddressType {
@@ -54,7 +80,7 @@ impl Address {
                 if addrs.is_empty() {
                     return Err(anyhow!("Failed to resolve domain: {}", domain));
                 }
-                Ok(addrs)
+                Ok(sort_addrs_for_happy_eyeballs(addrs))
             }
         }
     }
