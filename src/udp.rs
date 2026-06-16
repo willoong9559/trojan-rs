@@ -3,8 +3,9 @@ use crate::socks5;
 
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -247,8 +248,11 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     let socket_key = format!("client_{}_{}", peer_addr, id);
 
     let udp_association = {
-        let bind_socket_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0);
-        let socket = UdpSocket::bind(bind_socket_addr).await?;
+        let raw = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        raw.set_only_v6(false)?;
+        raw.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())?;
+        raw.set_nonblocking(true)?;
+        let socket = UdpSocket::from_std(raw.into())?;
         let association = UdpAssociation::new(socket);
 
         let mut associations = udp_associations.lock().await;
@@ -355,8 +359,20 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
 
                         match udp_packet.addr.to_socket_addr().await {
                             Ok(remote_addr) => {
-                                if let Err(e) = udp_association.socket
-                                    .send_to(&udp_packet.payload, remote_addr).await {
+                                let target = match remote_addr {
+                                    SocketAddr::V4(v4) => SocketAddr::V6(SocketAddrV6::new(
+                                        v4.ip().to_ipv6_mapped(),
+                                        v4.port(),
+                                        0,
+                                        0,
+                                    )),
+                                    addr => addr,
+                                };
+                                if let Err(e) = udp_association
+                                    .socket
+                                    .send_to(&udp_packet.payload, target)
+                                    .await
+                                {
                                     log::debug!(peer = %peer_addr, error = %e, "Failed to send UDP packet");
                                 }
                             }
@@ -396,7 +412,13 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                         Some((from_addr, data)) => {
                             let addr = match from_addr {
                                 SocketAddr::V4(v4) => socks5::Address::IPv4(v4.ip().octets(), v4.port()),
-                                SocketAddr::V6(v6) => socks5::Address::IPv6(v6.ip().octets(), v6.port()),
+                                SocketAddr::V6(v6) => {
+                                    if let Some(v4) = v6.ip().to_ipv4_mapped() {
+                                        socks5::Address::IPv4(v4.octets(), v6.port())
+                                    } else {
+                                        socks5::Address::IPv6(v6.ip().octets(), v6.port())
+                                    }
+                                }
                             };
 
                             let udp_packet = UdpPacket {
@@ -480,6 +502,7 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
 mod tests {
     use super::*;
     use std::io::ErrorKind;
+    use std::net::IpAddr;
     use tokio::io::AsyncWriteExt;
     use tokio::time::{timeout, Duration};
 
@@ -490,7 +513,7 @@ mod tests {
             Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
             Err(e) => panic!("UDP server bind should succeed: {e}"),
         };
-        match UdpSocket::bind("0.0.0.0:0").await {
+        match UdpSocket::bind("[::]:0").await {
             Ok(socket) => drop(socket),
             Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
             Err(e) => panic!("UDP associate bind should succeed: {e}"),
