@@ -248,11 +248,19 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     let socket_key = format!("client_{}_{}", peer_addr, id);
 
     let udp_association = {
-        let raw = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-        raw.set_only_v6(false)?;
-        raw.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())?;
-        raw.set_nonblocking(true)?;
-        let socket = UdpSocket::from_std(raw.into())?;
+        let socket = match (|| -> Result<UdpSocket> {
+            let raw = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+            raw.set_only_v6(false)?;
+            raw.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())?;
+            raw.set_nonblocking(true)?;
+            UdpSocket::from_std(raw.into()).map_err(Into::into)
+        })() {
+            Ok(socket) => socket,
+            Err(e) => {
+                log::debug!(error = %e, "IPv6 UDP bind failed, falling back to IPv4");
+                UdpSocket::bind("0.0.0.0:0").await?
+            }
+        };
         let association = UdpAssociation::new(socket);
 
         let mut associations = udp_associations.lock().await;
@@ -360,12 +368,19 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                         match udp_packet.addr.to_socket_addr().await {
                             Ok(remote_addr) => {
                                 let target = match remote_addr {
-                                    SocketAddr::V4(v4) => SocketAddr::V6(SocketAddrV6::new(
-                                        v4.ip().to_ipv6_mapped(),
-                                        v4.port(),
-                                        0,
-                                        0,
-                                    )),
+                                    SocketAddr::V4(v4)
+                                        if matches!(
+                                            udp_association.socket.local_addr(),
+                                            Ok(SocketAddr::V6(_))
+                                        ) =>
+                                    {
+                                        SocketAddr::V6(SocketAddrV6::new(
+                                            v4.ip().to_ipv6_mapped(),
+                                            v4.port(),
+                                            0,
+                                            0,
+                                        ))
+                                    }
                                     addr => addr,
                                 };
                                 if let Err(e) = udp_association
@@ -513,11 +528,6 @@ mod tests {
             Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
             Err(e) => panic!("UDP server bind should succeed: {e}"),
         };
-        match UdpSocket::bind("[::]:0").await {
-            Ok(socket) => drop(socket),
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
-            Err(e) => panic!("UDP associate bind should succeed: {e}"),
-        }
 
         let udp_server_addr = udp_server
             .local_addr()
