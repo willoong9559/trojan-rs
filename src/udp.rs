@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 const UDP_TIMEOUT: u64 = 60; // UDP association timeout in seconds;
 const BUF_SIZE: usize = 4 * 1024;
 const UDP_CHANNEL_BUFFER_SIZE: usize = 64;
-const TCP_WRITE_CHANNEL_BUFFER_SIZE: usize = 256;
+const TCP_WRITE_CHANNEL_BUFFER_SIZE: usize = 32;
 const CLEANUP_TIMEOUT_SECS: u64 = 5;
 
 // UDP Association info
