@@ -1,8 +1,10 @@
 use anyhow::Result;
 use bytes::Bytes;
+use futures_util::FutureExt;
 use h2::server;
 use http::{Response, StatusCode};
 use std::io;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -14,6 +16,43 @@ use super::transport::GrpcH2cTransport;
 use super::{MAX_CONCURRENT_STREAMS, MAX_FRAME_SIZE, MAX_SEND_QUEUE_BYTES};
 
 const GRPC_CONNECTION_IDLE_TIMEOUT_SECS: u64 = 600;
+
+struct ActiveStreamGuard {
+    active_count: Option<Arc<AtomicUsize>>,
+    all_streams_done: Arc<Notify>,
+}
+
+impl ActiveStreamGuard {
+    fn new(active_count: Arc<AtomicUsize>, all_streams_done: Arc<Notify>) -> Self {
+        Self {
+            active_count: Some(active_count),
+            all_streams_done,
+        }
+    }
+
+    fn finish(mut self) -> usize {
+        self.decrement().unwrap_or(0)
+    }
+
+    fn decrement(&mut self) -> Option<usize> {
+        let active_count = self.active_count.take()?;
+        let remaining_streams = active_count
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
+
+        if remaining_streams == 0 {
+            self.all_streams_done.notify_one();
+        }
+
+        Some(remaining_streams)
+    }
+}
+
+impl Drop for ActiveStreamGuard {
+    fn drop(&mut self) {
+        let _ = self.decrement();
+    }
+}
 
 /// gRPC HTTP/2 连接管理器
 ///
@@ -138,29 +177,33 @@ where
                     let active_streams = active_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
                     debug!(active_streams, path, "Accepted gRPC stream");
                     tokio::spawn(async move {
-                        let result = handler_clone(transport).await;
-                        let remaining_streams = active_count_clone
-                            .fetch_sub(1, Ordering::Relaxed)
-                            .saturating_sub(1);
+                        let active_stream =
+                            ActiveStreamGuard::new(active_count_clone, all_streams_done_clone);
+                        let result = AssertUnwindSafe(handler_clone(transport))
+                            .catch_unwind()
+                            .await;
+                        let remaining_streams = active_stream.finish();
 
                         match result {
-                            Ok(()) => {
+                            Ok(Ok(())) => {
                                 debug!(
                                     active_streams = remaining_streams,
                                     "gRPC stream handler finished"
                                 );
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 warn!(
                                     error = %e,
                                     active_streams = remaining_streams,
                                     "gRPC stream handler failed",
                                 );
                             }
-                        }
-
-                        if remaining_streams == 0 {
-                            all_streams_done_clone.notify_one();
+                            Err(_) => {
+                                warn!(
+                                    active_streams = remaining_streams,
+                                    "gRPC stream handler panicked",
+                                );
+                            }
                         }
                     });
                 }
@@ -301,6 +344,60 @@ mod tests {
         drop(ok_body);
         drop(send_request);
         server_task.abort();
+        client_conn_task.abort();
+    }
+
+    #[tokio::test]
+    async fn handler_panic_releases_active_stream() {
+        let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
+
+        let server_task = tokio::spawn(async move {
+            let conn = GrpcH2cConnection::new(server_io)
+                .await
+                .expect("server handshake should succeed");
+            conn.run_with_idle_timeout(
+                |_| async {
+                    panic!("intentional handler panic");
+                    #[allow(unreachable_code)]
+                    Ok::<(), anyhow::Error>(())
+                },
+                Duration::from_millis(50),
+            )
+            .await
+        });
+
+        let (mut send_request, client_conn) = client::Builder::new()
+            .handshake::<_, Bytes>(client_io)
+            .await
+            .expect("client handshake should succeed");
+        let client_conn_task = tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+
+        let (response, _) = send_request
+            .send_request(
+                Request::builder()
+                    .method("POST")
+                    .uri("/Tun")
+                    .body(())
+                    .expect("request should be valid"),
+                true,
+            )
+            .expect("request send should succeed");
+
+        let response = timeout(Duration::from_secs(3), response)
+            .await
+            .expect("response headers timeout")
+            .expect("response future failed");
+        drop(response);
+        drop(send_request);
+
+        timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("server should not wait forever after handler panic")
+            .expect("server task should not panic")
+            .expect("server run should succeed");
+
         client_conn_task.abort();
     }
 
