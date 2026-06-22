@@ -350,6 +350,10 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 return;
             }
         }
+
+        if let Err(e) = client_write.shutdown().await {
+            log::debug!(peer = %peer_addr_for_write, error = %e, "Error shutting down client stream after UDP associate");
+        }
     });
 
     let result = async {

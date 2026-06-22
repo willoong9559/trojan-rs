@@ -15,8 +15,8 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::Duration;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -186,8 +186,118 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut stream: S,
     peer_addr: String,
 ) -> Result<()> {
-    // Read until a full Trojan request header is available.
-    let request = tokio::time::timeout(
+    let request = read_trojan_request(&mut stream).await?;
+
+    // 验证密码
+    if request.password != server.password {
+        log_incorrect_password(server.transport_mode, &peer_addr);
+        return Err(anyhow!("Incorrect password"));
+    }
+
+    log::authentication(&peer_addr, true);
+
+    match request.cmd {
+        TrojanCmd::Connect => {
+            handle_connect(&mut stream, request.addr, request.payload, peer_addr).await
+        }
+        TrojanCmd::UdpAssociate => {
+            if !server.enable_udp {
+                log::warn!(peer = %peer_addr, "UDP associate request rejected: UDP support is disabled");
+                return Err(anyhow!("UDP support is disabled"));
+            }
+            udp::handle_udp_associate(
+                Arc::clone(&server.udp_associations),
+                stream,
+                request.addr,
+                request.payload,
+                peer_addr,
+            )
+            .await
+        }
+    }
+}
+
+async fn process_grpc_stream<S>(
+    password: [u8; 56],
+    enable_udp: bool,
+    udp_associations: Arc<Mutex<HashMap<String, udp::UdpAssociation>>>,
+    mut stream: S,
+    peer_addr: String,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let request = match read_trojan_request(&mut stream).await {
+        Ok(request) => request,
+        Err(e) => return finish_grpc_stream(&mut stream, Err(e), &peer_addr).await,
+    };
+
+    if request.password != password {
+        log_incorrect_password(TransportMode::Grpc, &peer_addr);
+        return finish_grpc_stream(&mut stream, Err(anyhow!("Incorrect password")), &peer_addr)
+            .await;
+    }
+
+    log::authentication(&peer_addr, true);
+
+    match request.cmd {
+        TrojanCmd::Connect => {
+            let result = handle_connect(
+                &mut stream,
+                request.addr,
+                request.payload,
+                peer_addr.clone(),
+            )
+            .await;
+            finish_grpc_stream(&mut stream, result, &peer_addr).await
+        }
+        TrojanCmd::UdpAssociate => {
+            if !enable_udp {
+                log::warn!(peer = %peer_addr, "UDP associate request rejected: UDP support is disabled");
+                return finish_grpc_stream(
+                    &mut stream,
+                    Err(anyhow!("UDP support is disabled")),
+                    &peer_addr,
+                )
+                .await;
+            }
+            udp::handle_udp_associate(
+                udp_associations,
+                stream,
+                request.addr,
+                request.payload,
+                peer_addr,
+            )
+            .await
+        }
+    }
+}
+
+async fn finish_grpc_stream<S>(stream: &mut S, result: Result<()>, peer_addr: &str) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let shutdown_result = stream.shutdown().await;
+    match (result, shutdown_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Ok(())) => Err(e),
+        (Ok(()), Err(e)) => Err(e.into()),
+        (Err(original), Err(shutdown_error)) => {
+            log::warn!(
+                peer = %peer_addr,
+                error = %shutdown_error,
+                "Failed to send gRPC stream trailers after handler error"
+            );
+            Err(original)
+        }
+    }
+}
+
+async fn read_trojan_request<S>(stream: &mut S) -> Result<TrojanRequest>
+where
+    S: AsyncRead + Unpin,
+{
+    tokio::time::timeout(
         tokio::time::Duration::from_secs(REQUEST_HEADER_TIMEOUT_SECS),
         async {
             let mut read_buf = vec![0u8; BUF_SIZE];
@@ -225,47 +335,23 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             "Timed out waiting for Trojan request header after {} seconds",
             REQUEST_HEADER_TIMEOUT_SECS
         )
-    })??;
+    })?
+}
 
-    // 验证密码
-    if request.password != server.password {
-        let transport = match server.transport_mode {
-            TransportMode::Tcp => "TCP",
-            TransportMode::WebSocket => "WS",
-            TransportMode::Grpc => "gRPC",
-        };
-        log::authentication(&peer_addr, false);
-        log::warn!(peer = %peer_addr, transport = transport, "Incorrect password");
-        return Err(anyhow!("Incorrect password"));
-    }
-
-    log::authentication(&peer_addr, true);
-
-    match request.cmd {
-        TrojanCmd::Connect => {
-            handle_connect(stream, request.addr, request.payload, peer_addr).await
-        }
-        TrojanCmd::UdpAssociate => {
-            if !server.enable_udp {
-                log::warn!(peer = %peer_addr, "UDP associate request rejected: UDP support is disabled");
-                return Err(anyhow!("UDP support is disabled"));
-            }
-            udp::handle_udp_associate(
-                Arc::clone(&server.udp_associations),
-                stream,
-                request.addr,
-                request.payload,
-                peer_addr,
-            )
-            .await
-        }
-    }
+fn log_incorrect_password(transport_mode: TransportMode, peer_addr: &str) {
+    let transport = match transport_mode {
+        TransportMode::Tcp => "TCP",
+        TransportMode::WebSocket => "WS",
+        TransportMode::Grpc => "gRPC",
+    };
+    log::authentication(peer_addr, false);
+    log::warn!(peer = %peer_addr, transport = transport, "Incorrect password");
 }
 
 // 统一的 CONNECT 处理
 
 async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
-    client_stream: S,
+    client_stream: &mut S,
     target_addr: socks5::Address,
     initial_payload: Bytes,
     peer_addr: String,
@@ -393,9 +479,20 @@ where
             };
             let result = grpc_conn
                 .run(move |transport| {
-                    let server = Arc::clone(&server);
+                    let password = server.password;
+                    let enable_udp = server.enable_udp;
+                    let udp_associations = Arc::clone(&server.udp_associations);
                     let peer_addr = peer_addr.clone();
-                    async move { handle_connection(server, transport, peer_addr).await }
+                    async move {
+                        process_grpc_stream(
+                            password,
+                            enable_udp,
+                            udp_associations,
+                            transport,
+                            peer_addr,
+                        )
+                        .await
+                    }
                 })
                 .await;
 
@@ -529,4 +626,124 @@ async fn main() -> Result<()> {
 
     let server = build_server(config).await?;
     server.run().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::{BufMut, BytesMut};
+    use h2::client;
+    use http::Request;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn grpc_password_failure_sends_ok_trailers() {
+        let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
+        let password = [0x11; 56];
+        let udp_associations = Arc::new(Mutex::new(HashMap::new()));
+
+        let server_task = tokio::spawn({
+            let udp_associations = Arc::clone(&udp_associations);
+            async move {
+                let conn = grpc::GrpcH2cConnection::new(server_io)
+                    .await
+                    .expect("server handshake should succeed");
+                conn.run(move |transport| {
+                    let udp_associations = Arc::clone(&udp_associations);
+                    async move {
+                        process_grpc_stream(
+                            password,
+                            false,
+                            udp_associations,
+                            transport,
+                            "127.0.0.1:12345".to_string(),
+                        )
+                        .await
+                    }
+                })
+                .await
+            }
+        });
+
+        let (mut send_request, client_conn) = client::Builder::new()
+            .handshake::<_, Bytes>(client_io)
+            .await
+            .expect("client handshake should succeed");
+        let client_conn_task = tokio::spawn(async move {
+            let _ = client_conn.await;
+        });
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/Tun")
+            .body(())
+            .expect("request should be valid");
+        let (response_future, mut request_stream) = send_request
+            .send_request(request, false)
+            .expect("request send should succeed");
+
+        request_stream
+            .send_data(
+                encode_test_grpc_message(&wrong_password_connect_request()),
+                true,
+            )
+            .expect("request body should send");
+
+        let response = timeout(Duration::from_secs(3), response_future)
+            .await
+            .expect("response headers timeout")
+            .expect("response future failed");
+        let mut body = response.into_body();
+        let trailers = timeout(Duration::from_secs(3), body.trailers())
+            .await
+            .expect("trailers timeout")
+            .expect("trailers future failed")
+            .expect("expected grpc trailers");
+
+        assert_eq!(trailers.get("grpc-status").unwrap(), "0");
+
+        drop(send_request);
+        server_task.abort();
+        client_conn_task.abort();
+    }
+
+    fn wrong_password_connect_request() -> Vec<u8> {
+        let mut request = Vec::new();
+        request.extend_from_slice(&[0x22; 56]);
+        request.extend_from_slice(b"\r\n");
+        request.push(TrojanCmd::Connect as u8);
+        request.push(1);
+        request.extend_from_slice(&[127, 0, 0, 1]);
+        request.extend_from_slice(&80u16.to_be_bytes());
+        request.extend_from_slice(b"\r\n");
+        request
+    }
+
+    fn encode_test_grpc_message(payload: &[u8]) -> Bytes {
+        let mut proto_header = BytesMut::with_capacity(10);
+        proto_header.put_u8(0x0A);
+        encode_test_varint(payload.len() as u64, &mut proto_header);
+
+        let grpc_payload_len = (proto_header.len() + payload.len()) as u32;
+        let mut frame = BytesMut::with_capacity(5 + proto_header.len() + payload.len());
+        frame.put_u8(0x00);
+        frame.put_u32(grpc_payload_len);
+        frame.extend_from_slice(&proto_header);
+        frame.extend_from_slice(payload);
+        frame.freeze()
+    }
+
+    fn encode_test_varint(mut value: u64, buf: &mut BytesMut) {
+        loop {
+            let mut byte = (value & 0x7F) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            buf.put_u8(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
 }
