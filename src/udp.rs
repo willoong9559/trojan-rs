@@ -17,6 +17,7 @@ const UDP_TIMEOUT: u64 = 60; // UDP association timeout in seconds;
 const BUF_SIZE: usize = 4 * 1024;
 const UDP_CHANNEL_BUFFER_SIZE: usize = 64;
 const TCP_WRITE_CHANNEL_BUFFER_SIZE: usize = 32;
+const TCP_WRITE_BATCH_BYTES: usize = 256 * 1024;
 const CLEANUP_TIMEOUT_SECS: u64 = 5;
 
 // UDP Association info
@@ -328,20 +329,24 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     let tcp_write_handle = tokio::spawn(async move {
         let mut client_write = client_write;
         while let Some(encoded) = tcp_write_rx.recv().await {
-            let mut written = 0;
-            while written < encoded.len() {
-                match client_write.write(&encoded[written..]).await {
-                    Ok(0) => {
-                        log::debug!(peer = %peer_addr_for_write, "TCP connection closed while writing UDP response, dropping UDP");
-                        return;
+            let mut batch_bytes = encoded.len();
+
+            if let Err(e) = client_write.write_all(&encoded).await {
+                log::debug!(peer = %peer_addr_for_write, error = %e, "Error writing UDP response to client, dropping UDP");
+                return;
+            }
+
+            while batch_bytes < TCP_WRITE_BATCH_BYTES {
+                match tcp_write_rx.try_recv() {
+                    Ok(encoded) => {
+                        batch_bytes += encoded.len();
+                        if let Err(e) = client_write.write_all(&encoded).await {
+                            log::debug!(peer = %peer_addr_for_write, error = %e, "Error writing UDP response to client, dropping UDP");
+                            return;
+                        }
                     }
-                    Ok(n) => {
-                        written += n;
-                    }
-                    Err(e) => {
-                        log::debug!(peer = %peer_addr_for_write, error = %e, "Error writing UDP response to client, dropping UDP");
-                        return;
-                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => break,
                 }
             }
 
