@@ -13,13 +13,11 @@ use logger::log;
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
 
 const BUF_SIZE: usize = 32 * 1024;
@@ -44,7 +42,6 @@ pub struct Server {
     pub ws_path: Option<String>,
     pub grpc_service_name: Option<String>,
     pub enable_udp: bool,
-    pub udp_associations: Arc<Mutex<HashMap<String, udp::UdpAssociation>>>,
     pub tls_acceptor: Option<TlsAcceptor>,
 }
 
@@ -206,7 +203,6 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 return Err(anyhow!("UDP support is disabled"));
             }
             udp::handle_udp_associate(
-                Arc::clone(&server.udp_associations),
                 stream,
                 request.addr,
                 request.payload,
@@ -220,7 +216,6 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 async fn process_grpc_stream<S>(
     password: [u8; 56],
     enable_udp: bool,
-    udp_associations: Arc<Mutex<HashMap<String, udp::UdpAssociation>>>,
     mut stream: S,
     peer_addr: String,
 ) -> Result<()>
@@ -262,7 +257,6 @@ where
                 .await;
             }
             udp::handle_udp_associate(
-                udp_associations,
                 stream,
                 request.addr,
                 request.payload,
@@ -301,19 +295,19 @@ where
         tokio::time::Duration::from_secs(REQUEST_HEADER_TIMEOUT_SECS),
         async {
             let mut read_buf = vec![0u8; BUF_SIZE];
-            let mut buffer = Vec::with_capacity(BUF_SIZE);
+            let mut server_buffer = Vec::with_capacity(BUF_SIZE);
 
             loop {
-                if buffer.len() >= BUF_SIZE {
+                if server_buffer.len() >= BUF_SIZE {
                     return Err(anyhow!("Trojan request exceeds maximum buffer size"));
                 }
 
-                let remaining = BUF_SIZE - buffer.len();
+                let remaining = BUF_SIZE - server_buffer.len();
                 let read_size = remaining.min(read_buf.len());
                 let n = stream.read(&mut read_buf[..read_size]).await?;
 
                 if n == 0 {
-                    if buffer.is_empty() {
+                    if server_buffer.is_empty() {
                         return Err(anyhow!("Connection closed before receiving request"));
                     }
                     return Err(anyhow!(
@@ -321,9 +315,9 @@ where
                     ));
                 }
 
-                buffer.extend_from_slice(&read_buf[..n]);
+                server_buffer.extend_from_slice(&read_buf[..n]);
 
-                if let Some((request, _consumed)) = TrojanRequest::decode(&buffer)? {
+                if let Some((request, _consumed)) = TrojanRequest::decode(&server_buffer)? {
                     break Ok(request);
                 }
             }
@@ -481,13 +475,11 @@ where
                 .run(move |transport| {
                     let password = server.password;
                     let enable_udp = server.enable_udp;
-                    let udp_associations = Arc::clone(&server.udp_associations);
                     let peer_addr = peer_addr.clone();
                     async move {
                         process_grpc_stream(
                             password,
                             enable_udp,
-                            udp_associations,
                             transport,
                             peer_addr,
                         )
@@ -532,9 +524,6 @@ impl Server {
         let tls_enabled = server.tls_acceptor.is_some();
 
         log::info!(address = %addr, mode = mode, tls = tls_enabled, "Server started");
-
-        // UDP清理任务
-        udp::start_cleanup_task(Arc::clone(&server.udp_associations));
 
         loop {
             match server.listener.accept().await {
@@ -612,7 +601,6 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         ws_path: config.ws_path,
         grpc_service_name: config.grpc_service_name,
         enable_udp: config.enable_udp,
-        udp_associations: Arc::new(Mutex::new(HashMap::new())),
         tls_acceptor,
     })
 }
@@ -640,21 +628,17 @@ mod tests {
     async fn grpc_password_failure_sends_ok_trailers() {
         let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
         let password = [0x11; 56];
-        let udp_associations = Arc::new(Mutex::new(HashMap::new()));
 
         let server_task = tokio::spawn({
-            let udp_associations = Arc::clone(&udp_associations);
             async move {
                 let conn = grpc::GrpcH2cConnection::new(server_io)
                     .await
                     .expect("server handshake should succeed");
                 conn.run(move |transport| {
-                    let udp_associations = Arc::clone(&udp_associations);
                     async move {
                         process_grpc_stream(
                             password,
                             false,
-                            udp_associations,
                             transport,
                             "127.0.0.1:12345".to_string(),
                         )
