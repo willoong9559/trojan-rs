@@ -4,9 +4,7 @@ use crate::socks5;
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -19,39 +17,6 @@ const UDP_CHANNEL_BUFFER_SIZE: usize = 64;
 const TCP_WRITE_CHANNEL_BUFFER_SIZE: usize = 32;
 const TCP_WRITE_BATCH_BYTES: usize = 256 * 1024;
 const CLEANUP_TIMEOUT_SECS: u64 = 5;
-
-// UDP Association info
-#[derive(Debug, Clone)]
-pub struct UdpAssociation {
-    pub socket: Arc<UdpSocket>,
-    last_activity: Arc<Mutex<Instant>>,
-    created_at: Instant,
-}
-
-impl UdpAssociation {
-    pub fn new(socket: UdpSocket) -> Self {
-        Self {
-            socket: Arc::new(socket),
-            last_activity: Arc::new(Mutex::new(Instant::now())),
-            created_at: Instant::now(),
-        }
-    }
-
-    #[inline]
-    pub async fn update_activity(&self) {
-        *self.last_activity.lock().await = Instant::now();
-    }
-
-    pub async fn is_inactive(&self, timeout_secs: u64) -> bool {
-        let last_activity = *self.last_activity.lock().await;
-        last_activity.elapsed().as_secs() > timeout_secs
-    }
-
-    #[inline]
-    pub fn age(&self) -> std::time::Duration {
-        self.created_at.elapsed()
-    }
-}
 
 // UDP Packet for Trojan UDP Associate
 #[derive(Debug)]
@@ -194,48 +159,8 @@ impl UdpPacket {
     }
 }
 
-// UDP清理任务，定期清理不活跃的UDP association
-pub fn start_cleanup_task(associations: Arc<Mutex<HashMap<String, UdpAssociation>>>) {
-    tokio::spawn(async move {
-        const CLEANUP_INTERVAL_SECS: u64 = UDP_TIMEOUT / 2;
-        let mut interval =
-            tokio::time::interval(tokio::time::Duration::from_secs(CLEANUP_INTERVAL_SECS));
-        interval.tick().await;
-
-        loop {
-            interval.tick().await;
-
-            let associations_to_check: Vec<(String, UdpAssociation)> = {
-                let assocs = associations.lock().await;
-                assocs.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-            };
-
-            let mut keys_to_remove = Vec::new();
-            for (key, association) in associations_to_check {
-                if association.is_inactive(UDP_TIMEOUT).await {
-                    keys_to_remove.push(key);
-                }
-            }
-
-            if !keys_to_remove.is_empty() {
-                let mut assocs = associations.lock().await;
-                let removed_count = keys_to_remove.len();
-                for key in keys_to_remove {
-                    assocs.remove(&key);
-                }
-                log::debug!(
-                    removed = removed_count,
-                    remaining = assocs.len(),
-                    "Cleaned up inactive UDP associations"
-                );
-            }
-        }
-    });
-}
-
 // 处理 UDP Associate 请求
 pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
-    udp_associations: Arc<Mutex<HashMap<String, UdpAssociation>>>,
     client_stream: S,
     _bind_addr: socks5::Address,
     initial_payload: Bytes,
@@ -243,31 +168,21 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
 ) -> Result<()> {
     log::info!(peer = %peer_addr, "Starting UDP associate");
 
-    // 生成唯一的socket key
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let socket_key = format!("client_{}_{}", peer_addr, id);
-
-    let udp_association = {
-        let socket = match (|| -> Result<UdpSocket> {
-            let raw = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-            raw.set_only_v6(false)?;
-            raw.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())?;
-            raw.set_nonblocking(true)?;
-            UdpSocket::from_std(raw.into()).map_err(Into::into)
-        })() {
-            Ok(socket) => socket,
-            Err(e) => {
-                log::debug!(error = %e, "IPv6 UDP bind failed, falling back to IPv4");
-                UdpSocket::bind("0.0.0.0:0").await?
-            }
-        };
-        let association = UdpAssociation::new(socket);
-
-        let mut associations = udp_associations.lock().await;
-        associations.insert(socket_key.clone(), association.clone());
-        association
+    let socket = match (|| -> Result<UdpSocket> {
+        let raw = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        raw.set_only_v6(false)?;
+        raw.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())?;
+        raw.set_nonblocking(true)?;
+        UdpSocket::from_std(raw.into()).map_err(Into::into)
+    })() {
+        Ok(socket) => socket,
+        Err(e) => {
+            log::debug!(error = %e, "IPv6 UDP bind failed, falling back to IPv4");
+            UdpSocket::bind("0.0.0.0:0").await?
+        }
     };
+    let socket = Arc::new(socket);
+    let last_activity = Arc::new(Mutex::new(Instant::now()));
 
     let (mut client_read, client_write) = tokio::io::split(client_stream);
 
@@ -275,8 +190,8 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     let (tcp_write_tx, mut tcp_write_rx) = mpsc::channel::<Vec<u8>>(TCP_WRITE_CHANNEL_BUFFER_SIZE);
     let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
-    let socket_clone = Arc::clone(&udp_association.socket);
-    let association_clone = udp_association.clone();
+    let socket_clone = Arc::clone(&socket);
+    let last_activity_clone = Arc::clone(&last_activity);
 
     let udp_recv_handle = tokio::spawn(async move {
         let mut buf = BytesMut::with_capacity(BUF_SIZE);
@@ -295,7 +210,7 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 } => {
                     match result {
                         Ok((len, from_addr)) => {
-                            association_clone.update_activity().await;
+                            *last_activity_clone.lock().await = Instant::now();
 
                             buf.truncate(len);
 
@@ -372,14 +287,14 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                     DecodeResult::Ok(udp_packet, consumed) => {
                         let _ = buffer.split_to(consumed);
 
-                        udp_association.update_activity().await;
+                        *last_activity.lock().await = Instant::now();
 
                         match udp_packet.addr.to_socket_addr().await {
                             Ok(remote_addr) => {
                                 let target = match remote_addr {
                                     SocketAddr::V4(v4)
                                         if matches!(
-                                            udp_association.socket.local_addr(),
+                                            socket.local_addr(),
                                             Ok(SocketAddr::V6(_))
                                         ) =>
                                     {
@@ -392,8 +307,7 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                                     }
                                     addr => addr,
                                 };
-                                if let Err(e) = udp_association
-                                    .socket
+                                if let Err(e) = socket
                                     .send_to(&udp_packet.payload, target)
                                     .await
                                 {
@@ -415,7 +329,22 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 }
             }
 
+            let timeout_duration = std::time::Duration::from_secs(UDP_TIMEOUT);
+            let time_since_activity = {
+                let last = *last_activity.lock().await;
+                last.elapsed()
+            };
+            let sleep_duration = timeout_duration.saturating_sub(time_since_activity);
+
             tokio::select! {
+                _ = tokio::time::sleep(sleep_duration) => {
+                    let last = *last_activity.lock().await;
+                    if last.elapsed().as_secs() >= UDP_TIMEOUT {
+                        log::info!(peer = %peer_addr, "UDP associate timeout due to inactivity");
+                        break 'main_loop;
+                    }
+                }
+
                 read_result = client_read.read(&mut read_buf) => {
                     match read_result {
                         Ok(0) => {
@@ -514,11 +443,6 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
         }
     }
 
-    {
-        let mut associations = udp_associations.lock().await;
-        associations.remove(&socket_key);
-    }
-
     result
 }
 
@@ -556,9 +480,7 @@ mod tests {
         .encode();
 
         let (client_stream, mut client_side) = tokio::io::duplex(1024);
-        let udp_associations = Arc::new(Mutex::new(HashMap::new()));
         let handle = tokio::spawn(handle_udp_associate(
-            Arc::clone(&udp_associations),
             client_stream,
             socks5::Address::IPv4([0, 0, 0, 0], 0),
             Bytes::from(initial_packet),
