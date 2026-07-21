@@ -14,13 +14,111 @@ use logger::log;
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
 const BUF_SIZE: usize = 32 * 1024;
+
+pub enum Listener {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix(tokio::net::UnixListener),
+}
+
+impl Listener {
+    pub fn local_addr_string(&self) -> Result<String> {
+        match self {
+            Listener::Tcp(l) => Ok(l.local_addr()?.to_string()),
+            #[cfg(unix)]
+            Listener::Unix(l) => {
+                let addr = l.local_addr()?;
+                if let Some(path) = addr.as_pathname() {
+                    Ok(path.to_string_lossy().into_owned())
+                } else {
+                    Ok("[unnamed unix socket]".to_string())
+                }
+            }
+        }
+    }
+
+    pub async fn accept(&self) -> Result<(ConnectionStream, String)> {
+        match self {
+            Listener::Tcp(l) => {
+                let (stream, addr) = l.accept().await?;
+                let _ = stream.set_nodelay(true);
+                Ok((ConnectionStream::Tcp { stream }, addr.to_string()))
+            }
+            #[cfg(unix)]
+            Listener::Unix(l) => {
+                let (stream, addr) = l.accept().await?;
+                let peer_addr = if let Some(path) = addr.as_pathname() {
+                    format!("unix:{}", path.to_string_lossy())
+                } else {
+                    "unix:[unnamed]".to_string()
+                };
+                Ok((ConnectionStream::Unix { stream }, peer_addr))
+            }
+        }
+    }
+}
+
+pin_project_lite::pin_project! {
+    #[project = ConnectionStreamProj]
+    pub enum ConnectionStream {
+        Tcp { #[pin] stream: TcpStream },
+        #[cfg(unix)]
+        Unix { #[pin] stream: tokio::net::UnixStream },
+    }
+}
+
+impl AsyncRead for ConnectionStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.project() {
+            ConnectionStreamProj::Tcp { stream } => stream.poll_read(cx, buf),
+            #[cfg(unix)]
+            ConnectionStreamProj::Unix { stream } => stream.poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for ConnectionStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.project() {
+            ConnectionStreamProj::Tcp { stream } => stream.poll_write(cx, buf),
+            #[cfg(unix)]
+            ConnectionStreamProj::Unix { stream } => stream.poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.project() {
+            ConnectionStreamProj::Tcp { stream } => stream.poll_flush(cx),
+            #[cfg(unix)]
+            ConnectionStreamProj::Unix { stream } => stream.poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.project() {
+            ConnectionStreamProj::Tcp { stream } => stream.poll_shutdown(cx),
+            #[cfg(unix)]
+            ConnectionStreamProj::Unix { stream } => stream.poll_shutdown(cx),
+        }
+    }
+}
 
 const CONNECTION_TIMEOUT_SECS: u64 = 300;
 const TCP_CONNECT_TIMEOUT_SECS: u64 = 10;
@@ -35,7 +133,7 @@ pub enum TransportMode {
 }
 
 pub struct Server {
-    pub listener: TcpListener,
+    pub listener: Listener,
     pub password: [u8; 56],
     pub transport_mode: TransportMode,
     pub ws_host: Option<String>,
@@ -515,7 +613,7 @@ where
 impl Server {
     pub async fn run(self) -> Result<()> {
         let server = Arc::new(self);
-        let addr = server.listener.local_addr()?;
+        let addr = server.listener.local_addr_string()?;
         let mode = match server.transport_mode {
             TransportMode::Tcp => "TCP",
             TransportMode::WebSocket => "WebSocket",
@@ -527,13 +625,11 @@ impl Server {
 
         loop {
             match server.listener.accept().await {
-                Ok((stream, addr)) => {
-                    let _ = stream.set_nodelay(true);
-                    log::connection(&addr.to_string(), "new");
+                Ok((stream, peer_addr)) => {
+                    log::connection(&peer_addr, "new");
                     let server_clone = Arc::clone(&server);
 
                     tokio::spawn(async move {
-                        let peer_addr = addr.to_string();
                         let result = async {
                             if let Some(ref tls_acceptor) = server_clone.tls_acceptor {
                                 const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 30; // TLS握手超时30秒
@@ -578,8 +674,26 @@ impl Server {
 }
 
 pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
-    let addr: String = format!("{}:{}", config.host, config.port);
-    let listener = TcpListener::bind(addr).await?;
+    let listener = if let Some(ref path) = config.unix_path {
+        #[cfg(unix)]
+        {
+            if std::fs::metadata(path).is_ok() {
+                log::info!("Removing existing Unix Domain Socket file at {}", path);
+                let _ = std::fs::remove_file(path);
+            }
+            let unix_listener = tokio::net::UnixListener::bind(path)?;
+            Listener::Unix(unix_listener)
+        }
+        #[cfg(not(unix))]
+        {
+            return Err(anyhow!("Unix Domain Sockets are not supported on this platform"));
+        }
+    } else {
+        let addr: String = format!("{}:{}", config.host, config.port);
+        let tcp_listener = TcpListener::bind(addr).await?;
+        Listener::Tcp(tcp_listener)
+    };
+
     let password = utils::password_to_hex(&config.password);
     let enable_ws = config.enable_ws;
     let enable_grpc = config.enable_grpc;
@@ -689,6 +803,61 @@ mod tests {
         drop(send_request);
         server_task.abort();
         client_conn_task.abort();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_unix_domain_socket_bind_and_connect() {
+        let unix_path = format!("/tmp/test_trojan_rs_uds_{}.sock", std::process::id());
+        let _ = std::fs::remove_file(&unix_path);
+
+        let config = config::ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: "35537".to_string(),
+            password: "test_password".to_string(),
+            enable_ws: false,
+            enable_grpc: false,
+            ws_host: None,
+            ws_path: None,
+            grpc_service_name: None,
+            enable_udp: false,
+            cert: None,
+            key: None,
+            config_file: None,
+            generate_config: None,
+            log_level: None,
+            unix_path: Some(unix_path.clone()),
+        };
+
+        let server = build_server(config).await.expect("failed to build server");
+        let server_run_task = tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+
+        // Give the server a small moment to bind/start
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let client_stream_res: std::io::Result<tokio::net::UnixStream> = tokio::net::UnixStream::connect(&unix_path).await;
+        assert!(client_stream_res.is_ok(), "Failed to connect to Unix Domain Socket: {:?}", client_stream_res.err());
+        let mut client_stream = client_stream_res.unwrap();
+
+        // Write an invalid request (to trigger a response or end of connection)
+        let mut invalid_req = Vec::new();
+        invalid_req.extend_from_slice(&[0x11; 56]);
+        invalid_req.extend_from_slice(b"\r\n");
+        invalid_req.push(TrojanCmd::Connect as u8);
+        invalid_req.push(1);
+        invalid_req.extend_from_slice(&[127, 0, 0, 1]);
+        invalid_req.extend_from_slice(&80u16.to_be_bytes());
+        invalid_req.extend_from_slice(b"\r\n");
+
+        let write_res: std::io::Result<()> = client_stream.write_all(&invalid_req).await;
+        assert!(write_res.is_ok());
+
+        // Wait a bit, clean up task
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        server_run_task.abort();
+        let _ = std::fs::remove_file(&unix_path);
     }
 
     fn wrong_password_connect_request() -> Vec<u8> {

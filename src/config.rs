@@ -50,6 +50,10 @@ pub struct ServerConfig {
     #[arg(long)]
     pub key: Option<String>,
 
+    /// Unix Domain Socket path (optional)
+    #[arg(long)]
+    pub unix_path: Option<String>,
+
     /// Load configuration from TOML file
     #[arg(short = 'c', long)]
     pub config_file: Option<String>,
@@ -117,6 +121,9 @@ impl ServerConfig {
             if config.key.is_none() {
                 config.key = file_config.key;
             }
+            if config.unix_path.is_none() {
+                config.unix_path = file_config.unix_path;
+            }
             if config.log_level.is_none() {
                 config.log_level = file_config.log_level;
             }
@@ -138,6 +145,7 @@ impl ServerConfig {
         config.ws_host = normalize_optional_value(config.ws_host, "WebSocket host")?;
         config.ws_path = normalize_ws_path(config.ws_path)?;
         config.grpc_service_name = normalize_grpc_service_name(config.grpc_service_name)?;
+        config.unix_path = normalize_optional_value(config.unix_path, "Unix Domain Socket path")?;
 
         Ok(config)
     }
@@ -177,6 +185,9 @@ pub struct ServerSettings {
 
     #[serde(default = "default_enable_udp")]
     pub enable_udp: bool,
+
+    #[serde(default)]
+    pub unix_path: Option<String>,
 }
 
 const fn default_enable_udp() -> bool {
@@ -221,6 +232,7 @@ impl TomlConfig {
                 ws_path: Some("/ws".to_string()),
                 grpc_service_name: Some("GunService".to_string()),
                 enable_udp: true,
+                unix_path: None,
             },
             tls: Some(TlsSettings {
                 cert: "/path/to/cert.pem".to_string(),
@@ -253,6 +265,7 @@ impl TomlConfig {
             config_file: None,
             generate_config: None,
             log_level: self.log.map(|l| l.level),
+            unix_path: self.server.unix_path,
         }
     }
 }
