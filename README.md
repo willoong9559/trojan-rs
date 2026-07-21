@@ -54,6 +54,7 @@ cargo rustc --release -- -C target-cpu=native -C opt-level=3
 | `--password <PASSWORD>` | 服务器密码 | String | - | **是** |
 | `--cert <FILE>` | TLS 证书文件路径 (PEM 格式) | String | - | 否 |
 | `--key <FILE>` | TLS 私钥文件路径 (PEM 格式) | String | - | 否 |
+| `--unix-path <PATH>` | Unix Domain Socket 监听路径 (仅 Unix 平台) | String | - | 否 |
 | `--enable-ws` | 启用 WebSocket 模式 | Flag | 禁用 | 否 |
 | `--enable-grpc` | 启用 gRPC 模式 | Flag | 禁用 | 否 |
 | `--ws-host <HOST>` | WebSocket Host 头 | String | - | 否 |
@@ -89,6 +90,7 @@ enable_grpc = true
 ws_host = "cdn.example.com"
 ws_path = "/ws"
 grpc_service_name = "GunService"
+unix_path = "/var/run/trojan-rs.sock"
 
 [tls]
 cert = "/path/to/cert.pem"
