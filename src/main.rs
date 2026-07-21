@@ -51,7 +51,7 @@ impl Listener {
             Listener::Tcp(l) => {
                 let (stream, addr) = l.accept().await?;
                 let _ = stream.set_nodelay(true);
-                Ok((ConnectionStream::Tcp { stream }, addr.to_string()))
+                Ok((ConnectionStream::Tcp(stream), addr.to_string()))
             }
             #[cfg(unix)]
             Listener::Unix(l) => {
@@ -61,19 +61,16 @@ impl Listener {
                 } else {
                     "unix:[unnamed]".to_string()
                 };
-                Ok((ConnectionStream::Unix { stream }, peer_addr))
+                Ok((ConnectionStream::Unix(stream), peer_addr))
             }
         }
     }
 }
 
-pin_project_lite::pin_project! {
-    #[project = ConnectionStreamProj]
-    pub enum ConnectionStream {
-        Tcp { #[pin] stream: TcpStream },
-        #[cfg(unix)]
-        Unix { #[pin] stream: tokio::net::UnixStream },
-    }
+pub enum ConnectionStream {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(tokio::net::UnixStream),
 }
 
 impl AsyncRead for ConnectionStream {
@@ -82,10 +79,10 @@ impl AsyncRead for ConnectionStream {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        match self.project() {
-            ConnectionStreamProj::Tcp { stream } => stream.poll_read(cx, buf),
+        match self.get_mut() {
+            ConnectionStream::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
             #[cfg(unix)]
-            ConnectionStreamProj::Unix { stream } => stream.poll_read(cx, buf),
+            ConnectionStream::Unix(stream) => Pin::new(stream).poll_read(cx, buf),
         }
     }
 }
@@ -96,26 +93,26 @@ impl AsyncWrite for ConnectionStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        match self.project() {
-            ConnectionStreamProj::Tcp { stream } => stream.poll_write(cx, buf),
+        match self.get_mut() {
+            ConnectionStream::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
             #[cfg(unix)]
-            ConnectionStreamProj::Unix { stream } => stream.poll_write(cx, buf),
+            ConnectionStream::Unix(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match self.project() {
-            ConnectionStreamProj::Tcp { stream } => stream.poll_flush(cx),
+        match self.get_mut() {
+            ConnectionStream::Tcp(stream) => Pin::new(stream).poll_flush(cx),
             #[cfg(unix)]
-            ConnectionStreamProj::Unix { stream } => stream.poll_flush(cx),
+            ConnectionStream::Unix(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match self.project() {
-            ConnectionStreamProj::Tcp { stream } => stream.poll_shutdown(cx),
+        match self.get_mut() {
+            ConnectionStream::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
             #[cfg(unix)]
-            ConnectionStreamProj::Unix { stream } => stream.poll_shutdown(cx),
+            ConnectionStream::Unix(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
 }
@@ -686,6 +683,7 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         }
         #[cfg(not(unix))]
         {
+            let _ = path;
             return Err(anyhow!("Unix Domain Sockets are not supported on this platform"));
         }
     } else {
