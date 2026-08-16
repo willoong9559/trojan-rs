@@ -90,7 +90,7 @@ enable_grpc = true
 ws_host = "cdn.example.com"
 ws_path = "/ws"
 grpc_service_name = "GunService"
-unix_path = "/var/run/trojan-rs.sock"
+# unix_path = "/var/run/trojan-rs.sock"
 
 [tls]
 cert = "/path/to/cert.pem"
