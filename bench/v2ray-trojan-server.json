@@ -1,0 +1,18 @@
+{
+  "log": { "loglevel": "none" },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 18443,
+      "protocol": "trojan",
+      "settings": {
+        "clients": [
+          { "password": "trojan-rs-benchmark" }
+        ]
+      }
+    }
+  ],
+  "outbounds": [
+    { "protocol": "freedom" }
+  ]
+}

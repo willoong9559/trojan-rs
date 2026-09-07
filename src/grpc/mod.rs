@@ -10,5 +10,7 @@ pub(crate) const MAX_CONCURRENT_STREAMS: usize = 1024;
 pub(crate) const MAX_FRAME_SIZE: u32 = 64 * 1024;
 
 // gRPC 配置
-pub(crate) const GRPC_MAX_MESSAGE_SIZE: usize = 8 * 1024;
+// Keep messages below the 64 KiB HTTP/2 frame limit while amortizing gRPC
+// framing, allocation, and flow-control work across larger relay reads.
+pub(crate) const GRPC_MAX_MESSAGE_SIZE: usize = 32 * 1024;
 pub(crate) const MAX_SEND_QUEUE_BYTES: usize = 512 * 1024;

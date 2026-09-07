@@ -24,6 +24,7 @@ pub struct GrpcH2cTransport {
     pub(crate) pending_release_capacity: usize,
     pub(crate) send_queue: VecDeque<Bytes>,
     pub(crate) send_queue_bytes: usize,
+    pub(crate) pending_payload: BytesMut,
     pub(crate) current_frame: Option<Bytes>,
     pub(crate) current_frame_offset: usize,
     pub(crate) recv_closed: bool,
@@ -41,6 +42,7 @@ impl GrpcH2cTransport {
             pending_release_capacity: 0,
             send_queue: VecDeque::new(),
             send_queue_bytes: 0,
+            pending_payload: BytesMut::with_capacity(GRPC_MAX_MESSAGE_SIZE),
             current_frame: None,
             current_frame_offset: 0,
             recv_closed: false,
@@ -91,6 +93,17 @@ impl GrpcH2cTransport {
                 None => return Poll::Ready(Ok(())),
             }
         }
+    }
+
+    fn queue_pending_payload(&mut self) {
+        if self.pending_payload.is_empty() {
+            return;
+        }
+
+        let frame = encode_grpc_message(&self.pending_payload);
+        self.send_queue_bytes += frame.len();
+        self.send_queue.push_back(frame.freeze());
+        self.pending_payload.clear();
     }
 
     fn poll_send_current_frame(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -188,42 +201,6 @@ impl GrpcH2cTransport {
                 )))
             }
         }
-    }
-
-    fn grpc_varint_len(mut value: usize) -> usize {
-        let mut len = 1usize;
-        while value >= 0x80 {
-            value >>= 7;
-            len += 1;
-        }
-        len
-    }
-
-    // 帧结构: compression(1) + length(4) + protobuf tag(1) + varint(payload_len) + payload
-    fn grpc_frame_len(payload_len: usize) -> usize {
-        6 + Self::grpc_varint_len(payload_len) + payload_len
-    }
-
-    // 在给定队列预算内，返回可安全编码发送的最大 payload 字节数。
-    fn max_payload_for_queue_budget(payload_cap: usize, queue_budget: usize) -> usize {
-        if payload_cap == 0 {
-            return 0;
-        }
-        if Self::grpc_frame_len(1) > queue_budget {
-            return 0;
-        }
-
-        let mut lo = 1usize;
-        let mut hi = payload_cap;
-        while lo < hi {
-            let mid = (lo + hi + 1) / 2;
-            if Self::grpc_frame_len(mid) <= queue_budget {
-                lo = mid;
-            } else {
-                hi = mid - 1;
-            }
-        }
-        lo
     }
 }
 
@@ -405,17 +382,12 @@ impl AsyncWrite for GrpcH2cTransport {
             }
         }
 
-        let payload_cap = buf.len().min(GRPC_MAX_MESSAGE_SIZE);
-        let queue_budget = MAX_SEND_QUEUE_BYTES.saturating_sub(self.send_queue_bytes);
-        let to_write = Self::max_payload_for_queue_budget(payload_cap, queue_budget);
-        if to_write == 0 {
-            return Poll::Pending;
+        let remaining = GRPC_MAX_MESSAGE_SIZE - self.pending_payload.len();
+        let to_write = buf.len().min(remaining);
+        self.pending_payload.extend_from_slice(&buf[..to_write]);
+        if self.pending_payload.len() == GRPC_MAX_MESSAGE_SIZE {
+            self.queue_pending_payload();
         }
-
-        let frame = encode_grpc_message(&buf[..to_write]);
-        let frame_bytes = frame.len();
-        self.send_queue.push_back(frame.freeze());
-        self.send_queue_bytes += frame_bytes;
 
         match self.poll_send_queued(cx) {
             Poll::Ready(Ok(())) => {}
@@ -427,6 +399,7 @@ impl AsyncWrite for GrpcH2cTransport {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.queue_pending_payload();
         self.poll_send_queued(cx)
     }
 

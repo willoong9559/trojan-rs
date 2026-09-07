@@ -1,0 +1,24 @@
+{
+  "log": { "loglevel": "none" },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 10808,
+      "protocol": "socks",
+      "settings": { "auth": "noauth", "udp": false }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "trojan",
+      "settings": {
+        "servers": [{ "address": "127.0.0.1", "port": 18443, "password": "trojan-rs-benchmark" }]
+      },
+      "streamSettings": {
+        "network": "grpc",
+        "security": "none",
+        "grpcSettings": { "serviceName": "Benchmark" }
+      }
+    }
+  ]
+}

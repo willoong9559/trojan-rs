@@ -55,18 +55,25 @@ pub fn parse_grpc_header(buf: &[u8]) -> io::Result<Option<ParsedGrpcHeader>> {
 
 /// 编码 gRPC 消息帧
 pub fn encode_grpc_message(payload: &[u8]) -> BytesMut {
-    let mut proto_header = BytesMut::with_capacity(10);
-    proto_header.put_u8(0x0A);
-    encode_varint(payload.len() as u64, &mut proto_header);
-
-    let grpc_payload_len = (proto_header.len() + payload.len()) as u32;
-    let mut buf = BytesMut::with_capacity(5 + proto_header.len() + payload.len());
+    let varint_len = varint_len(payload.len() as u64);
+    let grpc_payload_len = (1 + varint_len + payload.len()) as u32;
+    let mut buf = BytesMut::with_capacity(6 + varint_len + payload.len());
     buf.put_u8(0x00);
     buf.put_u32(grpc_payload_len);
-    buf.extend_from_slice(&proto_header);
+    buf.put_u8(0x0A);
+    encode_varint(payload.len() as u64, &mut buf);
     buf.extend_from_slice(payload);
 
     buf
+}
+
+fn varint_len(mut value: u64) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
 }
 
 fn decode_varint_partial(data: &[u8]) -> io::Result<Option<(u64, usize)>> {
@@ -104,5 +111,20 @@ fn encode_varint(mut value: u64, buf: &mut BytesMut) {
         if value == 0 {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{encode_grpc_message, parse_grpc_header};
+
+    #[test]
+    fn encoded_message_has_a_matching_header_at_32_kib() {
+        let payload = vec![0xA5; 32 * 1024];
+        let frame = encode_grpc_message(&payload);
+        let header = parse_grpc_header(&frame).unwrap().unwrap();
+
+        assert_eq!(header.payload_len, payload.len());
+        assert_eq!(header.header_len + header.payload_len, frame.len());
     }
 }
