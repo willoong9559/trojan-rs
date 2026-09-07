@@ -1,14 +1,13 @@
 use anyhow::Result;
 use bytes::Bytes;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use futures_util::FutureExt;
 use h2::server;
 use http::{Response, StatusCode};
 use std::io;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::Notify;
 use tokio::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -17,49 +16,11 @@ use super::{MAX_CONCURRENT_STREAMS, MAX_FRAME_SIZE, MAX_SEND_QUEUE_BYTES};
 
 const GRPC_CONNECTION_IDLE_TIMEOUT_SECS: u64 = 600;
 
-struct ActiveStreamGuard {
-    active_count: Option<Arc<AtomicUsize>>,
-    all_streams_done: Arc<Notify>,
-}
-
-impl ActiveStreamGuard {
-    fn new(active_count: Arc<AtomicUsize>, all_streams_done: Arc<Notify>) -> Self {
-        Self {
-            active_count: Some(active_count),
-            all_streams_done,
-        }
-    }
-
-    fn finish(mut self) -> usize {
-        self.decrement().unwrap_or(0)
-    }
-
-    fn decrement(&mut self) -> Option<usize> {
-        let active_count = self.active_count.take()?;
-        let remaining_streams = active_count
-            .fetch_sub(1, Ordering::Relaxed)
-            .saturating_sub(1);
-
-        if remaining_streams == 0 {
-            self.all_streams_done.notify_one();
-        }
-
-        Some(remaining_streams)
-    }
-}
-
-impl Drop for ActiveStreamGuard {
-    fn drop(&mut self) {
-        let _ = self.decrement();
-    }
-}
-
 /// gRPC HTTP/2 连接管理器
 ///
 /// 管理整个 HTTP/2 连接，接受多个流，每个流对应一个独立的 Trojan 隧道
 pub struct GrpcH2cConnection<S> {
     h2_conn: server::Connection<S, Bytes>,
-    active_count: Arc<AtomicUsize>,
     expected_service_name: Option<String>,
 }
 
@@ -85,7 +46,6 @@ where
 
         Ok(Self {
             h2_conn,
-            active_count: Arc::new(AtomicUsize::new(0)),
             expected_service_name,
         })
     }
@@ -109,27 +69,48 @@ where
     {
         let handler = Arc::new(handler);
         let mut h2_conn = self.h2_conn;
-        let active_count = self.active_count;
         let expected_service_name = self.expected_service_name;
-        let all_streams_done = Arc::new(Notify::new());
+        // h2 stream handles synchronize through the connection's shared
+        // state. Keeping the driver and all stream futures in this task
+        // avoids cross-worker lock contention under many active streams.
+        let mut handlers = FuturesUnordered::new();
+        let mut connection_open = true;
 
         loop {
-            let accepted = if active_count.load(Ordering::Relaxed) == 0 {
+            if !connection_open && handlers.is_empty() {
+                break;
+            }
+
+            let accepted = if handlers.is_empty() {
                 tokio::select! {
-                    accepted = h2_conn.accept() => accepted,
+                    accepted = h2_conn.accept() => Some(accepted),
                     _ = tokio::time::sleep(idle_timeout) => {
                         info!(
                             idle_timeout_secs = idle_timeout.as_secs(),
                             "Closing idle gRPC connection"
                         );
-                        break;
+                        None
+                    }
+                }
+            } else if connection_open {
+                tokio::select! {
+                    accepted = h2_conn.accept() => Some(accepted),
+                    completed = handlers.next() => {
+                        if let Some(result) = completed {
+                            log_stream_result(result, handlers.len());
+                        }
+                        continue;
                     }
                 }
             } else {
-                tokio::select! {
-                    accepted = h2_conn.accept() => accepted,
-                    _ = all_streams_done.notified() => continue,
+                if let Some(result) = handlers.next().await {
+                    log_stream_result(result, handlers.len());
                 }
+                continue;
+            };
+
+            let Some(accepted) = accepted else {
+                break;
             };
 
             match accepted {
@@ -172,40 +153,9 @@ where
                     let transport = GrpcH2cTransport::new(request.into_body(), send_stream);
 
                     let handler_clone = Arc::clone(&handler);
-                    let active_count_clone = Arc::clone(&active_count);
-                    let all_streams_done_clone = Arc::clone(&all_streams_done);
-                    let active_streams = active_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                    let active_streams = handlers.len() + 1;
                     debug!(active_streams, path, "Accepted gRPC stream");
-                    tokio::spawn(async move {
-                        let active_stream =
-                            ActiveStreamGuard::new(active_count_clone, all_streams_done_clone);
-                        let result = AssertUnwindSafe(handler_clone(transport))
-                            .catch_unwind()
-                            .await;
-                        let remaining_streams = active_stream.finish();
-
-                        match result {
-                            Ok(Ok(())) => {
-                                debug!(
-                                    active_streams = remaining_streams,
-                                    "gRPC stream handler finished"
-                                );
-                            }
-                            Ok(Err(e)) => {
-                                warn!(
-                                    error = %e,
-                                    active_streams = remaining_streams,
-                                    "gRPC stream handler failed",
-                                );
-                            }
-                            Err(_) => {
-                                warn!(
-                                    active_streams = remaining_streams,
-                                    "gRPC stream handler panicked",
-                                );
-                            }
-                        }
-                    });
+                    handlers.push(AssertUnwindSafe(handler_clone(transport)).catch_unwind());
                 }
                 Some(Err(e)) => {
                     warn!(error = %e, "gRPC connection error");
@@ -213,16 +163,36 @@ where
                 }
                 None => {
                     debug!("gRPC connection closed normally");
-                    break;
+                    connection_open = false;
                 }
             }
         }
 
-        while active_count.load(Ordering::Relaxed) > 0 {
-            all_streams_done.notified().await;
-        }
-
         Ok(())
+    }
+}
+
+fn log_stream_result(result: std::thread::Result<Result<()>>, remaining_streams: usize) {
+    match result {
+        Ok(Ok(())) => {
+            debug!(
+                active_streams = remaining_streams,
+                "gRPC stream handler finished"
+            );
+        }
+        Ok(Err(e)) => {
+            warn!(
+                error = %e,
+                active_streams = remaining_streams,
+                "gRPC stream handler failed",
+            );
+        }
+        Err(_) => {
+            warn!(
+                active_streams = remaining_streams,
+                "gRPC stream handler panicked",
+            );
+        }
     }
 }
 
