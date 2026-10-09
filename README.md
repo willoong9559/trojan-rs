@@ -56,6 +56,7 @@ cargo rustc --release -- -C target-cpu=native -C opt-level=3
 | `--unix-path <PATH>` | Unix Domain Socket 监听路径 (仅 Unix 平台) | String | - | 否 |
 | `--enable-ws` | 启用 WebSocket 模式 | Flag | 禁用 | 否 |
 | `--enable-grpc` | 启用 gRPC 模式 | Flag | 禁用 | 否 |
+| `--enable-shadowsocks` | 启用 Shadowsocks `aes-256-gcm` 协议 | Flag | 禁用 | 否 |
 | `--ws-host <HOST>` | WebSocket Host 头 | String | - | 否 |
 | `--ws-path <PATH>` | WebSocket 请求路径 | String | - | 否 |
 | `--grpc-service-name <NAME>` | gRPC service name | String | - | 否 |
@@ -67,7 +68,7 @@ cargo rustc --release -- -C target-cpu=native -C opt-level=3
 
 > **注意**：
 > - 如果同时提供 `--cert` 和 `--key`，服务器将自动启用 TLS 模式
-> - `--enable-ws` 和 `--enable-grpc` 不能同时启用
+> - `--enable-ws` 和 `--enable-grpc` 不能同时启用；`--enable-shadowsocks` 选择协议，可与其中一种传输层组合
 > - 命令行参数会覆盖配置文件中的对应设置
 > - 配置了 `ws_host` 后，WebSocket 模式会校验 `Host` 头
 > - 配置了 `ws_path` 后，WebSocket 模式会校验请求路径
@@ -86,6 +87,7 @@ password = "password"
 enable_udp = true
 enable_ws = false
 enable_grpc = true
+enable_shadowsocks = false
 ws_host = "cdn.example.com"
 ws_path = "/ws"
 grpc_service_name = "GunService"
@@ -94,6 +96,24 @@ grpc_service_name = "GunService"
 [tls]
 cert = "/path/to/cert.pem"
 key = "/path/to/key.pem"
+
+[log]
+level = "info"
+```
+
+#### Shadowsocks 配置
+
+Shadowsocks 是与 Trojan 并列的协议层，当前支持 `aes-256-gcm` TCP AEAD，并使用同一个 `password` 字段。它可复用 TCP、TLS、WebSocket 或 gRPC 传输；`--enable-ws` 与 `--enable-grpc` 仍然只能选择一个。客户端也必须使用相同的传输封装；UDP 尚未实现。
+
+```toml
+[server]
+host = "0.0.0.0"
+port = "8388"
+password = "trojan-rs-password"
+enable_ws = false
+enable_grpc = false
+enable_shadowsocks = true
+enable_udp = false
 
 [log]
 level = "info"
