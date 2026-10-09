@@ -26,6 +26,10 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = false)]
     pub enable_grpc: bool,
 
+    /// Use the Shadowsocks AEAD protocol (aes-256-gcm)
+    #[arg(long, default_value_t = false)]
+    pub enable_shadowsocks: bool,
+
     /// Expected WebSocket Host header
     #[arg(long)]
     pub ws_host: Option<String>,
@@ -103,6 +107,9 @@ impl ServerConfig {
             if !config.enable_grpc {
                 config.enable_grpc = file_config.enable_grpc;
             }
+            if !config.enable_shadowsocks {
+                config.enable_shadowsocks = file_config.enable_shadowsocks;
+            }
             if config.ws_host.is_none() {
                 config.ws_host = file_config.ws_host;
             }
@@ -175,6 +182,9 @@ pub struct ServerSettings {
     pub enable_grpc: bool,
 
     #[serde(default)]
+    pub enable_shadowsocks: bool,
+
+    #[serde(default)]
     pub ws_host: Option<String>,
 
     #[serde(default)]
@@ -228,6 +238,7 @@ impl TomlConfig {
                 password: "your_password_here".to_string(),
                 enable_ws: true,
                 enable_grpc: false,
+                enable_shadowsocks: false,
                 ws_host: Some("cdn.example.com".to_string()),
                 ws_path: Some("/ws".to_string()),
                 grpc_service_name: Some("GunService".to_string()),
@@ -256,6 +267,7 @@ impl TomlConfig {
             password: self.server.password,
             enable_ws: self.server.enable_ws,
             enable_grpc: self.server.enable_grpc,
+            enable_shadowsocks: self.server.enable_shadowsocks,
             ws_host: self.server.ws_host,
             ws_path: self.server.ws_path,
             grpc_service_name: self.server.grpc_service_name,

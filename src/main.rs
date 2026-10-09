@@ -3,6 +3,7 @@ mod error;
 mod grpc;
 mod logger;
 mod relay;
+mod shadowsocks;
 mod socks5;
 mod tls;
 mod udp;
@@ -117,7 +118,7 @@ impl AsyncWrite for ConnectionStream {
     }
 }
 
-const CONNECTION_TIMEOUT_SECS: u64 = 300;
+pub(crate) const CONNECTION_TIMEOUT_SECS: u64 = 300;
 const TCP_CONNECT_TIMEOUT_SECS: u64 = 10;
 const HAPPY_EYEBALLS_STAGGER_MS: u64 = 250;
 const REQUEST_HEADER_TIMEOUT_SECS: u64 = 15;
@@ -129,9 +130,17 @@ pub enum TransportMode {
     Grpc,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum ProtocolMode {
+    Trojan,
+    Shadowsocks,
+}
+
 pub struct Server {
     pub listener: Listener,
     pub password: [u8; 56],
+    pub shadowsocks: Option<shadowsocks::Server>,
+    pub protocol_mode: ProtocolMode,
     pub transport_mode: TransportMode,
     pub ws_host: Option<String>,
     pub ws_path: Option<String>,
@@ -479,7 +488,7 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn connect_first_available(
+pub(crate) async fn connect_first_available(
     peer_addr: &str,
     addrs: &[SocketAddr],
 ) -> Result<(TcpStream, SocketAddr)> {
@@ -566,19 +575,26 @@ where
             } else {
                 grpc::GrpcH2cConnection::new(stream).await?
             };
+            let protocol_mode = server.protocol_mode;
+            let shadowsocks = server.shadowsocks.clone();
             let result = grpc_conn
                 .run(move |transport| {
                     let password = server.password;
                     let enable_udp = server.enable_udp;
                     let peer_addr = peer_addr.clone();
+                    let shadowsocks = shadowsocks.clone();
                     async move {
-                        process_grpc_stream(
-                            password,
-                            enable_udp,
-                            transport,
-                            peer_addr,
-                        )
-                        .await
+                        match protocol_mode {
+                            ProtocolMode::Trojan => {
+                                process_grpc_stream(password, enable_udp, transport, peer_addr)
+                                    .await
+                            }
+                            ProtocolMode::Shadowsocks => shadowsocks
+                                .as_ref()
+                                .ok_or_else(|| anyhow!("Shadowsocks server is not configured"))?
+                                .handle_connection(transport, peer_addr)
+                                .await,
+                        }
                     }
                 })
                 .await;
@@ -601,9 +617,24 @@ where
                 server.ws_path.clone(),
             )
             .await?;
-            handle_connection(server, ws_transport, peer_addr).await
+            dispatch_protocol(server, ws_transport, peer_addr).await
         }
-        TransportMode::Tcp => handle_connection(server, stream, peer_addr).await,
+        TransportMode::Tcp => dispatch_protocol(server, stream, peer_addr).await,
+    }
+}
+
+async fn dispatch_protocol<S>(server: Arc<Server>, stream: S, peer_addr: String) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match server.protocol_mode {
+        ProtocolMode::Trojan => handle_connection(server, stream, peer_addr).await,
+        ProtocolMode::Shadowsocks => server
+            .shadowsocks
+            .as_ref()
+            .ok_or_else(|| anyhow!("Shadowsocks server is not configured"))?
+            .handle_connection(stream, peer_addr)
+            .await,
     }
 }
 
@@ -616,9 +647,13 @@ impl Server {
             TransportMode::WebSocket => "WebSocket",
             TransportMode::Grpc => "gRPC",
         };
+        let protocol = match server.protocol_mode {
+            ProtocolMode::Trojan => "Trojan",
+            ProtocolMode::Shadowsocks => "Shadowsocks",
+        };
         let tls_enabled = server.tls_acceptor.is_some();
 
-        log::info!(address = %addr, mode = mode, tls = tls_enabled, "Server started");
+        log::info!(address = %addr, protocol = protocol, transport = mode, tls = tls_enabled, "Server started");
 
         loop {
             match server.listener.accept().await {
@@ -693,8 +728,17 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
     };
 
     let password = utils::password_to_hex(&config.password);
+    let shadowsocks = config
+        .enable_shadowsocks
+        .then(|| shadowsocks::Server::new(&config.password));
     let enable_ws = config.enable_ws;
     let enable_grpc = config.enable_grpc;
+    let enable_shadowsocks = config.enable_shadowsocks;
+    let protocol_mode = if enable_shadowsocks {
+        ProtocolMode::Shadowsocks
+    } else {
+        ProtocolMode::Trojan
+    };
     let transport_mode = if enable_grpc {
         TransportMode::Grpc
     } else if enable_ws {
@@ -708,6 +752,8 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
     Ok(Server {
         listener,
         password,
+        shadowsocks,
+        protocol_mode,
         transport_mode,
         ws_host: config.ws_host,
         ws_path: config.ws_path,
@@ -735,6 +781,34 @@ mod tests {
     use h2::client;
     use http::Request;
     use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn shadowsocks_can_use_websocket_transport() {
+        let config = config::ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: "0".to_string(),
+            password: "test_password".to_string(),
+            enable_ws: true,
+            enable_grpc: false,
+            enable_shadowsocks: true,
+            ws_host: None,
+            ws_path: None,
+            grpc_service_name: None,
+            enable_udp: false,
+            cert: None,
+            key: None,
+            config_file: None,
+            generate_config: None,
+            log_level: None,
+            unix_path: None,
+        };
+
+        let server = build_server(config)
+            .await
+            .expect("Shadowsocks WebSocket server should build");
+        assert!(matches!(server.protocol_mode, ProtocolMode::Shadowsocks));
+        assert!(matches!(server.transport_mode, TransportMode::WebSocket));
+    }
 
     #[tokio::test]
     async fn grpc_password_failure_sends_ok_trailers() {
@@ -815,6 +889,7 @@ mod tests {
             password: "test_password".to_string(),
             enable_ws: false,
             enable_grpc: false,
+            enable_shadowsocks: false,
             ws_host: None,
             ws_path: None,
             grpc_service_name: None,

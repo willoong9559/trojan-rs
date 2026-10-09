@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1.49", features = ["full", "signal"] }
-tokio-tungstenite = "0.28"
+tokio-tungstenite = "0.30"
 futures-util = "0.3"
 sha2 = "0.10"
 anyhow = "1.0"
@@ -28,6 +28,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 pin-project-lite = "0.2"
 socket2 = "0.6"
+aes-gcm = "0.10"
+getrandom = "0.3"
+hkdf = "0.12"
+md-5 = "0.10"
+sha1 = "0.10"
 
 [profile.release]
 opt-level = 3
