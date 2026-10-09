@@ -1,10 +1,13 @@
 use bytes::{Buf, Bytes, BytesMut};
 use h2::{Reason, RecvStream, SendStream};
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::time::Sleep;
 use tracing::{debug, warn};
 
 use super::codec::{encode_grpc_message, parse_grpc_header};
@@ -30,10 +33,16 @@ pub struct GrpcH2cTransport {
     pub(crate) recv_closed: bool,
     pub(crate) send_closed: bool,
     pub(crate) trailers_sent: bool,
+    pub(crate) send_capacity_timeout: Duration,
+    pub(crate) send_capacity_deadline: Option<Pin<Box<Sleep>>>,
 }
 
 impl GrpcH2cTransport {
-    pub(crate) fn new(recv_stream: RecvStream, send_stream: SendStream<Bytes>) -> Self {
+    pub(crate) fn with_flow_control_timeout(
+        recv_stream: RecvStream,
+        send_stream: SendStream<Bytes>,
+        send_capacity_timeout: Duration,
+    ) -> Self {
         Self {
             recv_stream,
             send_stream,
@@ -48,7 +57,39 @@ impl GrpcH2cTransport {
             recv_closed: false,
             send_closed: false,
             trailers_sent: false,
+            send_capacity_timeout,
+            send_capacity_deadline: None,
         }
+    }
+
+    fn clear_send_capacity_deadline(&mut self) {
+        self.send_capacity_deadline = None;
+    }
+
+    fn send_capacity_timed_out(&mut self, cx: &mut Context<'_>) -> bool {
+        let deadline = self
+            .send_capacity_deadline
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(self.send_capacity_timeout)));
+        deadline.as_mut().poll(cx).is_ready()
+    }
+
+    fn abort_flow_control_wait(&mut self) -> io::Error {
+        self.send_closed = true;
+        self.current_frame = None;
+        self.current_frame_offset = 0;
+        self.send_queue.clear();
+        self.send_queue_bytes = 0;
+        self.pending_payload.clear();
+        self.send_capacity_deadline = None;
+        self.send_stream.send_reset(Reason::CANCEL);
+        warn!(
+            timeout_secs = self.send_capacity_timeout.as_secs(),
+            "Closing gRPC stream after flow-control capacity timeout"
+        );
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "gRPC stream flow-control capacity timed out",
+        )
     }
 
     fn reset_read_buffer_if_needed(&mut self) {
@@ -107,12 +148,12 @@ impl GrpcH2cTransport {
     }
 
     fn poll_send_current_frame(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let frame = match &self.current_frame {
-            Some(f) => f,
+        let frame_len = match &self.current_frame {
+            Some(frame) => frame.len(),
             None => return Poll::Ready(Ok(())),
         };
 
-        if self.current_frame_offset > frame.len() {
+        if self.current_frame_offset > frame_len {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid send state: frame offset exceeds frame length",
@@ -120,17 +161,20 @@ impl GrpcH2cTransport {
         }
 
         loop {
-            let remaining = frame.len() - self.current_frame_offset;
+            let remaining = frame_len - self.current_frame_offset;
             if remaining == 0 {
                 return Poll::Ready(Ok(()));
             }
 
             let capacity = self.send_stream.capacity();
             if capacity == 0 {
+                if self.send_capacity_timed_out(cx) {
+                    return Poll::Ready(Err(self.abort_flow_control_wait()));
+                }
                 debug!(
                     queued_bytes = self.send_queue_bytes,
                     queued_frames = self.send_queue.len(),
-                    frame_len = frame.len(),
+                    frame_len,
                     frame_offset = self.current_frame_offset,
                     "Waiting for gRPC stream flow-control capacity",
                 );
@@ -156,15 +200,20 @@ impl GrpcH2cTransport {
                 }
             }
 
+            self.clear_send_capacity_deadline();
+
             let send_size = remaining.min(capacity);
-            let chunk =
-                frame.slice(self.current_frame_offset..self.current_frame_offset + send_size);
+            let chunk = self
+                .current_frame
+                .as_ref()
+                .expect("current frame remains set while sending")
+                .slice(self.current_frame_offset..self.current_frame_offset + send_size);
 
             match self.send_stream.send_data(chunk, false) {
                 Ok(()) => {
                     self.current_frame_offset += send_size;
                     self.send_queue_bytes = self.send_queue_bytes.saturating_sub(send_size);
-                    if self.current_frame_offset >= frame.len() {
+                    if self.current_frame_offset >= frame_len {
                         return Poll::Ready(Ok(()));
                     }
                 }
@@ -180,6 +229,9 @@ impl GrpcH2cTransport {
     }
 
     fn poll_wait_send_capacity(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.send_capacity_timed_out(cx) {
+            return Poll::Ready(Err(self.abort_flow_control_wait()));
+        }
         debug!(
             queued_bytes = self.send_queue_bytes,
             queued_frames = self.send_queue.len(),
@@ -187,7 +239,10 @@ impl GrpcH2cTransport {
         );
         self.send_stream.reserve_capacity(MAX_FRAME_SIZE as usize);
         match self.send_stream.poll_capacity(cx) {
-            Poll::Ready(Some(Ok(cap))) if cap > 0 => Poll::Ready(Ok(())),
+            Poll::Ready(Some(Ok(cap))) if cap > 0 => {
+                self.clear_send_capacity_deadline();
+                Poll::Ready(Ok(()))
+            }
             Poll::Ready(Some(Ok(_))) | Poll::Pending => Poll::Pending,
             Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::Other,

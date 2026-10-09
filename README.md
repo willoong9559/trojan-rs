@@ -73,6 +73,7 @@ cargo rustc --release -- -C target-cpu=native -C opt-level=3
 > - 配置了 `ws_path` 后，WebSocket 模式会校验请求路径
 > - 配置了 `grpc_service_name` 后，gRPC 模式会严格校验 service name
 > - TLS 证书和私钥必须为 PEM 格式（rustls 仅支持 PEM 格式）
+> - gRPC 服务端每 30 秒发送一次 HTTP/2 PING；10 秒未收到 ACK 会关闭连接。单个 stream 的发送窗口连续 30 秒未恢复时会被重置，客户端应在连接或 stream 错误后重建隧道并持续读取响应数据以更新 HTTP/2 流控窗口
 
 #### 配置文件示例
 
