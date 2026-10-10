@@ -2,20 +2,18 @@ use anyhow::Result;
 use bytes::Bytes;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use futures_util::FutureExt;
-use h2::{server, Ping, Reason};
+use h2::server;
 use http::{Response, StatusCode};
 use std::io;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::oneshot;
-use tokio::time::{timeout, Duration};
+use tokio::time::Duration;
 use tracing::{debug, info, warn};
 
 use super::transport::GrpcH2cTransport;
 use super::{
-    GRPC_FLOW_CONTROL_TIMEOUT_SECS, GRPC_KEEPALIVE_INTERVAL_SECS, GRPC_KEEPALIVE_TIMEOUT_SECS,
-    MAX_CONCURRENT_STREAMS, MAX_FRAME_SIZE, MAX_SEND_QUEUE_BYTES,
+    GRPC_FLOW_CONTROL_TIMEOUT_SECS, MAX_CONCURRENT_STREAMS, MAX_FRAME_SIZE, MAX_SEND_QUEUE_BYTES,
 };
 
 const GRPC_CONNECTION_IDLE_TIMEOUT_SECS: u64 = 600;
@@ -74,8 +72,6 @@ where
         self.run_with_timeouts(
             handler,
             idle_timeout,
-            Duration::from_secs(GRPC_KEEPALIVE_INTERVAL_SECS),
-            Duration::from_secs(GRPC_KEEPALIVE_TIMEOUT_SECS),
             Duration::from_secs(GRPC_FLOW_CONTROL_TIMEOUT_SECS),
         )
         .await
@@ -85,8 +81,6 @@ where
         self,
         handler: F,
         idle_timeout: Duration,
-        keepalive_interval: Duration,
-        keepalive_timeout: Duration,
         flow_control_timeout: Duration,
     ) -> Result<()>
     where
@@ -96,29 +90,7 @@ where
         let handler = Arc::new(handler);
         let mut h2_conn = self.h2_conn;
         let expected_service_name = self.expected_service_name;
-        let mut ping_pong = h2_conn
-            .ping_pong()
-            .expect("a new HTTP/2 connection provides one PingPong handle");
-        let (heartbeat_tx, mut heartbeat_rx) = oneshot::channel();
-        let heartbeat_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(keepalive_interval);
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                let result = timeout(keepalive_timeout, ping_pong.ping(Ping::opaque())).await;
-                if let Err(error) = result {
-                    let _ = heartbeat_tx.send(format!(
-                        "gRPC keepalive ACK timed out after {} seconds: {error}",
-                        keepalive_timeout.as_secs()
-                    ));
-                    return;
-                }
-                if let Ok(Err(error)) = result {
-                    let _ = heartbeat_tx.send(format!("gRPC keepalive failed: {error}"));
-                    return;
-                }
-            }
-        });
+
         // h2 stream handles synchronize through the connection's shared
         // state. Keeping the driver and all stream futures in this task
         // avoids cross-worker lock contention under many active streams.
@@ -133,12 +105,6 @@ where
             let accepted = if handlers.is_empty() {
                 tokio::select! {
                     accepted = h2_conn.accept() => Some(accepted),
-                    heartbeat = &mut heartbeat_rx => {
-                        let message = heartbeat.unwrap_or_else(|_| "gRPC keepalive task stopped".to_string());
-                        h2_conn.abrupt_shutdown(Reason::CANCEL);
-                        heartbeat_task.abort();
-                        return Err(anyhow::anyhow!(message));
-                    }
                     _ = tokio::time::sleep(idle_timeout) => {
                         info!(
                             idle_timeout_secs = idle_timeout.as_secs(),
@@ -150,12 +116,6 @@ where
             } else if connection_open {
                 tokio::select! {
                     accepted = h2_conn.accept() => Some(accepted),
-                    heartbeat = &mut heartbeat_rx => {
-                        let message = heartbeat.unwrap_or_else(|_| "gRPC keepalive task stopped".to_string());
-                        h2_conn.abrupt_shutdown(Reason::CANCEL);
-                        heartbeat_task.abort();
-                        return Err(anyhow::anyhow!(message));
-                    }
                     completed = handlers.next() => {
                         if let Some(result) = completed {
                             log_stream_result(result, handlers.len());
@@ -224,7 +184,6 @@ where
                 }
                 Some(Err(e)) => {
                     warn!(error = %e, "gRPC connection error");
-                    heartbeat_task.abort();
                     return Err(anyhow::anyhow!("gRPC connection error: {}", e));
                 }
                 None => {
@@ -234,7 +193,6 @@ where
             }
         }
 
-        heartbeat_task.abort();
         Ok(())
     }
 }
@@ -543,8 +501,6 @@ mod tests {
                     }
                 },
                 Duration::from_secs(5),
-                Duration::from_secs(5),
-                Duration::from_secs(1),
                 Duration::from_millis(50),
             )
             .await
@@ -581,37 +537,5 @@ mod tests {
 
         server_task.abort();
         client_conn_task.abort();
-    }
-
-    #[tokio::test]
-    async fn keepalive_timeout_closes_a_nonresponsive_connection() {
-        let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
-        let server_task = tokio::spawn(async move {
-            let conn = GrpcH2cConnection::new(server_io)
-                .await
-                .expect("server handshake should succeed");
-            conn.run_with_timeouts(
-                |_| async { Ok(()) },
-                Duration::from_secs(5),
-                Duration::from_millis(20),
-                Duration::from_millis(20),
-                Duration::from_secs(1),
-            )
-            .await
-        });
-
-        let (_send_request, _client_connection) = client::Builder::new()
-            .handshake::<_, Bytes>(client_io)
-            .await
-            .expect("client handshake should succeed");
-
-        let result = timeout(Duration::from_secs(1), server_task)
-            .await
-            .expect("keepalive timeout did not fire")
-            .expect("server task should not panic");
-        assert!(
-            result.is_err(),
-            "nonresponsive peer should fail the keepalive check"
-        );
     }
 }
