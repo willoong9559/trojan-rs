@@ -633,8 +633,13 @@ async fn connect_first_available(
 }
 
 fn is_benign_copy_error(error: &std::io::Error) -> bool {
-    matches!(error.kind(), std::io::ErrorKind::BrokenPipe)
-        && error.to_string() == "gRPC stream closed"
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::UnexpectedEof
+    )
 }
 
 // 连接检测与分发
@@ -897,6 +902,23 @@ mod tests {
         assert!(limits.try_acquire_tls_handshake().is_none());
         drop(handshake);
         assert!(limits.try_acquire_tls_handshake().is_some());
+    }
+
+    #[test]
+    fn peer_disconnect_errors_are_not_reported_as_relay_failures() {
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(is_benign_copy_error(&std::io::Error::from(kind)));
+        }
+
+        assert!(!is_benign_copy_error(&std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "gRPC stream flow-control capacity timed out",
+        )));
     }
 
     #[tokio::test]

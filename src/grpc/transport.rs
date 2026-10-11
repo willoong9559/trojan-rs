@@ -188,10 +188,7 @@ impl GrpcH2cTransport {
                     Poll::Ready(Some(Ok(_))) | Poll::Pending => return Poll::Pending,
                     Poll::Ready(Some(Err(e))) => {
                         self.send_closed = true;
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("gRPC capacity error: {}", e),
-                        )));
+                        return Poll::Ready(Err(grpc_stream_error(e, "gRPC capacity error")));
                     }
                     Poll::Ready(None) => {
                         self.send_closed = true;
@@ -222,10 +219,7 @@ impl GrpcH2cTransport {
                 }
                 Err(e) => {
                     self.send_closed = true;
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        format!("gRPC send error: {}", e),
-                    )));
+                    return Poll::Ready(Err(grpc_stream_error(e, "gRPC send error")));
                 }
             }
         }
@@ -247,10 +241,9 @@ impl GrpcH2cTransport {
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Some(Ok(_))) | Poll::Pending => Poll::Pending,
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("gRPC capacity error: {}", e),
-            ))),
+            Poll::Ready(Some(Err(e))) => {
+                Poll::Ready(Err(grpc_stream_error(e, "gRPC capacity error")))
+            }
             Poll::Ready(None) => {
                 self.send_closed = true;
                 Poll::Ready(Err(io::Error::new(
@@ -263,10 +256,26 @@ impl GrpcH2cTransport {
 }
 
 fn is_normal_stream_close(error: &h2::Error) -> bool {
-    if let Some(reason) = error.reason() {
-        matches!(reason, Reason::NO_ERROR | Reason::CANCEL)
+    if matches!(error.reason(), Some(Reason::NO_ERROR | Reason::CANCEL)) {
+        return true;
+    }
+
+    matches!(
+        error.get_io().map(io::Error::kind),
+        Some(
+            io::ErrorKind::BrokenPipe
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::UnexpectedEof
+        )
+    )
+}
+
+fn grpc_stream_error(error: h2::Error, context: &str) -> io::Error {
+    if is_normal_stream_close(&error) {
+        io::Error::new(io::ErrorKind::BrokenPipe, "gRPC stream closed")
     } else {
-        false
+        io::Error::new(io::ErrorKind::Other, format!("{context}: {error}"))
     }
 }
 
@@ -385,10 +394,7 @@ impl GrpcH2cTransport {
                 if is_normal_stream_close(&e) {
                     Poll::Ready(Ok(false))
                 } else {
-                    Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("gRPC recv error: {}", e),
-                    )))
+                    Poll::Ready(Err(grpc_stream_error(e, "gRPC recv error")))
                 }
             }
             Poll::Ready(None) => {
