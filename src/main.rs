@@ -13,13 +13,15 @@ use logger::log;
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 
 const BUF_SIZE: usize = 32 * 1024;
@@ -46,12 +48,16 @@ impl Listener {
         }
     }
 
-    pub async fn accept(&self) -> Result<(ConnectionStream, String)> {
+    pub async fn accept(&self) -> Result<(ConnectionStream, String, Option<IpAddr>)> {
         match self {
             Listener::Tcp(l) => {
                 let (stream, addr) = l.accept().await?;
                 let _ = stream.set_nodelay(true);
-                Ok((ConnectionStream::Tcp(stream), addr.to_string()))
+                Ok((
+                    ConnectionStream::Tcp(stream),
+                    addr.to_string(),
+                    Some(addr.ip()),
+                ))
             }
             #[cfg(unix)]
             Listener::Unix(l) => {
@@ -61,7 +67,7 @@ impl Listener {
                 } else {
                     "unix:[unnamed]".to_string()
                 };
-                Ok((ConnectionStream::Unix(stream), peer_addr))
+                Ok((ConnectionStream::Unix(stream), peer_addr, None))
             }
         }
     }
@@ -136,8 +142,99 @@ pub struct Server {
     pub ws_host: Option<String>,
     pub ws_path: Option<String>,
     pub grpc_service_name: Option<String>,
+    pub grpc_limits: grpc::GrpcLimits,
+    connection_limits: ConnectionLimits,
     pub enable_udp: bool,
     pub tls_acceptor: Option<TlsAcceptor>,
+}
+
+struct ConnectionLimits {
+    active_connections: Arc<Semaphore>,
+    tls_handshakes: Arc<Semaphore>,
+    per_ip_limit: usize,
+    per_ip_connections: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+struct ConnectionPermit {
+    _total: OwnedSemaphorePermit,
+    _ip: Option<IpConnectionPermit>,
+}
+
+struct IpConnectionPermit {
+    ip: IpAddr,
+    connections: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+#[derive(Debug)]
+enum ConnectionLimitError {
+    Total,
+    PerIp(IpAddr),
+}
+
+impl ConnectionLimits {
+    fn new(max_connections: usize, max_tls_handshakes: usize, per_ip_limit: usize) -> Self {
+        Self {
+            active_connections: Arc::new(Semaphore::new(max_connections)),
+            tls_handshakes: Arc::new(Semaphore::new(max_tls_handshakes)),
+            per_ip_limit,
+            per_ip_connections: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn try_acquire_connection(
+        &self,
+        peer_ip: Option<IpAddr>,
+    ) -> std::result::Result<ConnectionPermit, ConnectionLimitError> {
+        let total = self
+            .active_connections
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ConnectionLimitError::Total)?;
+
+        let ip = match peer_ip {
+            Some(ip) => {
+                let mut connections = self
+                    .per_ip_connections
+                    .lock()
+                    .expect("per-IP connection counter lock poisoned");
+                let count = connections.entry(ip).or_default();
+                if *count >= self.per_ip_limit {
+                    return Err(ConnectionLimitError::PerIp(ip));
+                }
+                *count += 1;
+                Some(IpConnectionPermit {
+                    ip,
+                    connections: Arc::clone(&self.per_ip_connections),
+                })
+            }
+            None => None,
+        };
+
+        Ok(ConnectionPermit {
+            _total: total,
+            _ip: ip,
+        })
+    }
+
+    fn try_acquire_tls_handshake(&self) -> Option<OwnedSemaphorePermit> {
+        self.tls_handshakes.clone().try_acquire_owned().ok()
+    }
+}
+
+impl Drop for IpConnectionPermit {
+    fn drop(&mut self) {
+        let mut connections = self
+            .connections
+            .lock()
+            .expect("per-IP connection counter lock poisoned");
+        let count = connections
+            .get_mut(&self.ip)
+            .expect("per-IP connection counter missing");
+        *count -= 1;
+        if *count == 0 {
+            connections.remove(&self.ip);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -297,13 +394,7 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 log::warn!(peer = %peer_addr, "UDP associate request rejected: UDP support is disabled");
                 return Err(anyhow!("UDP support is disabled"));
             }
-            udp::handle_udp_associate(
-                stream,
-                request.addr,
-                request.payload,
-                peer_addr,
-            )
-            .await
+            udp::handle_udp_associate(stream, request.addr, request.payload, peer_addr).await
         }
     }
 }
@@ -351,13 +442,7 @@ where
                 )
                 .await;
             }
-            udp::handle_udp_associate(
-                stream,
-                request.addr,
-                request.payload,
-                peer_addr,
-            )
-            .await
+            udp::handle_udp_associate(stream, request.addr, request.payload, peer_addr).await
         }
     }
 }
@@ -561,27 +646,23 @@ where
         TransportMode::Grpc => {
             let peer_addr_for_log = peer_addr.clone();
             log::info!(peer = %peer_addr_for_log, "gRPC connection established, waiting for streams");
-            let grpc_conn = if let Some(service_name) = server.grpc_service_name.clone() {
-                grpc::GrpcH2cConnection::with_service_name(stream, Some(service_name)).await?
-            } else {
-                grpc::GrpcH2cConnection::new(stream).await?
-            };
-            let result = grpc_conn
-                .run(move |transport| {
-                    let password = server.password;
-                    let enable_udp = server.enable_udp;
-                    let peer_addr = peer_addr.clone();
-                    async move {
-                        process_grpc_stream(
-                            password,
-                            enable_udp,
-                            transport,
-                            peer_addr,
-                        )
-                        .await
-                    }
-                })
-                .await;
+            let grpc_conn = grpc::GrpcH2cConnection::with_service_name_and_limits(
+                stream,
+                server.grpc_service_name.clone(),
+                server.grpc_limits,
+            )
+            .await?;
+            let result =
+                grpc_conn
+                    .run(move |transport| {
+                        let password = server.password;
+                        let enable_udp = server.enable_udp;
+                        let peer_addr = peer_addr.clone();
+                        async move {
+                            process_grpc_stream(password, enable_udp, transport, peer_addr).await
+                        }
+                    })
+                    .await;
 
             match &result {
                 Ok(()) => {
@@ -622,35 +703,68 @@ impl Server {
 
         loop {
             match server.listener.accept().await {
-                Ok((stream, peer_addr)) => {
+                Ok((stream, peer_addr, peer_ip)) => {
+                    let connection_permit = match server
+                        .connection_limits
+                        .try_acquire_connection(peer_ip)
+                    {
+                        Ok(permit) => permit,
+                        Err(ConnectionLimitError::Total) => {
+                            log::warn!(peer = %peer_addr, "Connection rejected: total connection limit reached");
+                            continue;
+                        }
+                        Err(ConnectionLimitError::PerIp(ip)) => {
+                            log::warn!(peer = %peer_addr, ip = %ip, "Connection rejected: per-IP connection limit reached");
+                            continue;
+                        }
+                    };
+
                     log::connection(&peer_addr, "new");
                     let server_clone = Arc::clone(&server);
 
                     tokio::spawn(async move {
-                        let result = async {
-                            if let Some(ref tls_acceptor) = server_clone.tls_acceptor {
-                                const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 30; // TLS握手超时30秒
-                                match tokio::time::timeout(
+                        let _connection_permit = connection_permit;
+                        let result = if let Some(ref tls_acceptor) = server_clone.tls_acceptor {
+                            const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 30;
+                            let handshake_result = {
+                                let _handshake_permit = match server_clone
+                                    .connection_limits
+                                    .try_acquire_tls_handshake()
+                                {
+                                    Some(permit) => permit,
+                                    None => {
+                                        log::warn!(peer = %peer_addr, "Connection rejected: TLS handshake limit reached");
+                                        return;
+                                    }
+                                };
+                                tokio::time::timeout(
                                     tokio::time::Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS),
-                                    tls_acceptor.accept(stream)
-                                ).await {
-                                    Ok(Ok(tls_stream)) => {
-                                        log::info!(peer = %peer_addr, "TLS handshake successful");
-                                        accept_connection(server_clone, tls_stream, peer_addr.clone()).await
-                                    }
-                                    Ok(Err(e)) => {
-                                        log::error!(peer = %peer_addr, error = %e, "TLS handshake failed");
-                                        Err(anyhow!("TLS handshake failed: {}", e))
-                                    }
-                                    Err(_) => {
-                                        log::warn!(peer = %peer_addr, timeout_secs = TLS_HANDSHAKE_TIMEOUT_SECS, "TLS handshake timeout");
-                                        Err(anyhow!("TLS handshake timeout after {} seconds", TLS_HANDSHAKE_TIMEOUT_SECS))
-                                    }
+                                    tls_acceptor.accept(stream),
+                                )
+                                .await
+                            };
+
+                            match handshake_result {
+                                Ok(Ok(tls_stream)) => {
+                                    log::info!(peer = %peer_addr, "TLS handshake successful");
+                                    accept_connection(server_clone, tls_stream, peer_addr.clone())
+                                        .await
                                 }
-                            } else {
-                                accept_connection(server_clone, stream, peer_addr.clone()).await
+                                Ok(Err(e)) => {
+                                    log::error!(peer = %peer_addr, error = %e, "TLS handshake failed");
+                                    Err(anyhow!("TLS handshake failed: {}", e))
+                                }
+                                Err(_) => {
+                                    log::warn!(peer = %peer_addr, timeout_secs = TLS_HANDSHAKE_TIMEOUT_SECS, "TLS handshake timeout");
+                                    Err(anyhow!(
+                                        "TLS handshake timeout after {} seconds",
+                                        TLS_HANDSHAKE_TIMEOUT_SECS
+                                    ))
+                                }
                             }
-                        }.await;
+                        } else {
+                            accept_connection(server_clone, stream, peer_addr.clone()).await
+                        };
 
                         if let Err(e) = result {
                             log::error!(peer = %peer_addr, error = %e, "Connection error");
@@ -684,7 +798,9 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         #[cfg(not(unix))]
         {
             let _ = path;
-            return Err(anyhow!("Unix Domain Sockets are not supported on this platform"));
+            return Err(anyhow!(
+                "Unix Domain Sockets are not supported on this platform"
+            ));
         }
     } else {
         let addr: String = format!("{}:{}", config.host, config.port);
@@ -693,6 +809,13 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
     };
 
     let password = utils::password_to_hex(&config.password);
+    let grpc_limits = config.grpc_limits()?;
+    config.validate_connection_limits()?;
+    let connection_limits = ConnectionLimits::new(
+        config.max_connections,
+        config.max_tls_handshakes,
+        config.max_connections_per_ip,
+    );
     let enable_ws = config.enable_ws;
     let enable_grpc = config.enable_grpc;
     let transport_mode = if enable_grpc {
@@ -712,6 +835,8 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         ws_host: config.ws_host,
         ws_path: config.ws_path,
         grpc_service_name: config.grpc_service_name,
+        grpc_limits,
+        connection_limits,
         enable_udp: config.enable_udp,
         tls_acceptor,
     })
@@ -734,7 +859,45 @@ mod tests {
     use bytes::{BufMut, BytesMut};
     use h2::client;
     use http::Request;
+    use std::net::{IpAddr, Ipv4Addr};
     use tokio::time::{timeout, Duration};
+
+    #[test]
+    fn connection_limits_enforce_total_per_ip_and_tls_handshake_limits() {
+        let limits = ConnectionLimits::new(2, 1, 1);
+        let first_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let second_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+
+        let first_connection = limits
+            .try_acquire_connection(Some(first_ip))
+            .expect("first connection should be accepted");
+        assert!(matches!(
+            limits.try_acquire_connection(Some(first_ip)),
+            Err(ConnectionLimitError::PerIp(ip)) if ip == first_ip
+        ));
+
+        let second_connection = limits
+            .try_acquire_connection(Some(second_ip))
+            .expect("second IP should be accepted");
+        assert!(matches!(
+            limits.try_acquire_connection(None),
+            Err(ConnectionLimitError::Total)
+        ));
+
+        drop(first_connection);
+        let replacement_connection = limits
+            .try_acquire_connection(Some(first_ip))
+            .expect("per-IP slot should be released when a connection closes");
+        drop(replacement_connection);
+        drop(second_connection);
+
+        let handshake = limits
+            .try_acquire_tls_handshake()
+            .expect("first TLS handshake should be accepted");
+        assert!(limits.try_acquire_tls_handshake().is_none());
+        drop(handshake);
+        assert!(limits.try_acquire_tls_handshake().is_some());
+    }
 
     #[tokio::test]
     async fn grpc_password_failure_sends_ok_trailers() {
@@ -746,16 +909,9 @@ mod tests {
                 let conn = grpc::GrpcH2cConnection::new(server_io)
                     .await
                     .expect("server handshake should succeed");
-                conn.run(move |transport| {
-                    async move {
-                        process_grpc_stream(
-                            password,
-                            false,
-                            transport,
-                            "127.0.0.1:12345".to_string(),
-                        )
+                conn.run(move |transport| async move {
+                    process_grpc_stream(password, false, transport, "127.0.0.1:12345".to_string())
                         .await
-                    }
                 })
                 .await
             }
@@ -818,6 +974,13 @@ mod tests {
             ws_host: None,
             ws_path: None,
             grpc_service_name: None,
+            grpc_max_concurrent_streams: 7,
+            grpc_max_read_buffer_bytes: 64 * 1024,
+            grpc_max_message_bytes: 8 * 1024,
+            grpc_max_send_queue_bytes: 16 * 1024,
+            max_connections: 10,
+            max_tls_handshakes: 2,
+            max_connections_per_ip: 3,
             enable_udp: false,
             cert: None,
             key: None,
@@ -828,6 +991,10 @@ mod tests {
         };
 
         let server = build_server(config).await.expect("failed to build server");
+        assert_eq!(server.grpc_limits.max_concurrent_streams, 7);
+        assert_eq!(server.grpc_limits.max_read_buffer_bytes, 64 * 1024);
+        assert_eq!(server.grpc_limits.max_message_bytes, 8 * 1024);
+        assert_eq!(server.grpc_limits.max_send_queue_bytes, 16 * 1024);
         let server_run_task = tokio::spawn(async move {
             let _ = server.run().await;
         });
@@ -835,8 +1002,13 @@ mod tests {
         // Give the server a small moment to bind/start
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let client_stream_res: std::io::Result<tokio::net::UnixStream> = tokio::net::UnixStream::connect(&unix_path).await;
-        assert!(client_stream_res.is_ok(), "Failed to connect to Unix Domain Socket: {:?}", client_stream_res.err());
+        let client_stream_res: std::io::Result<tokio::net::UnixStream> =
+            tokio::net::UnixStream::connect(&unix_path).await;
+        assert!(
+            client_stream_res.is_ok(),
+            "Failed to connect to Unix Domain Socket: {:?}",
+            client_stream_res.err()
+        );
         let mut client_stream = client_stream_res.unwrap();
 
         // Write an invalid request (to trigger a response or end of connection)

@@ -59,6 +59,13 @@ cargo rustc --release -- -C target-cpu=native -C opt-level=3
 | `--ws-host <HOST>` | WebSocket Host 头 | String | - | 否 |
 | `--ws-path <PATH>` | WebSocket 请求路径 | String | - | 否 |
 | `--grpc-service-name <NAME>` | gRPC service name | String | - | 否 |
+| `--grpc-max-concurrent-streams <N>` | 单个 HTTP/2 连接允许的最大 gRPC stream 数 | Integer | `128` | 否 |
+| `--grpc-max-read-buffer-bytes <N>` | 单个 gRPC stream 的最大请求缓冲字节数 | Integer | `262144` | 否 |
+| `--grpc-max-message-bytes <N>` | 单条 gRPC 消息的最大负载字节数 | Integer | `16384` | 否 |
+| `--grpc-max-send-queue-bytes <N>` | 单个 gRPC stream 的最大响应队列字节数 | Integer | `131072` | 否 |
+| `--max-connections <N>` | 最大存活连接数（包含 TLS 握手中连接） | Integer | `1024` | 否 |
+| `--max-tls-handshakes <N>` | 最大并发 TLS 握手数 | Integer | `64` | 否 |
+| `--max-connections-per-ip <N>` | 单个 IP 最大存活 TCP 连接数 | Integer | `32` | 否 |
 | `-c, --config-file <FILE>` | 从 TOML 文件加载配置 | String | - | 否 |
 | `--generate-config <FILE>` | 生成示例配置文件 | String | - | 否 |
 | `--log-level <LEVEL>` | 日志级别 (trace/debug/info/warn/error) | String | `info` | 否 |
@@ -90,6 +97,13 @@ enable_grpc = true
 ws_host = "cdn.example.com"
 ws_path = "/ws"
 grpc_service_name = "GunService"
+grpc_max_concurrent_streams = 128
+grpc_max_read_buffer_bytes = 262144
+grpc_max_message_bytes = 16384
+grpc_max_send_queue_bytes = 131072
+max_connections = 1024
+max_tls_handshakes = 64
+max_connections_per_ip = 32
 # unix_path = "/var/run/trojan-rs.sock"
 
 [tls]

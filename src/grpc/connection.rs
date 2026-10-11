@@ -12,9 +12,7 @@ use tokio::time::Duration;
 use tracing::{debug, info, warn};
 
 use super::transport::GrpcH2cTransport;
-use super::{
-    GRPC_FLOW_CONTROL_TIMEOUT_SECS, MAX_CONCURRENT_STREAMS, MAX_FRAME_SIZE, MAX_SEND_QUEUE_BYTES,
-};
+use super::{GrpcLimits, GRPC_FLOW_CONTROL_TIMEOUT_SECS, MAX_FRAME_SIZE};
 
 const GRPC_CONNECTION_IDLE_TIMEOUT_SECS: u64 = 600;
 
@@ -24,24 +22,36 @@ const GRPC_CONNECTION_IDLE_TIMEOUT_SECS: u64 = 600;
 pub struct GrpcH2cConnection<S> {
     h2_conn: server::Connection<S, Bytes>,
     expected_service_name: Option<String>,
+    limits: GrpcLimits,
 }
 
 impl<S> GrpcH2cConnection<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    #[cfg(test)]
     pub async fn new(stream: S) -> io::Result<Self> {
-        Self::with_service_name(stream, None).await
+        Self::with_service_name_and_limits(stream, None, GrpcLimits::default()).await
     }
 
+    #[cfg(test)]
     pub async fn with_service_name(
         stream: S,
         expected_service_name: Option<String>,
     ) -> io::Result<Self> {
+        Self::with_service_name_and_limits(stream, expected_service_name, GrpcLimits::default())
+            .await
+    }
+
+    pub async fn with_service_name_and_limits(
+        stream: S,
+        expected_service_name: Option<String>,
+        limits: GrpcLimits,
+    ) -> io::Result<Self> {
         let h2_conn = server::Builder::new()
             .max_frame_size(MAX_FRAME_SIZE)
-            .max_concurrent_streams(MAX_CONCURRENT_STREAMS as u32)
-            .max_send_buffer_size(MAX_SEND_QUEUE_BYTES)
+            .max_concurrent_streams(limits.max_concurrent_streams)
+            .max_send_buffer_size(limits.max_send_queue_bytes)
             .handshake(stream)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 handshake: {}", e)))?;
@@ -49,6 +59,7 @@ where
         Ok(Self {
             h2_conn,
             expected_service_name,
+            limits,
         })
     }
 
@@ -90,6 +101,7 @@ where
         let handler = Arc::new(handler);
         let mut h2_conn = self.h2_conn;
         let expected_service_name = self.expected_service_name;
+        let limits = self.limits;
 
         // h2 stream handles synchronize through the connection's shared
         // state. Keeping the driver and all stream futures in this task
@@ -175,6 +187,7 @@ where
                         request.into_body(),
                         send_stream,
                         flow_control_timeout,
+                        limits,
                     );
 
                     let handler_clone = Arc::clone(&handler);

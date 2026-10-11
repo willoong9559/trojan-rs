@@ -3,6 +3,15 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
+use crate::grpc::{
+    GrpcLimits, DEFAULT_GRPC_MAX_CONCURRENT_STREAMS, DEFAULT_GRPC_MAX_MESSAGE_BYTES,
+    DEFAULT_GRPC_MAX_READ_BUFFER_BYTES, DEFAULT_GRPC_MAX_SEND_QUEUE_BYTES, MAX_FRAME_SIZE,
+};
+
+pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+pub const DEFAULT_MAX_TLS_HANDSHAKES: usize = 64;
+pub const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 32;
+
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Trojan Server")]
 pub struct ServerConfig {
@@ -37,6 +46,34 @@ pub struct ServerConfig {
     /// Expected gRPC service name
     #[arg(long)]
     pub grpc_service_name: Option<String>,
+
+    /// Maximum concurrent gRPC streams per HTTP/2 connection
+    #[arg(long, default_value_t = DEFAULT_GRPC_MAX_CONCURRENT_STREAMS)]
+    pub grpc_max_concurrent_streams: u32,
+
+    /// Maximum buffered gRPC request bytes per stream
+    #[arg(long, default_value_t = DEFAULT_GRPC_MAX_READ_BUFFER_BYTES)]
+    pub grpc_max_read_buffer_bytes: usize,
+
+    /// Maximum uncompressed payload in one gRPC message
+    #[arg(long, default_value_t = DEFAULT_GRPC_MAX_MESSAGE_BYTES)]
+    pub grpc_max_message_bytes: usize,
+
+    /// Maximum queued gRPC response bytes per stream
+    #[arg(long, default_value_t = DEFAULT_GRPC_MAX_SEND_QUEUE_BYTES)]
+    pub grpc_max_send_queue_bytes: usize,
+
+    /// Maximum active connections, including connections in TLS handshake
+    #[arg(long, default_value_t = DEFAULT_MAX_CONNECTIONS)]
+    pub max_connections: usize,
+
+    /// Maximum concurrent TLS handshakes
+    #[arg(long, default_value_t = DEFAULT_MAX_TLS_HANDSHAKES)]
+    pub max_tls_handshakes: usize,
+
+    /// Maximum active TCP connections from a single IP address
+    #[arg(long, default_value_t = DEFAULT_MAX_CONNECTIONS_PER_IP)]
+    pub max_connections_per_ip: usize,
 
     /// Enable UDP support
     #[arg(long, default_value_t = true)]
@@ -112,6 +149,27 @@ impl ServerConfig {
             if config.grpc_service_name.is_none() {
                 config.grpc_service_name = file_config.grpc_service_name;
             }
+            if config.grpc_max_concurrent_streams == DEFAULT_GRPC_MAX_CONCURRENT_STREAMS {
+                config.grpc_max_concurrent_streams = file_config.grpc_max_concurrent_streams;
+            }
+            if config.grpc_max_read_buffer_bytes == DEFAULT_GRPC_MAX_READ_BUFFER_BYTES {
+                config.grpc_max_read_buffer_bytes = file_config.grpc_max_read_buffer_bytes;
+            }
+            if config.grpc_max_message_bytes == DEFAULT_GRPC_MAX_MESSAGE_BYTES {
+                config.grpc_max_message_bytes = file_config.grpc_max_message_bytes;
+            }
+            if config.grpc_max_send_queue_bytes == DEFAULT_GRPC_MAX_SEND_QUEUE_BYTES {
+                config.grpc_max_send_queue_bytes = file_config.grpc_max_send_queue_bytes;
+            }
+            if config.max_connections == DEFAULT_MAX_CONNECTIONS {
+                config.max_connections = file_config.max_connections;
+            }
+            if config.max_tls_handshakes == DEFAULT_MAX_TLS_HANDSHAKES {
+                config.max_tls_handshakes = file_config.max_tls_handshakes;
+            }
+            if config.max_connections_per_ip == DEFAULT_MAX_CONNECTIONS_PER_IP {
+                config.max_connections_per_ip = file_config.max_connections_per_ip;
+            }
             if config.enable_udp {
                 config.enable_udp = file_config.enable_udp;
             }
@@ -146,8 +204,65 @@ impl ServerConfig {
         config.ws_path = normalize_ws_path(config.ws_path)?;
         config.grpc_service_name = normalize_grpc_service_name(config.grpc_service_name)?;
         config.unix_path = normalize_optional_value(config.unix_path, "Unix Domain Socket path")?;
+        config.grpc_limits()?;
+        config.validate_connection_limits()?;
 
         Ok(config)
+    }
+
+    pub fn grpc_limits(&self) -> Result<GrpcLimits> {
+        if self.grpc_max_concurrent_streams == 0 {
+            return Err(anyhow!(
+                "gRPC maximum concurrent streams must be greater than zero"
+            ));
+        }
+        if self.grpc_max_message_bytes == 0 {
+            return Err(anyhow!(
+                "gRPC maximum message size must be greater than zero"
+            ));
+        }
+        if self.grpc_max_read_buffer_bytes < MAX_FRAME_SIZE as usize {
+            return Err(anyhow!(
+                "gRPC maximum read buffer must be at least {} bytes",
+                MAX_FRAME_SIZE
+            ));
+        }
+        if self.grpc_max_read_buffer_bytes < self.grpc_max_message_bytes {
+            return Err(anyhow!(
+                "gRPC maximum read buffer must not be smaller than the maximum message size"
+            ));
+        }
+        let framed_message_bytes = self
+            .grpc_max_message_bytes
+            .checked_add(16)
+            .ok_or_else(|| anyhow!("gRPC maximum message size is too large"))?;
+        if self.grpc_max_send_queue_bytes < framed_message_bytes {
+            return Err(anyhow!(
+                "gRPC maximum send queue must fit one framed gRPC message"
+            ));
+        }
+
+        Ok(GrpcLimits {
+            max_concurrent_streams: self.grpc_max_concurrent_streams,
+            max_read_buffer_bytes: self.grpc_max_read_buffer_bytes,
+            max_message_bytes: self.grpc_max_message_bytes,
+            max_send_queue_bytes: self.grpc_max_send_queue_bytes,
+        })
+    }
+
+    pub fn validate_connection_limits(&self) -> Result<()> {
+        if self.max_connections == 0 {
+            return Err(anyhow!("maximum connections must be greater than zero"));
+        }
+        if self.max_tls_handshakes == 0 {
+            return Err(anyhow!("maximum TLS handshakes must be greater than zero"));
+        }
+        if self.max_connections_per_ip == 0 {
+            return Err(anyhow!(
+                "maximum connections per IP must be greater than zero"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -183,6 +298,27 @@ pub struct ServerSettings {
     #[serde(default)]
     pub grpc_service_name: Option<String>,
 
+    #[serde(default = "default_grpc_max_concurrent_streams")]
+    pub grpc_max_concurrent_streams: u32,
+
+    #[serde(default = "default_grpc_max_read_buffer_bytes")]
+    pub grpc_max_read_buffer_bytes: usize,
+
+    #[serde(default = "default_grpc_max_message_bytes")]
+    pub grpc_max_message_bytes: usize,
+
+    #[serde(default = "default_grpc_max_send_queue_bytes")]
+    pub grpc_max_send_queue_bytes: usize,
+
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+
+    #[serde(default = "default_max_tls_handshakes")]
+    pub max_tls_handshakes: usize,
+
+    #[serde(default = "default_max_connections_per_ip")]
+    pub max_connections_per_ip: usize,
+
     #[serde(default = "default_enable_udp")]
     pub enable_udp: bool,
 
@@ -192,6 +328,34 @@ pub struct ServerSettings {
 
 const fn default_enable_udp() -> bool {
     true
+}
+
+const fn default_grpc_max_concurrent_streams() -> u32 {
+    DEFAULT_GRPC_MAX_CONCURRENT_STREAMS
+}
+
+const fn default_grpc_max_read_buffer_bytes() -> usize {
+    DEFAULT_GRPC_MAX_READ_BUFFER_BYTES
+}
+
+const fn default_grpc_max_message_bytes() -> usize {
+    DEFAULT_GRPC_MAX_MESSAGE_BYTES
+}
+
+const fn default_grpc_max_send_queue_bytes() -> usize {
+    DEFAULT_GRPC_MAX_SEND_QUEUE_BYTES
+}
+
+const fn default_max_connections() -> usize {
+    DEFAULT_MAX_CONNECTIONS
+}
+
+const fn default_max_tls_handshakes() -> usize {
+    DEFAULT_MAX_TLS_HANDSHAKES
+}
+
+const fn default_max_connections_per_ip() -> usize {
+    DEFAULT_MAX_CONNECTIONS_PER_IP
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +395,13 @@ impl TomlConfig {
                 ws_host: Some("cdn.example.com".to_string()),
                 ws_path: Some("/ws".to_string()),
                 grpc_service_name: Some("GunService".to_string()),
+                grpc_max_concurrent_streams: default_grpc_max_concurrent_streams(),
+                grpc_max_read_buffer_bytes: default_grpc_max_read_buffer_bytes(),
+                grpc_max_message_bytes: default_grpc_max_message_bytes(),
+                grpc_max_send_queue_bytes: default_grpc_max_send_queue_bytes(),
+                max_connections: default_max_connections(),
+                max_tls_handshakes: default_max_tls_handshakes(),
+                max_connections_per_ip: default_max_connections_per_ip(),
                 enable_udp: true,
                 unix_path: None,
             },
@@ -259,6 +430,13 @@ impl TomlConfig {
             ws_host: self.server.ws_host,
             ws_path: self.server.ws_path,
             grpc_service_name: self.server.grpc_service_name,
+            grpc_max_concurrent_streams: self.server.grpc_max_concurrent_streams,
+            grpc_max_read_buffer_bytes: self.server.grpc_max_read_buffer_bytes,
+            grpc_max_message_bytes: self.server.grpc_max_message_bytes,
+            grpc_max_send_queue_bytes: self.server.grpc_max_send_queue_bytes,
+            max_connections: self.server.max_connections,
+            max_tls_handshakes: self.server.max_tls_handshakes,
+            max_connections_per_ip: self.server.max_connections_per_ip,
             enable_udp: self.server.enable_udp,
             cert: self.tls.as_ref().map(|t| t.cert.clone()),
             key: self.tls.as_ref().map(|t| t.key.clone()),
@@ -323,7 +501,10 @@ fn normalize_grpc_service_name(value: Option<String>) -> Result<Option<String>> 
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_grpc_service_name, normalize_optional_value, normalize_ws_path};
+    use super::{
+        normalize_grpc_service_name, normalize_optional_value, normalize_ws_path, ServerConfig,
+    };
+    use clap::Parser;
 
     #[test]
     fn websocket_path_is_normalized_with_leading_slash() {
@@ -346,5 +527,51 @@ mod tests {
     #[test]
     fn optional_value_rejects_empty_input() {
         assert!(normalize_optional_value(Some("   ".to_string()), "test field").is_err());
+    }
+
+    #[test]
+    fn grpc_limits_use_conservative_defaults() {
+        let config =
+            ServerConfig::try_parse_from(["trojan-rs", "--password", "test-password"]).unwrap();
+        let limits = config.grpc_limits().unwrap();
+
+        assert_eq!(limits.max_concurrent_streams, 128);
+        assert_eq!(limits.max_read_buffer_bytes, 256 * 1024);
+        assert_eq!(limits.max_message_bytes, 16 * 1024);
+        assert_eq!(limits.max_send_queue_bytes, 128 * 1024);
+    }
+
+    #[test]
+    fn grpc_limits_reject_an_undersized_read_buffer() {
+        let config = ServerConfig::try_parse_from([
+            "trojan-rs",
+            "--password",
+            "test-password",
+            "--grpc-max-read-buffer-bytes",
+            "1024",
+        ])
+        .unwrap();
+
+        assert!(config.grpc_limits().is_err());
+    }
+
+    #[test]
+    fn connection_limits_use_defaults_and_reject_zero() {
+        let default_config =
+            ServerConfig::try_parse_from(["trojan-rs", "--password", "test-password"]).unwrap();
+        assert_eq!(default_config.max_connections, 1024);
+        assert_eq!(default_config.max_tls_handshakes, 64);
+        assert_eq!(default_config.max_connections_per_ip, 32);
+        assert!(default_config.validate_connection_limits().is_ok());
+
+        let invalid_config = ServerConfig::try_parse_from([
+            "trojan-rs",
+            "--password",
+            "test-password",
+            "--max-connections-per-ip",
+            "0",
+        ])
+        .unwrap();
+        assert!(invalid_config.validate_connection_limits().is_err());
     }
 }

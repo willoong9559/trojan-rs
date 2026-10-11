@@ -11,9 +11,8 @@ use tokio::time::Sleep;
 use tracing::{debug, warn};
 
 use super::codec::{encode_grpc_message, parse_grpc_header};
-use super::{GRPC_MAX_MESSAGE_SIZE, MAX_FRAME_SIZE, MAX_SEND_QUEUE_BYTES, READ_BUFFER_SIZE};
+use super::{GrpcLimits, MAX_FRAME_SIZE};
 
-const MAX_BUF: usize = READ_BUFFER_SIZE * 2;
 const INIT_BUF: usize = 16 * 1024;
 
 /// gRPC 传输层（兼容 v2ray）
@@ -35,6 +34,7 @@ pub struct GrpcH2cTransport {
     pub(crate) trailers_sent: bool,
     pub(crate) send_capacity_timeout: Duration,
     pub(crate) send_capacity_deadline: Option<Pin<Box<Sleep>>>,
+    pub(crate) limits: GrpcLimits,
 }
 
 impl GrpcH2cTransport {
@@ -42,16 +42,17 @@ impl GrpcH2cTransport {
         recv_stream: RecvStream,
         send_stream: SendStream<Bytes>,
         send_capacity_timeout: Duration,
+        limits: GrpcLimits,
     ) -> Self {
         Self {
             recv_stream,
             send_stream,
-            read_pending: BytesMut::with_capacity(INIT_BUF),
+            read_pending: BytesMut::with_capacity(INIT_BUF.min(limits.max_read_buffer_bytes)),
             read_remaining: 0,
             pending_release_capacity: 0,
             send_queue: VecDeque::new(),
             send_queue_bytes: 0,
-            pending_payload: BytesMut::with_capacity(GRPC_MAX_MESSAGE_SIZE),
+            pending_payload: BytesMut::with_capacity(limits.max_message_bytes),
             current_frame: None,
             current_frame_offset: 0,
             recv_closed: false,
@@ -59,6 +60,7 @@ impl GrpcH2cTransport {
             trailers_sent: false,
             send_capacity_timeout,
             send_capacity_deadline: None,
+            limits,
         }
     }
 
@@ -96,9 +98,10 @@ impl GrpcH2cTransport {
         if self.read_remaining == 0
             && self.pending_release_capacity == 0
             && self.read_pending.is_empty()
-            && self.read_pending.capacity() >= MAX_BUF
+            && self.read_pending.capacity() >= self.limits.max_read_buffer_bytes
         {
-            self.read_pending = BytesMut::with_capacity(INIT_BUF);
+            self.read_pending =
+                BytesMut::with_capacity(INIT_BUF.min(self.limits.max_read_buffer_bytes));
         }
     }
 
@@ -361,11 +364,11 @@ impl GrpcH2cTransport {
         match self.recv_stream.poll_data(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
                 let chunk_len = chunk.len();
-                if self.read_pending.len() + chunk_len > MAX_BUF {
+                if self.read_pending.len() + chunk_len > self.limits.max_read_buffer_bytes {
                     warn!(
                         pending = self.read_pending.len(),
                         incoming = chunk_len,
-                        limit = MAX_BUF,
+                        limit = self.limits.max_read_buffer_bytes,
                         "gRPC read buffer overflow"
                     );
                     return Poll::Ready(Err(io::Error::new(
@@ -420,7 +423,7 @@ impl AsyncWrite for GrpcH2cTransport {
             Poll::Pending => return Poll::Pending,
         }
 
-        if self.send_queue_bytes >= MAX_SEND_QUEUE_BYTES {
+        if self.send_queue_bytes >= self.limits.max_send_queue_bytes {
             match self.poll_wait_send_capacity(cx) {
                 Poll::Ready(Ok(())) => {
                     match self.poll_send_queued(cx) {
@@ -428,7 +431,7 @@ impl AsyncWrite for GrpcH2cTransport {
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         Poll::Pending => return Poll::Pending,
                     }
-                    if self.send_queue_bytes >= MAX_SEND_QUEUE_BYTES {
+                    if self.send_queue_bytes >= self.limits.max_send_queue_bytes {
                         return Poll::Pending;
                     }
                 }
@@ -437,10 +440,10 @@ impl AsyncWrite for GrpcH2cTransport {
             }
         }
 
-        let remaining = GRPC_MAX_MESSAGE_SIZE - self.pending_payload.len();
+        let remaining = self.limits.max_message_bytes - self.pending_payload.len();
         let to_write = buf.len().min(remaining);
         self.pending_payload.extend_from_slice(&buf[..to_write]);
-        if self.pending_payload.len() == GRPC_MAX_MESSAGE_SIZE {
+        if self.pending_payload.len() == self.limits.max_message_bytes {
             self.queue_pending_payload();
         }
 
@@ -796,9 +799,9 @@ mod tests {
                     move |mut transport| {
                         let done_tx = std::sync::Arc::clone(&done_tx);
                         async move {
-                            transport.current_frame =
-                                Some(Bytes::from(vec![0u8; MAX_SEND_QUEUE_BYTES]));
-                            transport.send_queue_bytes = MAX_SEND_QUEUE_BYTES;
+                            let queue_limit = transport.limits.max_send_queue_bytes;
+                            transport.current_frame = Some(Bytes::from(vec![0u8; queue_limit]));
+                            transport.send_queue_bytes = queue_limit;
                             let result =
                                 match timeout(Duration::from_secs(1), transport.write(b"hello"))
                                     .await
