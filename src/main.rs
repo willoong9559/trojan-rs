@@ -948,6 +948,10 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| anyhow!("failed to install the Rustls AWS-LC crypto provider"))?;
+
     let log_level = logger::get_log_level_from_args();
     logger::init_logger(log_level);
 
