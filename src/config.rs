@@ -11,6 +11,15 @@ use crate::grpc::{
 pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 pub const DEFAULT_MAX_TLS_HANDSHAKES: usize = 64;
 pub const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 32;
+pub const DEFAULT_ACME_CACHE_DIR: &str = "/var/lib/trojan-rs/acme";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcmeSettings {
+    pub domain: String,
+    pub email: String,
+    pub cache_dir: String,
+    pub staging: bool,
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Trojan Server")]
@@ -74,6 +83,22 @@ pub struct ServerConfig {
     /// Maximum active TCP connections from a single IP address
     #[arg(long, default_value_t = DEFAULT_MAX_CONNECTIONS_PER_IP)]
     pub max_connections_per_ip: usize,
+
+    /// Domain name to provision through Let's Encrypt using TLS-ALPN-01
+    #[arg(long)]
+    pub acme_domain: Option<String>,
+
+    /// Let's Encrypt account contact email
+    #[arg(long)]
+    pub acme_email: Option<String>,
+
+    /// Directory for the ACME account and certificate cache
+    #[arg(long, default_value = DEFAULT_ACME_CACHE_DIR)]
+    pub acme_cache_dir: String,
+
+    /// Use the Let's Encrypt staging environment
+    #[arg(long, default_value_t = false)]
+    pub acme_staging: bool,
 
     /// Enable UDP support
     #[arg(long, default_value_t = true)]
@@ -170,6 +195,18 @@ impl ServerConfig {
             if config.max_connections_per_ip == DEFAULT_MAX_CONNECTIONS_PER_IP {
                 config.max_connections_per_ip = file_config.max_connections_per_ip;
             }
+            if config.acme_domain.is_none() {
+                config.acme_domain = file_config.acme_domain;
+            }
+            if config.acme_email.is_none() {
+                config.acme_email = file_config.acme_email;
+            }
+            if config.acme_cache_dir == DEFAULT_ACME_CACHE_DIR {
+                config.acme_cache_dir = file_config.acme_cache_dir;
+            }
+            if !config.acme_staging {
+                config.acme_staging = file_config.acme_staging;
+            }
             if config.enable_udp {
                 config.enable_udp = file_config.enable_udp;
             }
@@ -206,6 +243,7 @@ impl ServerConfig {
         config.unix_path = normalize_optional_value(config.unix_path, "Unix Domain Socket path")?;
         config.grpc_limits()?;
         config.validate_connection_limits()?;
+        config.acme_settings()?;
 
         Ok(config)
     }
@@ -263,6 +301,41 @@ impl ServerConfig {
             ));
         }
         Ok(())
+    }
+
+    pub fn acme_settings(&self) -> Result<Option<AcmeSettings>> {
+        let domain = normalize_optional_value(self.acme_domain.clone(), "ACME domain")?;
+        let email = normalize_optional_value(self.acme_email.clone(), "ACME email")?;
+
+        match (domain, email) {
+            (None, None) => Ok(None),
+            (Some(domain), Some(email)) => {
+                if self.cert.is_some() || self.key.is_some() {
+                    return Err(anyhow!(
+                        "ACME settings cannot be combined with --cert or --key"
+                    ));
+                }
+                if !domain.contains('.') || domain.starts_with('.') || domain.ends_with('.') {
+                    return Err(anyhow!("ACME domain must be a fully qualified domain name"));
+                }
+                if !email.contains('@') {
+                    return Err(anyhow!("ACME email must contain '@'"));
+                }
+                let cache_dir = self.acme_cache_dir.trim();
+                if cache_dir.is_empty() {
+                    return Err(anyhow!("ACME cache directory cannot be empty"));
+                }
+                Ok(Some(AcmeSettings {
+                    domain,
+                    email,
+                    cache_dir: cache_dir.to_string(),
+                    staging: self.acme_staging,
+                }))
+            }
+            _ => Err(anyhow!(
+                "ACME domain and ACME email must be configured together"
+            )),
+        }
     }
 }
 
@@ -324,6 +397,18 @@ pub struct ServerSettings {
 
     #[serde(default)]
     pub unix_path: Option<String>,
+
+    #[serde(default)]
+    pub acme_domain: Option<String>,
+
+    #[serde(default)]
+    pub acme_email: Option<String>,
+
+    #[serde(default = "default_acme_cache_dir")]
+    pub acme_cache_dir: String,
+
+    #[serde(default)]
+    pub acme_staging: bool,
 }
 
 const fn default_enable_udp() -> bool {
@@ -356,6 +441,10 @@ const fn default_max_tls_handshakes() -> usize {
 
 const fn default_max_connections_per_ip() -> usize {
     DEFAULT_MAX_CONNECTIONS_PER_IP
+}
+
+fn default_acme_cache_dir() -> String {
+    DEFAULT_ACME_CACHE_DIR.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,6 +493,10 @@ impl TomlConfig {
                 max_connections_per_ip: default_max_connections_per_ip(),
                 enable_udp: true,
                 unix_path: None,
+                acme_domain: None,
+                acme_email: None,
+                acme_cache_dir: default_acme_cache_dir(),
+                acme_staging: false,
             },
             tls: Some(TlsSettings {
                 cert: "/path/to/cert.pem".to_string(),
@@ -444,6 +537,10 @@ impl TomlConfig {
             generate_config: None,
             log_level: self.log.map(|l| l.level),
             unix_path: self.server.unix_path,
+            acme_domain: self.server.acme_domain,
+            acme_email: self.server.acme_email,
+            acme_cache_dir: self.server.acme_cache_dir,
+            acme_staging: self.server.acme_staging,
         }
     }
 }
@@ -573,5 +670,39 @@ mod tests {
         ])
         .unwrap();
         assert!(invalid_config.validate_connection_limits().is_err());
+    }
+
+    #[test]
+    fn acme_requires_domain_and_email_without_static_certificates() {
+        let config = ServerConfig::try_parse_from([
+            "trojan-rs",
+            "--password",
+            "test-password",
+            "--acme-domain",
+            "tunnel.example.com",
+            "--acme-email",
+            "admin@example.com",
+            "--acme-staging",
+        ])
+        .unwrap();
+        assert_eq!(
+            config.acme_settings().unwrap(),
+            Some(super::AcmeSettings {
+                domain: "tunnel.example.com".to_string(),
+                email: "admin@example.com".to_string(),
+                cache_dir: super::DEFAULT_ACME_CACHE_DIR.to_string(),
+                staging: true,
+            })
+        );
+
+        let incomplete = ServerConfig::try_parse_from([
+            "trojan-rs",
+            "--password",
+            "test-password",
+            "--acme-domain",
+            "tunnel.example.com",
+        ])
+        .unwrap();
+        assert!(incomplete.acme_settings().is_err());
     }
 }

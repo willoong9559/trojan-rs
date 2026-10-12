@@ -66,6 +66,10 @@ cargo rustc --release -- -C target-cpu=native -C opt-level=3
 | `--max-connections <N>` | 最大存活连接数（包含 TLS 握手中连接） | Integer | `1024` | 否 |
 | `--max-tls-handshakes <N>` | 最大并发 TLS 握手数 | Integer | `64` | 否 |
 | `--max-connections-per-ip <N>` | 单个 IP 最大存活 TCP 连接数 | Integer | `32` | 否 |
+| `--acme-domain <DOMAIN>` | 通过 TLS-ALPN-01 自动签发证书的域名 | String | - | 否 |
+| `--acme-email <EMAIL>` | Let's Encrypt 账户联系邮箱；须与 `--acme-domain` 同时配置 | String | - | 否 |
+| `--acme-cache-dir <PATH>` | ACME 账户和证书缓存目录 | String | `/var/lib/trojan-rs/acme` | 否 |
+| `--acme-staging` | 使用 Let's Encrypt 测试环境 | Flag | `false` | 否 |
 | `-c, --config-file <FILE>` | 从 TOML 文件加载配置 | String | - | 否 |
 | `--generate-config <FILE>` | 生成示例配置文件 | String | - | 否 |
 | `--log-level <LEVEL>` | 日志级别 (trace/debug/info/warn/error) | String | `info` | 否 |
@@ -81,6 +85,7 @@ cargo rustc --release -- -C target-cpu=native -C opt-level=3
 > - 配置了 `grpc_service_name` 后，gRPC 模式会严格校验 service name
 > - TLS 证书和私钥必须为 PEM 格式（rustls 仅支持 PEM 格式）
 > - 单个 stream 的发送窗口连续 30 秒未恢复时会被重置，客户端应在连接或 stream 错误后重建隧道并持续读取响应数据以更新 HTTP/2 流控窗口
+> - ACME 使用 TLS-ALPN-01，因此域名必须解析到本机且 TCP 443 必须由 Trojan-RS 独占；`acme_domain`/`acme_email` 与静态证书配置互斥
 
 #### 配置文件示例
 
@@ -104,9 +109,16 @@ grpc_max_send_queue_bytes = 131072
 max_connections = 1024
 max_tls_handshakes = 64
 max_connections_per_ip = 32
+# 配置以下两项后，Trojan-RS 会自动签发、续期并热加载 Let's Encrypt 证书。
+acme_domain = "tunnel.example.com"
+acme_email = "admin@example.com"
+acme_cache_dir = "/var/lib/trojan-rs/acme"
+# 首次测试时建议设为 true，避免消耗生产环境签发额度。
+acme_staging = false
 # unix_path = "/var/run/trojan-rs.sock"
 
 [tls]
+# 静态证书模式；与 ACME 配置互斥。
 cert = "/path/to/cert.pem"
 key = "/path/to/key.pem"
 
@@ -114,23 +126,23 @@ key = "/path/to/key.pem"
 level = "info"
 ```
 
-### Nginx + gRPC + UDS 一键部署
+### ACME + gRPC 一键部署
 
-[`scripts/install_nginx_grpc.sh`](scripts/install_nginx_grpc.sh) 会通过 GitHub Releases API 下载最新的 `x86_64-unknown-linux-musl` 构建，使用 systemd 将 Trojan-RS 运行在 UDS 上，并生成 Nginx gRPC 虚拟主机配置。它会用 acme.sh 申请 Let's Encrypt ECDSA 证书，并为之后的自动续期设置 Nginx reload hook。
+[`scripts/install_acme_grpc.sh`](scripts/install_acme_grpc.sh) 会通过 GitHub Releases API 下载最新的 `x86_64-unknown-linux-musl` 构建，以 systemd 直接运行 Trojan-RS，并把域名、邮箱和 ACME 缓存目录写入 Trojan-RS 配置。证书签发与续期使用内置 TLS-ALPN-01，不需要 Nginx、acme.sh 或 TCP 80。
 
-使用前请将域名的 A/AAAA 记录指向服务器，并在防火墙放行 TCP 80/443。脚本目前需要 systemd、x86_64 Linux，且会安装 Nginx、curl、unzip、jq 与 acme.sh：
+使用前请将域名的 A/AAAA 记录指向服务器，放行 TCP 443，并确保端口未被其他服务占用。脚本需要 systemd、x86_64 Linux，且会安装 curl、unzip、jq 与 ca-certificates：
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/willoong9559/trojan-rs/main/scripts/install_nginx_grpc.sh
-chmod +x install_nginx_grpc.sh
-sudo ./install_nginx_grpc.sh \
+curl -fsSLO https://raw.githubusercontent.com/willoong9559/trojan-rs/main/scripts/install_acme_grpc.sh
+chmod +x install_acme_grpc.sh
+sudo ./install_acme_grpc.sh \
   --domain example.com \
   --email admin@example.com \
   --service-name GunService \
   --password 'trojan-rs-password'
 ```
 
-若不使用 `--password`，脚本会通过 `read -s` 隐藏式读取密码。脚本每次运行都会获取最新 Release，因此可用同一命令升级二进制。Nginx 的受管配置默认写入 `/etc/nginx/conf.d/trojan-rs.conf`；如果已有同域名的 `server` 块，请先迁移或移除它，以避免虚拟主机冲突。
+若不使用 `--password`，脚本会通过 `read -s` 隐藏式读取密码。脚本每次运行都会获取最新 Release，因此可用同一命令升级二进制。首次测试可加 `--acme-staging` 使用 Let's Encrypt 测试环境，确认无误后移除该参数重新运行。ACME 状态保存在 `/var/lib/trojan-rs/acme`，重新运行脚本不会重复创建账户。
 
 #### 支持的 Linux 发行版
 
@@ -141,7 +153,7 @@ sudo ./install_nginx_grpc.sh \
 - openSUSE Leap/Tumbleweed、SUSE Linux Enterprise（`zypper`）
 - Arch Linux（`pacman`）
 
-不支持默认使用 OpenRC 的 Alpine Linux；也不支持非 x86_64 架构，因为当前自动下载的是 `rust-build-x86_64-unknown-linux-musl.zip`。其他发行版可以在已手动安装 Nginx、curl、unzip、jq、ca-certificates 和 systemd 的前提下尝试运行，但不属于脚本的兼容范围。
+不支持默认使用 OpenRC 的 Alpine Linux；也不支持非 x86_64 架构，因为当前自动下载的是 `rust-build-x86_64-unknown-linux-musl.zip`。其他发行版可以在已手动安装 curl、unzip、jq、ca-certificates 和 systemd 的前提下尝试运行，但不属于脚本的兼容范围。
 
 ## 协议支持
 

@@ -1,3 +1,4 @@
+mod acme;
 mod config;
 mod error;
 mod grpc;
@@ -144,6 +145,7 @@ pub struct Server {
     pub grpc_service_name: Option<String>,
     pub grpc_limits: grpc::GrpcLimits,
     connection_limits: ConnectionLimits,
+    acme: Option<config::AcmeSettings>,
     pub enable_udp: bool,
     pub tls_acceptor: Option<TlsAcceptor>,
 }
@@ -695,6 +697,10 @@ where
 
 impl Server {
     pub async fn run(self) -> Result<()> {
+        if let Some(acme) = self.acme.clone() {
+            return self.run_with_acme(acme).await;
+        }
+
         let server = Arc::new(self);
         let addr = server.listener.local_addr_string()?;
         let mode = match server.transport_mode {
@@ -787,9 +793,97 @@ impl Server {
 
         Ok(())
     }
+
+    async fn run_with_acme(self, acme: config::AcmeSettings) -> Result<()> {
+        if !matches!(self.listener, Listener::Tcp(_)) {
+            return Err(anyhow!("ACME requires a TCP listener"));
+        }
+
+        let server = Arc::new(self);
+        let addr = server.listener.local_addr_string()?;
+        let acme_tls = acme::AcmeTls::new(&acme, server.transport_mode)?;
+
+        log::info!(
+            address = %addr,
+            domain = %acme.domain,
+            staging = acme.staging,
+            cache_dir = %acme.cache_dir,
+            "ACME TLS-ALPN-01 enabled"
+        );
+
+        loop {
+            match server.listener.accept().await {
+                Ok((stream, peer_addr, peer_ip)) => {
+                    let connection_permit = match server
+                        .connection_limits
+                        .try_acquire_connection(peer_ip)
+                    {
+                        Ok(permit) => permit,
+                        Err(ConnectionLimitError::Total) => {
+                            log::warn!(peer = %peer_addr, "Connection rejected: total connection limit reached");
+                            continue;
+                        }
+                        Err(ConnectionLimitError::PerIp(ip)) => {
+                            log::warn!(peer = %peer_addr, ip = %ip, "Connection rejected: per-IP connection limit reached");
+                            continue;
+                        }
+                    };
+
+                    let server_clone = Arc::clone(&server);
+                    let acme_tls = acme_tls.clone();
+                    tokio::spawn(async move {
+                        let _connection_permit = connection_permit;
+                        let _handshake_permit = match server_clone
+                            .connection_limits
+                            .try_acquire_tls_handshake()
+                        {
+                            Some(permit) => permit,
+                            None => {
+                                log::warn!(peer = %peer_addr, "Connection rejected: TLS handshake limit reached");
+                                return;
+                            }
+                        };
+
+                        let tls_stream = match acme_tls.accept(stream).await {
+                            Ok(Some(stream)) => stream,
+                            Ok(None) => {
+                                log::info!(peer = %peer_addr, "ACME TLS-ALPN-01 validation completed");
+                                return;
+                            }
+                            Err(error) => {
+                                log::debug!(peer = %peer_addr, error = %error, "TLS handshake rejected");
+                                return;
+                            }
+                        };
+                        drop(_handshake_permit);
+
+                        if let Err(error) =
+                            accept_connection(server_clone, tls_stream, peer_addr.clone()).await
+                        {
+                            log::error!(peer = %peer_addr, error = %error, "Connection error");
+                        } else {
+                            log::connection(&peer_addr, "closed");
+                        }
+                    });
+                }
+                Err(error) => {
+                    log::error!(error = %error, "Failed to accept connection");
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
+    let acme = config.acme_settings()?;
+    if acme.is_some() && config.unix_path.is_some() {
+        return Err(anyhow!(
+            "ACME cannot be used with a Unix Domain Socket listener"
+        ));
+    }
     let listener = if let Some(ref path) = config.unix_path {
         #[cfg(unix)]
         {
@@ -831,7 +925,11 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         TransportMode::Tcp
     };
 
-    let tls_acceptor = tls::get_tls_acceptor(config.cert, config.key, transport_mode);
+    let tls_acceptor = if acme.is_some() {
+        None
+    } else {
+        tls::get_tls_acceptor(config.cert, config.key, transport_mode)
+    };
 
     Ok(Server {
         listener,
@@ -842,6 +940,7 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         grpc_service_name: config.grpc_service_name,
         grpc_limits,
         connection_limits,
+        acme,
         enable_udp: config.enable_udp,
         tls_acceptor,
     })
@@ -1003,6 +1102,10 @@ mod tests {
             max_connections: 10,
             max_tls_handshakes: 2,
             max_connections_per_ip: 3,
+            acme_domain: None,
+            acme_email: None,
+            acme_cache_dir: config::DEFAULT_ACME_CACHE_DIR.to_string(),
+            acme_staging: false,
             enable_udp: false,
             cert: None,
             key: None,
