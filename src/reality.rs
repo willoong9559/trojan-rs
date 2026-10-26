@@ -569,6 +569,13 @@ pub struct RealityTlsStream {
     prefix: Bytes,
     need_flush: bool,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiveStatus {
+    Data,
+    Eof,
+}
+
 impl RealityTlsStream {
     fn poll_drain(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         let this = self.as_mut().get_mut();
@@ -601,7 +608,10 @@ impl RealityTlsStream {
         }
         Poll::Ready(Ok(()))
     }
-    fn poll_receive(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+    fn poll_receive(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<io::Result<ReceiveStatus>> {
         let this = self.as_mut().get_mut();
         let RealityTlsStream {
             io: socket,
@@ -610,7 +620,10 @@ impl RealityTlsStream {
         } = this;
         let mut reader = PollReader { io: socket, cx };
         match session.read_tls(&mut reader) {
-            Ok(0) => return Poll::Ready(Ok(())),
+            // Propagate TCP EOF to AsyncRead. Treating it as a successful read
+            // and looping causes a closed connection to spin forever, retaining
+            // its connection permit and eventually starving the runtime.
+            Ok(0) => return Poll::Ready(Ok(ReceiveStatus::Eof)),
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Poll::Pending,
             Err(e) => return Poll::Ready(Err(e)),
@@ -618,7 +631,7 @@ impl RealityTlsStream {
         session
             .process_new_packets()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Poll::Ready(Ok(()))
+        Poll::Ready(Ok(ReceiveStatus::Data))
     }
 }
 impl AsyncRead for RealityTlsStream {
@@ -645,7 +658,8 @@ impl AsyncRead for RealityTlsStream {
                 Poll::Pending => {}
             }
             match self.as_mut().poll_receive(cx) {
-                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Ok(ReceiveStatus::Data)) => {}
+                Poll::Ready(Ok(ReceiveStatus::Eof)) => return Poll::Ready(Ok(())),
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
@@ -719,10 +733,14 @@ impl Write for PollWriter<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_key, generate_keypair, verify_flight};
+    use super::{
+        decode_key, generate_keypair, rustls, verify_flight, RealityTlsStream, ReceiveStatus,
+    };
     use aws_lc_rs::agreement;
     use base64::Engine as _;
     use bytes::Bytes;
+    use std::{future::poll_fn, pin::Pin, sync::Arc};
+    use tokio::net::{TcpListener, TcpStream};
 
     #[test]
     fn generated_keypair_has_matching_x25519_public_key() {
@@ -757,6 +775,34 @@ mod tests {
         synthetic[5 + 4] ^= 1;
 
         assert!(verify_flight(&synthetic, &[Bytes::from(target)]).is_err());
+    }
+
+    #[tokio::test]
+    async fn tcp_eof_is_reported_to_the_async_reader() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server_socket, _) = listener.accept().await.unwrap();
+        drop(client);
+
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
+        let mut stream = RealityTlsStream {
+            io: server_socket,
+            session: rustls::ServerConnection::new(Arc::new(config)).unwrap(),
+            prefix: Bytes::new(),
+            need_flush: false,
+        };
+
+        let status = poll_fn(|cx| Pin::new(&mut stream).poll_receive(cx))
+            .await
+            .unwrap();
+        assert_eq!(status, ReceiveStatus::Eof);
     }
 
     fn cover_server_hello(key_byte: u8) -> Vec<u8> {
