@@ -3,6 +3,7 @@ mod config;
 mod error;
 mod grpc;
 mod logger;
+mod reality;
 mod relay;
 mod socks5;
 mod tls;
@@ -148,6 +149,7 @@ pub struct Server {
     acme: Option<config::AcmeSettings>,
     pub enable_udp: bool,
     pub tls_acceptor: Option<TlsAcceptor>,
+    pub reality_acceptor: Option<reality::RealityAcceptor>,
 }
 
 struct ConnectionLimits {
@@ -708,7 +710,7 @@ impl Server {
             TransportMode::WebSocket => "WebSocket",
             TransportMode::Grpc => "gRPC",
         };
-        let tls_enabled = server.tls_acceptor.is_some();
+        let tls_enabled = server.tls_acceptor.is_some() || server.reality_acceptor.is_some();
 
         log::info!(address = %addr, mode = mode, tls = tls_enabled, "Server started");
 
@@ -735,7 +737,48 @@ impl Server {
 
                     tokio::spawn(async move {
                         let _connection_permit = connection_permit;
-                        let result = if let Some(ref tls_acceptor) = server_clone.tls_acceptor {
+                        let result = if let Some(ref reality_acceptor) =
+                            server_clone.reality_acceptor
+                        {
+                            let handshake_result = {
+                                let _handshake_permit = match server_clone
+                                    .connection_limits
+                                    .try_acquire_tls_handshake()
+                                {
+                                    Some(permit) => permit,
+                                    None => {
+                                        log::warn!(peer = %peer_addr, "Connection rejected: TLS handshake limit reached");
+                                        return;
+                                    }
+                                };
+                                tokio::time::timeout(
+                                    tokio::time::Duration::from_secs(30),
+                                    reality_acceptor.accept(match stream {
+                                        ConnectionStream::Tcp(stream) => stream,
+                                        #[cfg(unix)]
+                                        ConnectionStream::Unix(_) => return,
+                                    }),
+                                )
+                                .await
+                            };
+                            match handshake_result {
+                                Ok(Ok(reality::Accepted::Reality(stream))) => {
+                                    log::info!(peer = %peer_addr, "REALITY handshake successful");
+                                    accept_connection(server_clone, stream, peer_addr.clone()).await
+                                }
+                                Ok(Ok(reality::Accepted::Fallback(mut client, mut target))) => {
+                                    log::debug!(peer = %peer_addr, "REALITY client was forwarded to cover destination");
+                                    tokio::io::copy_bidirectional(&mut client, &mut target)
+                                        .await
+                                        .map(|_| ())
+                                        .map_err(Into::into)
+                                }
+                                Ok(Err(e)) => Err(e),
+                                Err(_) => {
+                                    Err(anyhow!("REALITY handshake timeout after 30 seconds"))
+                                }
+                            }
+                        } else if let Some(ref tls_acceptor) = server_clone.tls_acceptor {
                             const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 30;
                             let handshake_result = {
                                 let _handshake_permit = match server_clone
@@ -879,10 +922,14 @@ impl Server {
 
 pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
     let acme = config.acme_settings()?;
+    let reality = config.reality_settings()?;
     if acme.is_some() && config.unix_path.is_some() {
         return Err(anyhow!(
             "ACME cannot be used with a Unix Domain Socket listener"
         ));
+    }
+    if reality.is_some() && config.unix_path.is_some() {
+        return Err(anyhow!("REALITY requires a TCP listener"));
     }
     let listener = if let Some(ref path) = config.unix_path {
         #[cfg(unix)]
@@ -925,11 +972,12 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         TransportMode::Tcp
     };
 
-    let tls_acceptor = if acme.is_some() {
+    let tls_acceptor = if acme.is_some() || reality.is_some() {
         None
     } else {
         tls::get_tls_acceptor(config.cert, config.key, transport_mode)
     };
+    let reality_acceptor = reality.map(reality::RealityAcceptor::new).transpose()?;
 
     Ok(Server {
         listener,
@@ -943,6 +991,7 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         acme,
         enable_udp: config.enable_udp,
         tls_acceptor,
+        reality_acceptor,
     })
 }
 
@@ -1113,8 +1162,14 @@ mod tests {
             enable_udp: false,
             cert: None,
             key: None,
+            enable_reality: false,
+            reality_dest: None,
+            reality_private_key: None,
+            reality_short_ids: Vec::new(),
+            reality_max_time_diff_ms: None,
             config_file: None,
             generate_config: None,
+            generate_reality_keypair: false,
             log_level: None,
             unix_path: Some(unix_path.clone()),
         };

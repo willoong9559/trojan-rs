@@ -21,6 +21,16 @@ pub struct AcmeSettings {
     pub staging: bool,
 }
 
+/// Settings for a REALITY listener.  The destination is the public TLS site
+/// mirrored for unauthenticated connections (for example `www.example.com:443`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealitySettings {
+    pub dest: String,
+    pub private_key: String,
+    pub short_ids: Vec<String>,
+    pub max_time_diff_ms: Option<u64>,
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Trojan Server")]
 pub struct ServerConfig {
@@ -112,6 +122,27 @@ pub struct ServerConfig {
     #[arg(long)]
     pub key: Option<String>,
 
+    /// Enable REALITY instead of ordinary TLS. Requires --reality-dest,
+    /// --reality-private-key and at least one --reality-short-id.
+    #[arg(long, default_value_t = false)]
+    pub enable_reality: bool,
+
+    /// REALITY cover destination in `hostname:port` form
+    #[arg(long)]
+    pub reality_dest: Option<String>,
+
+    /// REALITY X25519 private key, base64url without padding
+    #[arg(long)]
+    pub reality_private_key: Option<String>,
+
+    /// Accepted REALITY short ID, 0-16 hexadecimal characters. May be repeated.
+    #[arg(long = "reality-short-id")]
+    pub reality_short_ids: Vec<String>,
+
+    /// Optional maximum client clock skew for REALITY, in milliseconds
+    #[arg(long)]
+    pub reality_max_time_diff_ms: Option<u64>,
+
     /// Unix Domain Socket path (optional)
     #[arg(long)]
     pub unix_path: Option<String>,
@@ -124,6 +155,10 @@ pub struct ServerConfig {
     #[arg(long)]
     pub generate_config: Option<String>,
 
+    /// Generate an X25519 keypair for REALITY and exit
+    #[arg(long, default_value_t = false)]
+    pub generate_reality_keypair: bool,
+
     /// Log level (trace, debug, info, warn, error)
     #[arg(long)]
     pub log_level: Option<String>,
@@ -133,6 +168,13 @@ impl ServerConfig {
     /// 从 TOML 文件或命令行参数加载配置
     pub fn load() -> Result<Self> {
         let mut config = Self::parse();
+
+        if config.generate_reality_keypair {
+            let (private_key, public_key) = crate::reality::generate_keypair()?;
+            println!("Private key: {private_key}");
+            println!("Public key:  {public_key}");
+            std::process::exit(0);
+        }
 
         // 如果指定了生成配置文件，生成后退出
         if let Some(ref path) = config.generate_config {
@@ -216,6 +258,21 @@ impl ServerConfig {
             if config.key.is_none() {
                 config.key = file_config.key;
             }
+            if !config.enable_reality {
+                config.enable_reality = file_config.enable_reality;
+            }
+            if config.reality_dest.is_none() {
+                config.reality_dest = file_config.reality_dest;
+            }
+            if config.reality_private_key.is_none() {
+                config.reality_private_key = file_config.reality_private_key;
+            }
+            if config.reality_short_ids.is_empty() {
+                config.reality_short_ids = file_config.reality_short_ids;
+            }
+            if config.reality_max_time_diff_ms.is_none() {
+                config.reality_max_time_diff_ms = file_config.reality_max_time_diff_ms;
+            }
             if config.unix_path.is_none() {
                 config.unix_path = file_config.unix_path;
             }
@@ -244,6 +301,16 @@ impl ServerConfig {
         config.grpc_limits()?;
         config.validate_connection_limits()?;
         config.acme_settings()?;
+        config.reality_settings()?;
+
+        if config.enable_reality && (config.cert.is_some() || config.key.is_some()) {
+            return Err(anyhow!(
+                "REALITY cannot be enabled together with a static TLS certificate"
+            ));
+        }
+        if config.enable_reality && config.acme_domain.is_some() {
+            return Err(anyhow!("REALITY cannot be enabled together with ACME"));
+        }
 
         Ok(config)
     }
@@ -337,6 +404,48 @@ impl ServerConfig {
             )),
         }
     }
+
+    pub fn reality_settings(&self) -> Result<Option<RealitySettings>> {
+        if !self.enable_reality {
+            return Ok(None);
+        }
+
+        let dest = self
+            .reality_dest
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("REALITY requires --reality-dest"))?;
+        let (_, port) = dest
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow!("REALITY destination must be hostname:port"))?;
+        let hostname = dest.trim_end_matches(port).trim_end_matches(':');
+        if hostname.is_empty()
+            || hostname.parse::<std::net::IpAddr>().is_ok()
+            || port.parse::<u16>().is_err()
+        {
+            return Err(anyhow!(
+                "REALITY destination must use a DNS hostname and valid port"
+            ));
+        }
+
+        let private_key = self
+            .reality_private_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("REALITY requires --reality-private-key"))?;
+        if self.reality_short_ids.is_empty() {
+            return Err(anyhow!("REALITY requires at least one --reality-short-id"));
+        }
+
+        Ok(Some(RealitySettings {
+            dest: dest.to_string(),
+            private_key: private_key.to_string(),
+            short_ids: self.reality_short_ids.clone(),
+            max_time_diff_ms: self.reality_max_time_diff_ms,
+        }))
+    }
 }
 
 // =============== TOML 配置部分 ==================
@@ -346,6 +455,8 @@ pub struct TomlConfig {
     pub server: ServerSettings,
     #[serde(default)]
     pub tls: Option<TlsSettings>,
+    #[serde(default)]
+    pub reality: Option<RealityTomlSettings>,
     #[serde(default)]
     pub log: Option<LogSettings>,
 }
@@ -409,6 +520,15 @@ pub struct ServerSettings {
 
     #[serde(default)]
     pub acme_staging: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealityTomlSettings {
+    pub dest: String,
+    pub private_key: String,
+    pub short_ids: Vec<String>,
+    #[serde(default)]
+    pub max_time_diff_ms: Option<u64>,
 }
 
 const fn default_enable_udp() -> bool {
@@ -502,12 +622,25 @@ impl TomlConfig {
                 cert: "/path/to/cert.pem".to_string(),
                 key: "/path/to/key.pem".to_string(),
             }),
+            reality: None,
             log: Some(LogSettings {
                 level: "info".to_string(),
             }),
         };
 
-        let toml_str = toml::to_string_pretty(&example)?;
+        let mut toml_str = toml::to_string_pretty(&example)?;
+        toml_str.push_str(
+            r#"
+
+# REALITY is an alternative to [tls] and ACME. Uncomment this block only after
+# removing [tls] and the ACME settings above.
+# [reality]
+# dest = "www.example.com:443"
+# private_key = "base64url-x25519-private-key"
+# short_ids = ["0123456789abcdef"]
+# max_time_diff_ms = 60000
+"#,
+        );
         fs::write(path, toml_str)?;
         Ok(())
     }
@@ -533,8 +666,18 @@ impl TomlConfig {
             enable_udp: self.server.enable_udp,
             cert: self.tls.as_ref().map(|t| t.cert.clone()),
             key: self.tls.as_ref().map(|t| t.key.clone()),
+            enable_reality: self.reality.is_some(),
+            reality_dest: self.reality.as_ref().map(|r| r.dest.clone()),
+            reality_private_key: self.reality.as_ref().map(|r| r.private_key.clone()),
+            reality_short_ids: self
+                .reality
+                .as_ref()
+                .map(|r| r.short_ids.clone())
+                .unwrap_or_default(),
+            reality_max_time_diff_ms: self.reality.as_ref().and_then(|r| r.max_time_diff_ms),
             config_file: None,
             generate_config: None,
+            generate_reality_keypair: false,
             log_level: self.log.map(|l| l.level),
             unix_path: self.server.unix_path,
             acme_domain: self.server.acme_domain,
@@ -704,5 +847,56 @@ mod tests {
         ])
         .unwrap();
         assert!(incomplete.acme_settings().is_err());
+    }
+
+    #[test]
+    fn reality_requires_complete_dns_based_settings() {
+        let incomplete = ServerConfig::try_parse_from([
+            "trojan-rs",
+            "--password",
+            "test-password",
+            "--enable-reality",
+        ])
+        .unwrap();
+        assert!(incomplete.reality_settings().is_err());
+
+        let complete = ServerConfig::try_parse_from([
+            "trojan-rs",
+            "--password",
+            "test-password",
+            "--enable-reality",
+            "--reality-dest",
+            "cover.example:443",
+            "--reality-private-key",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "--reality-short-id",
+            "0123456789abcdef",
+        ])
+        .unwrap();
+        let settings = complete.reality_settings().unwrap().unwrap();
+        assert_eq!(settings.dest, "cover.example:443");
+        assert_eq!(settings.short_ids, ["0123456789abcdef"]);
+
+        let ip_dest = ServerConfig::try_parse_from([
+            "trojan-rs",
+            "--password",
+            "test-password",
+            "--enable-reality",
+            "--reality-dest",
+            "127.0.0.1:443",
+            "--reality-private-key",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "--reality-short-id",
+            "01",
+        ])
+        .unwrap();
+        assert!(ip_dest.reality_settings().is_err());
+    }
+
+    #[test]
+    fn reality_keypair_generation_flag_is_parsed() {
+        let config =
+            ServerConfig::try_parse_from(["trojan-rs", "--generate-reality-keypair"]).unwrap();
+        assert!(config.generate_reality_keypair);
     }
 }

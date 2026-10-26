@@ -5,6 +5,7 @@
 ## 特性
 
 - 🔒 **TLS 加密**：支持可选的 TLS/SSL 加密传输
+- 🫥 **REALITY**：可选替代 TLS；认证失败的客户端会被透明转发至配置的覆盖站
 - 🌐 **多种传输模式**：
   - TCP 模式（原生 Trojan 协议）
   - WebSocket 模式（支持 WebSocket over TLS）
@@ -53,6 +54,12 @@ cargo rustc --release -- -C target-cpu=native -C opt-level=3
 | `--password <PASSWORD>` | 服务器密码 | String | - | **是** |
 | `--cert <FILE>` | TLS 证书文件路径 (PEM 格式) | String | - | 否 |
 | `--key <FILE>` | TLS 私钥文件路径 (PEM 格式) | String | - | 否 |
+| `--enable-reality` | 启用 REALITY，替代 TLS | Flag | `false` | 否 |
+| `--reality-dest <HOST:PORT>` | REALITY 覆盖站（必须是 DNS 主机名） | String | - | 启用时必需 |
+| `--reality-private-key <KEY>` | REALITY X25519 私钥（base64url，无填充） | String | - | 启用时必需 |
+| `--reality-short-id <HEX>` | 接受的 short ID（可重复，0–16 位十六进制） | String | - | 启用时必需 |
+| `--reality-max-time-diff-ms <MS>` | 可选客户端时钟最大偏差 | Integer | - | 否 |
+| `--generate-reality-keypair` | 生成 REALITY X25519 密钥对后退出 | Flag | `false` | 否 |
 | `--unix-path <PATH>` | Unix Domain Socket 监听路径 (仅 Unix 平台) | String | - | 否 |
 | `--enable-ws` | 启用 WebSocket 模式 | Flag | 禁用 | 否 |
 | `--enable-grpc` | 启用 gRPC 模式 | Flag | 禁用 | 否 |
@@ -84,6 +91,15 @@ cargo rustc --release -- -C target-cpu=native -C opt-level=3
 > - 配置了 `ws_path` 后，WebSocket 模式会校验请求路径
 > - 配置了 `grpc_service_name` 后，gRPC 模式会严格校验 service name
 > - TLS 证书和私钥必须为 PEM 格式（rustls 仅支持 PEM 格式）
+> - REALITY 与静态 TLS 证书、ACME 互斥。`reality_dest` 是对未认证探测流量的回落目标，应选择支持 TLS 1.3 的可信 HTTPS 主机。
+
+生成 REALITY 密钥对无需安装 Xray：
+
+```bash
+trojan-rs --generate-reality-keypair
+```
+
+将输出的 `Private key` 写入服务端 `private_key`，将 `Public key` 写入客户端 Reality 配置。short ID 可用 `openssl rand -hex 8` 生成。
 > - 单个 stream 的发送窗口连续 30 秒未恢复时会被重置，客户端应在连接或 stream 错误后重建隧道并持续读取响应数据以更新 HTTP/2 流控窗口
 > - ACME 使用 TLS-ALPN-01，因此域名必须解析到本机且 TCP 443 必须由 Trojan-RS 独占；`acme_domain`/`acme_email` 与静态证书配置互斥
 
@@ -121,6 +137,15 @@ acme_staging = false
 # 静态证书模式；与 ACME 配置互斥。
 cert = "/path/to/cert.pem"
 key = "/path/to/key.pem"
+
+# REALITY 模式：启用后不应配置 [tls] 或 ACME。
+# private_key 为 X25519 私钥；客户端使用其对应 public key。
+# 可配置多个 short_ids，以便轮换。
+# [reality]
+# dest = "www.example.com:443"
+# private_key = "base64url-x25519-private-key"
+# short_ids = ["0123456789abcdef"]
+# max_time_diff_ms = 60000
 
 [log]
 level = "info"
