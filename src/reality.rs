@@ -24,6 +24,7 @@ use rustls_reality::{
 use std::{
     fmt,
     io::{self, BufRead, Read, Write},
+    ops::Range,
     pin::Pin,
     sync::Arc,
     task::{Context as TaskContext, Poll},
@@ -463,7 +464,12 @@ fn verify_flight(wire: &[u8], target: &[Bytes]) -> Result<()> {
         let actual = wire
             .get(offset..end)
             .ok_or_else(|| anyhow!("REALITY synthetic flight is incomplete"))?;
-        if actual[..5] != expected[..5] || (index == 0 && actual[5..] != expected[5..]) {
+        let matches = if index == 0 {
+            server_hello_matches_cover(actual, expected)?
+        } else {
+            actual[..5] == expected[..5]
+        };
+        if !matches {
             return Err(anyhow!(
                 "REALITY synthetic flight does not match cover site"
             ));
@@ -476,6 +482,85 @@ fn verify_flight(wire: &[u8], target: &[Bytes]) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// A REALITY ServerHello copies the cover site's fixed fields but replaces its
+/// ephemeral key share.  Comparing that public key byte-for-byte would reject
+/// every valid synthetic handshake, so compare the complete record except that
+/// one protocol-mandated dynamic field.
+fn server_hello_matches_cover(actual: &[u8], expected: &[u8]) -> Result<bool> {
+    if actual.len() != expected.len() {
+        return Ok(false);
+    }
+    let key_share = server_hello_key_share_range(expected)?;
+    Ok(actual[..key_share.start] == expected[..key_share.start]
+        && actual[key_share.end..] == expected[key_share.end..])
+}
+
+/// Return the byte range of the TLS 1.3 ServerHello key-exchange public key,
+/// including the TLS record header in the returned offsets.
+fn server_hello_key_share_range(record: &[u8]) -> Result<Range<usize>> {
+    const TLS_RECORD_HEADER: usize = 5;
+    const HANDSHAKE_HEADER: usize = 4;
+    const SERVER_HELLO_FIXED: usize = 44;
+    const EXTENSION_KEY_SHARE: u16 = 51;
+
+    let handshake = record
+        .get(TLS_RECORD_HEADER..)
+        .ok_or_else(|| anyhow!("invalid REALITY cover ServerHello"))?;
+    if handshake.first() != Some(&2) || handshake.len() < SERVER_HELLO_FIXED {
+        return Err(anyhow!("invalid REALITY cover ServerHello"));
+    }
+    let handshake_len = (usize::from(handshake[1]) << 16)
+        | (usize::from(handshake[2]) << 8)
+        | usize::from(handshake[3]);
+    if handshake_len + HANDSHAKE_HEADER != handshake.len() {
+        return Err(anyhow!("invalid REALITY cover ServerHello"));
+    }
+
+    let session_id_len = usize::from(handshake[38]);
+    let extensions_start = SERVER_HELLO_FIXED
+        .checked_add(session_id_len)
+        .ok_or_else(|| anyhow!("invalid REALITY cover ServerHello"))?;
+    let extensions_len = handshake
+        .get(extensions_start - 2..extensions_start)
+        .and_then(|value| value.try_into().ok())
+        .map(u16::from_be_bytes)
+        .map(usize::from)
+        .ok_or_else(|| anyhow!("invalid REALITY cover ServerHello"))?;
+    let extensions_end = extensions_start
+        .checked_add(extensions_len)
+        .filter(|end| *end == handshake.len())
+        .ok_or_else(|| anyhow!("invalid REALITY cover ServerHello"))?;
+
+    let mut offset = extensions_start;
+    while offset < extensions_end {
+        let extension = handshake
+            .get(offset..offset + 4)
+            .ok_or_else(|| anyhow!("invalid REALITY cover ServerHello"))?;
+        let typ = u16::from_be_bytes(extension[..2].try_into().unwrap());
+        let len = usize::from(u16::from_be_bytes(extension[2..].try_into().unwrap()));
+        let data_start = offset + 4;
+        let data_end = data_start
+            .checked_add(len)
+            .filter(|end| *end <= extensions_end)
+            .ok_or_else(|| anyhow!("invalid REALITY cover ServerHello"))?;
+        if typ == EXTENSION_KEY_SHARE {
+            let key_len = handshake
+                .get(data_start + 2..data_start + 4)
+                .and_then(|value| value.try_into().ok())
+                .map(u16::from_be_bytes)
+                .map(usize::from)
+                .ok_or_else(|| anyhow!("invalid REALITY cover ServerHello key share"))?;
+            let key_start = data_start + 4;
+            if key_start.checked_add(key_len) != Some(data_end) || key_len == 0 {
+                return Err(anyhow!("invalid REALITY cover ServerHello key share"));
+            }
+            return Ok((TLS_RECORD_HEADER + key_start)..(TLS_RECORD_HEADER + data_end));
+        }
+        offset = data_end;
+    }
+    Err(anyhow!("REALITY cover ServerHello has no key share"))
 }
 
 pub struct RealityTlsStream {
@@ -634,9 +719,10 @@ impl Write for PollWriter<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_key, generate_keypair};
+    use super::{decode_key, generate_keypair, verify_flight};
     use aws_lc_rs::agreement;
     use base64::Engine as _;
+    use bytes::Bytes;
 
     #[test]
     fn generated_keypair_has_matching_x25519_public_key() {
@@ -650,5 +736,43 @@ mod tests {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(expected.as_ref()),
             public
         );
+    }
+
+    #[test]
+    fn synthetic_server_hello_may_replace_only_the_key_share() {
+        let target = cover_server_hello(7);
+        let mut synthetic = target.clone();
+        // Header (5) + ServerHello fixed part (44) + supported_versions (6)
+        // + key_share extension header and group/length fields (8).
+        synthetic[63..95].fill(9);
+
+        verify_flight(&synthetic, &[Bytes::from(target)]).unwrap();
+    }
+
+    #[test]
+    fn synthetic_server_hello_cannot_change_cover_fields() {
+        let target = cover_server_hello(7);
+        let mut synthetic = target.clone();
+        // TLS legacy version is a fixed ServerHello field.
+        synthetic[5 + 4] ^= 1;
+
+        assert!(verify_flight(&synthetic, &[Bytes::from(target)]).is_err());
+    }
+
+    fn cover_server_hello(key_byte: u8) -> Vec<u8> {
+        let mut handshake = Vec::new();
+        handshake.extend_from_slice(&[2, 0, 0, 86]);
+        handshake.extend_from_slice(&[3, 3]);
+        handshake.extend_from_slice(&[0x42; 32]);
+        handshake.push(0); // legacy_session_id_echo length
+        handshake.extend_from_slice(&[0x13, 0x01, 0]);
+        handshake.extend_from_slice(&[0, 46]);
+        handshake.extend_from_slice(&[0, 43, 0, 2, 3, 4]);
+        handshake.extend_from_slice(&[0, 51, 0, 36, 0, 29, 0, 32]);
+        handshake.extend_from_slice(&[key_byte; 32]);
+
+        let mut record = vec![22, 3, 3, 0, handshake.len() as u8];
+        record.extend_from_slice(&handshake);
+        record
     }
 }
