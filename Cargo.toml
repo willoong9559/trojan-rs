@@ -14,8 +14,10 @@ hex = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 tokio-rustls = "0.26.4"
-# REALITY needs the connection-scoped APIs maintained by the cfal/rustls fork.
-rustls = "0.23.46"
+# Ordinary TLS and ACME stay on the upstream crate. REALITY uses the vendored
+# fork below under a distinct crate name.
+rustls = "0.23.36"
+rustls-reality = { package = "rustls", path = "vendor/rustls-reality/rustls" }
 rustls-pemfile = "2.2.0"
 aws-lc-rs = "1.18"
 base64 = "0.22"
@@ -34,9 +36,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 pin-project-lite = "0.2"
 socket2 = "0.6"
-
-[patch.crates-io]
-rustls = { git = "https://github.com/cfal/rustls", rev = "d17d0fc304c03fe6e2c96ade6cd39c33b951c3af" }
 
 [profile.release]
 opt-level = 3

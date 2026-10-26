@@ -92,6 +92,7 @@ cargo rustc --release -- -C target-cpu=native -C opt-level=3
 > - 配置了 `grpc_service_name` 后，gRPC 模式会严格校验 service name
 > - TLS 证书和私钥必须为 PEM 格式（rustls 仅支持 PEM 格式）
 > - REALITY 与静态 TLS 证书、ACME 互斥。`reality_dest` 是对未认证探测流量的回落目标，应选择支持 TLS 1.3 的可信 HTTPS 主机。
+> - 常规 TLS 与 ACME 使用 crates.io 的标准 `rustls`；REALITY 所需扩展源码固定在 `vendor/rustls-reality`，仅由 REALITY 模块使用。
 
 生成 REALITY 密钥对无需安装 Xray：
 

@@ -716,7 +716,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
- "rustls",
+ "rustls 0.23.46 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -1365,7 +1365,7 @@ dependencies = [
  "log",
  "percent-encoding",
  "pin-project-lite",
- "rustls",
+ "rustls 0.23.46 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustls-pki-types",
  "rustls-platform-verifier",
  "sync_wrapper",
@@ -1415,7 +1415,21 @@ dependencies = [
 [[package]]
 name = "rustls"
 version = "0.23.46"
-source = "git+https://github.com/cfal/rustls?rev=d17d0fc304c03fe6e2c96ade6cd39c33b951c3af#d17d0fc304c03fe6e2c96ade6cd39c33b951c3af"
+dependencies = [
+ "aws-lc-rs",
+ "log",
+ "once_cell",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "rustls"
+version = "0.23.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -1468,7 +1482,7 @@ dependencies = [
  "jni",
  "log",
  "once_cell",
- "rustls",
+ "rustls 0.23.46 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustls-native-certs",
  "rustls-platform-verifier-android",
  "rustls-webpki",
@@ -1866,7 +1880,7 @@ version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
- "rustls",
+ "rustls 0.23.46 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio",
 ]
 
@@ -1887,7 +1901,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "ring",
- "rustls",
+ "rustls 0.23.46 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "serde_json",
  "thiserror",
@@ -2129,7 +2143,8 @@ dependencies = [
  "http",
  "pin-project-lite",
  "rcgen",
- "rustls",
+ "rustls 0.23.46",
+ "rustls 0.23.46 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustls-pemfile",
  "serde",
  "sha2",

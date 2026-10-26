@@ -15,7 +15,8 @@ use aws_lc_rs::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bytes::{Buf, Bytes};
-use rustls::{
+use rustls_reality as rustls;
+use rustls_reality::{
     pki_types::CertificateDer,
     sign::{CertifiedKey, Signer, SigningKey},
     SignatureAlgorithm, SignatureScheme,

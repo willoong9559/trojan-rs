@@ -1,0 +1,45 @@
+name: REALITY upstream rebase
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * 1'
+permissions:
+  contents: read
+jobs:
+  candidate:
+    if: github.repository == 'cfal/rustls'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Fetch compatible upstream
+        run: |
+          git remote add upstream https://github.com/rustls/rustls.git
+          git fetch upstream rel-0.23
+          git config user.name 'rustls rebase check'
+          git config user.email 'noreply@github.com'
+      - name: Prepare candidate without changing main
+        run: bash .fork/rebase.sh upstream/rel-0.23 "$HOME/rustls-candidate" > "$RUNNER_TEMP/rebase-range-diff.txt"
+      - name: Export reviewed-input candidate
+        run: |
+          git -C "$HOME/rustls-candidate" bundle create "$GITHUB_WORKSPACE/rebase-candidate.bundle" HEAD
+      - name: Check candidate
+        working-directory: /home/runner/rustls-candidate
+        run: bash .fork/check.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reality-rebase-candidate
+          path: |
+            ${{ runner.temp }}/rebase-range-diff.txt
+            rebase-candidate.bundle
