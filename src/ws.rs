@@ -1,5 +1,5 @@
 use crate::logger::log;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use futures_util::{Sink, Stream};
 use http::{header::HOST, uri::Authority, StatusCode};
@@ -7,6 +7,7 @@ use std::io;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::{
     accept_hdr_async,
@@ -20,11 +21,33 @@ use tokio_tungstenite::{
     WebSocketStream as TungsteniteStream,
 };
 
+const WEBSOCKET_HANDSHAKE_TIMEOUT_SECS: u64 = 15;
+
 pub async fn accept_connection<S>(
     stream: S,
     peer_addr: String,
     expected_host: Option<String>,
     expected_path: Option<String>,
+) -> Result<WebSocketTransport<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    accept_connection_with_timeout(
+        stream,
+        peer_addr,
+        expected_host,
+        expected_path,
+        Duration::from_secs(WEBSOCKET_HANDSHAKE_TIMEOUT_SECS),
+    )
+    .await
+}
+
+async fn accept_connection_with_timeout<S>(
+    stream: S,
+    peer_addr: String,
+    expected_host: Option<String>,
+    expected_path: Option<String>,
+    timeout_duration: Duration,
 ) -> Result<WebSocketTransport<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -40,8 +63,15 @@ where
                 expected_path.as_deref(),
             )
         },
-    )
-    .await?;
+    );
+    let ws_stream = tokio::time::timeout(timeout_duration, ws_stream)
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "WebSocket HTTP Upgrade handshake timed out after {} seconds",
+                timeout_duration.as_secs()
+            )
+        })??;
 
     Ok(WebSocketTransport::new(ws_stream))
 }
@@ -52,7 +82,8 @@ pub struct WebSocketTransport<S> {
     read_pos: usize,
     write_buffer: Vec<u8>, // 保持 Vec<u8>， WebSocket 库需要
     write_pending: bool,
-    closed: bool,
+    read_closed: bool,
+    write_closed: bool,
 }
 
 impl<S> WebSocketTransport<S>
@@ -66,7 +97,8 @@ where
             read_pos: 0,
             write_buffer: Vec::new(),
             write_pending: false,
-            closed: false,
+            read_closed: false,
+            write_closed: false,
         }
     }
 }
@@ -171,7 +203,7 @@ where
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if self.closed {
+        if self.read_closed {
             return Poll::Ready(Ok(()));
         }
 
@@ -190,33 +222,50 @@ where
             return Poll::Ready(Ok(()));
         }
 
-        // 直接从 WebSocket 流读取
-        match Stream::poll_next(self.ws_stream.as_mut(), cx) {
-            Poll::Ready(Some(Ok(Message::Binary(data)))) => {
-                let to_copy = data.len().min(buf.remaining());
-                buf.put_slice(&data[..to_copy]);
+        loop {
+            match Stream::poll_next(self.ws_stream.as_mut(), cx) {
+                Poll::Ready(Some(Ok(Message::Binary(data)))) => {
+                    let to_copy = data.len().min(buf.remaining());
+                    buf.put_slice(&data[..to_copy]);
 
-                if to_copy < data.len() {
-                    self.read_buffer = Bytes::copy_from_slice(&data[to_copy..]);
-                    self.read_pos = 0;
+                    if to_copy < data.len() {
+                        self.read_buffer = Bytes::copy_from_slice(&data[to_copy..]);
+                        self.read_pos = 0;
+                    }
+
+                    return Poll::Ready(Ok(()));
                 }
-
-                Poll::Ready(Ok(()))
+                Poll::Ready(Some(Ok(Message::Close(_)))) => {
+                    self.read_closed = true;
+                    self.write_pending = false;
+                    self.write_buffer.clear();
+                    // tungstenite queues the required Close reply while reading
+                    // the peer's Close frame; make sure it reaches the wire.
+                    return self.as_mut().poll_flush(cx);
+                }
+                Poll::Ready(Some(Ok(_))) => {
+                    // Ping/Pong and other control frames do not belong to the
+                    // Trojan byte stream. Flush here so tungstenite's automatic
+                    // Pong response is not delayed until application data flows.
+                    match self.as_mut().poll_flush(cx) {
+                        Poll::Ready(Ok(())) => continue,
+                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    self.read_closed = true;
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        format!("WebSocket receive error: {error}"),
+                    )));
+                }
+                Poll::Ready(None) => {
+                    self.read_closed = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(Some(Ok(Message::Close(_))) | Some(Err(_))) => {
-                self.closed = true;
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Some(Ok(_))) => {
-                // 非二进制消息，跳过
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Poll::Ready(None) => {
-                self.closed = true;
-                Poll::Ready(Ok(()))
-            }
-            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -230,7 +279,7 @@ where
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.closed {
+        if self.read_closed || self.write_closed {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "WebSocket closed",
@@ -294,6 +343,10 @@ where
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.write_closed {
+            return Poll::Ready(Ok(()));
+        }
+
         // 确保所有待发送的数据都已发送
         if self.write_pending {
             match Sink::poll_ready(self.ws_stream.as_mut(), cx) {
@@ -337,17 +390,51 @@ where
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.closed = true;
-        // 刷新所有待发送的数据
-        // WebSocket 连接的关闭由底层流处理，这里只需要确保数据已刷新
-        self.as_mut().poll_flush(cx)
+        if self.write_closed {
+            return Poll::Ready(Ok(()));
+        }
+
+        match self.as_mut().poll_flush(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Pending => return Poll::Pending,
+        }
+
+        if self.read_closed {
+            // The peer has already sent Close; poll_flush above sends the
+            // automatic reply queued by tungstenite, so no second Close is sent.
+            self.write_closed = true;
+            return Poll::Ready(Ok(()));
+        }
+
+        match Sink::poll_close(self.ws_stream.as_mut(), cx) {
+            Poll::Ready(Ok(())) => {
+                self.write_closed = true;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                format!("WebSocket close error: {error}"),
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_websocket_request, websocket_host_matches};
+    use super::{
+        accept_connection_with_timeout, validate_websocket_request, websocket_host_matches,
+        WebSocketTransport,
+    };
+    use futures_util::{SinkExt, StreamExt};
     use http::{Request, Response, StatusCode};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::{timeout, Duration};
+    use tokio_tungstenite::{
+        tungstenite::{protocol::Role, Message},
+        WebSocketStream,
+    };
 
     #[test]
     fn websocket_host_match_allows_missing_expected_port() {
@@ -411,5 +498,59 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn shutdown_sends_a_websocket_close_frame() {
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let mut transport = WebSocketTransport::new(server_ws);
+        let mut client_ws = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+
+        transport.shutdown().await.unwrap();
+
+        let message = timeout(Duration::from_secs(1), client_ws.next())
+            .await
+            .expect("client should receive a close frame")
+            .expect("WebSocket stream should not end before close")
+            .expect("close frame should be valid");
+        assert!(matches!(message, Message::Close(_)));
+    }
+
+    #[tokio::test]
+    async fn peer_close_is_flushed_before_read_reports_eof() {
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let mut transport = WebSocketTransport::new(server_ws);
+        let mut client_ws = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+
+        client_ws.send(Message::Close(None)).await.unwrap();
+        let mut buffer = [0_u8; 1];
+        assert_eq!(transport.read(&mut buffer).await.unwrap(), 0);
+
+        let message = timeout(Duration::from_secs(1), client_ws.next())
+            .await
+            .expect("client should receive the close reply")
+            .expect("WebSocket stream should not end before close reply")
+            .expect("close reply should be valid");
+        assert!(matches!(message, Message::Close(_)));
+    }
+
+    #[tokio::test]
+    async fn incomplete_websocket_handshake_times_out() {
+        let (server_io, _client_io) = tokio::io::duplex(1024);
+        let result = accept_connection_with_timeout(
+            server_io,
+            "127.0.0.1:12345".to_string(),
+            None,
+            None,
+            Duration::from_millis(10),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(error) if error.to_string().contains("WebSocket HTTP Upgrade handshake timed out")
+        ));
     }
 }
