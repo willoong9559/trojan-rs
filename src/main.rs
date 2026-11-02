@@ -886,7 +886,7 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
     let tls_acceptor = if reality.is_some() {
         None
     } else {
-        tls::get_tls_acceptor(config.cert, config.key, transport_mode)
+        tls::get_tls_acceptor(config.cert, config.key, config.cert_chain, transport_mode)?
     };
     let reality_acceptor = reality.map(reality::RealityAcceptor::new).transpose()?;
 
@@ -1139,6 +1139,7 @@ mod tests {
             max_connections_per_ip: 3,
             cert: None,
             key: None,
+            cert_chain: Vec::new(),
             enable_reality: false,
             reality_dest: None,
             reality_private_key: None,

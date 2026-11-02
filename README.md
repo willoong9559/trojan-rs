@@ -103,7 +103,13 @@ REALITY 不能和同一入口的 `tls` 同时设置。
 
 ## 证书
 
-为 TLS、WebSocket 或 gRPC 配置 PEM 证书与私钥路径：`tls = { cert = "...", key = "..." }`。证书更新后重启 Trojan-RS 以载入新文件。
+TLS、WebSocket 与 gRPC 接受 PEM 或 DER 编码的 X.509 证书和 PKCS#8、PKCS#1、SEC1 私钥；格式会自动识别。PEM 证书文件可直接包含完整链。若使用单独的中间证书文件（尤其是 DER），配置 `cert_chain`：
+
+```toml
+tls = { cert = "/etc/trojan-rs/cert.der", key = "/etc/trojan-rs/key.der", cert_chain = ["/etc/trojan-rs/intermediate.der"] }
+```
+
+证书更新后重启 Trojan-RS 以载入新文件。不支持 `.p12/.pfx`、JKS 或加密私钥。
 
 ## 协议支持
 

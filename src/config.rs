@@ -112,6 +112,9 @@ pub struct ServerConfig {
     pub key: Option<String>,
 
     #[arg(skip)]
+    pub cert_chain: Vec<String>,
+
+    #[arg(skip)]
     pub enable_reality: bool,
 
     #[arg(skip)]
@@ -250,6 +253,7 @@ impl ServerConfig {
                 if let Some(tls) = &inbound.tls {
                     config.cert = Some(tls.cert.clone());
                     config.key = Some(tls.key.clone());
+                    config.cert_chain = tls.cert_chain.clone();
                 }
                 config.enable_reality = inbound.reality.is_some();
                 if let Some(reality) = &inbound.reality {
@@ -297,6 +301,7 @@ impl ServerConfig {
                 if let Some(tls) = &inbound.tls {
                     config.cert = Some(tls.cert.clone());
                     config.key = Some(tls.key.clone());
+                    config.cert_chain = tls.cert_chain.clone();
                 }
                 config.enable_reality = false;
                 config.reality_dest = None;
@@ -488,6 +493,8 @@ const fn default_max_connections_per_ip() -> usize {
 pub struct TlsSettings {
     pub cert: String,
     pub key: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cert_chain: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -506,6 +513,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
         Some(TlsSettings {
             cert: "/path/to/cert.pem".to_string(),
             key: "/path/to/key.pem".to_string(),
+            cert_chain: Vec::new(),
         })
     };
 
@@ -612,6 +620,7 @@ impl TomlConfig {
             max_connections_per_ip: self.server.max_connections_per_ip,
             cert: None,
             key: None,
+            cert_chain: Vec::new(),
             enable_reality: false,
             reality_dest: None,
             reality_private_key: None,
