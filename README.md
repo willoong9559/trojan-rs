@@ -26,7 +26,7 @@ cargo build --release
 
 ## 配置
 
-`[server]` 定义共享的资源限制和 gRPC 限制。每个 `[[inbounds]]` 必须设置自己的 `password`。`listen` 是 Socket 地址数组，因此 `0.0.0.0:PORT` 与 `[::]:PORT` 可以同时监听同一端口的 IPv4 和 IPv6。
+`[server]` 定义共享的资源限制、gRPC 限制和可选的内置 ACME 设置。每个 `[[inbounds]]` 必须设置自己的 `password`。`listen` 是 Socket 地址数组，因此 `0.0.0.0:PORT` 与 `[::]:PORT` 可以同时监听同一端口的 IPv4 和 IPv6。
 
 ```toml
 [server]
@@ -41,23 +41,26 @@ grpc_max_read_buffer_bytes = 262144
 grpc_max_message_bytes = 16384
 grpc_max_send_queue_bytes = 131072
 
-# 1. 原生 Trojan TCP over TLS
+# 内置 ACME：只由 acme = true 的入口使用。
+acme = { domain = "tunnel.example.com", email = "admin@example.com", cache_dir = "/var/lib/trojan-rs/acme", staging = false }
+
+# 1. 原生 Trojan TCP over 内置 ACME TLS
 [[inbounds]]
 tag = "trojan-tcp"
 listen = ["0.0.0.0:443", "[::]:443"]
 transport = "tcp"
 password = "tcp-strong-password"
-tls = { cert = "/etc/trojan-rs/cert.pem", key = "/etc/trojan-rs/key.pem" }
+acme = true
 
-# 2. Trojan WebSocket over TLS
+# 2. Trojan WebSocket over 内置 ACME TLS
 [[inbounds]]
 tag = "trojan-ws"
 listen = ["0.0.0.0:8443", "[::]:8443"]
 transport = "websocket"
 password = "ws-strong-password"
-ws_host = "cdn.example.com"
+ws_host = "tunnel.example.com"
 ws_path = "/trojan"
-tls = { cert = "/etc/trojan-rs/cert.pem", key = "/etc/trojan-rs/key.pem" }
+acme = true
 
 # 3. Trojan gRPC over TLS
 [[inbounds]]
@@ -91,7 +94,7 @@ level = "info"
 
 `transport` 可取：`tcp`、`websocket`、`grpc`。`ws_host`、`ws_path` 只用于 WebSocket；`grpc_service_name` 只用于 gRPC。`unix_path` 为 Unix Domain Socket 路径；它可以与 `listen` 同时配置，但不能用于 REALITY。
 
-REALITY 不能和同一入口的 `tls` 同时设置。
+入口只能在 `tls`、`acme = true`、`reality` 三种 TLS 方式中选择一种。`acme = true` 必须配合 `[server]` 中的 `acme`；所有选用 ACME 的入口共享同一账户和证书。ACME 只能用于 TCP 监听，不能用于 `unix_path`。
 
 ## REALITY 密钥
 
@@ -109,7 +112,11 @@ TLS、WebSocket 与 gRPC 接受 PEM 或 DER 编码的 X.509 证书和 PKCS#8、P
 tls = { cert = "/etc/trojan-rs/cert.der", key = "/etc/trojan-rs/key.der", cert_chain = ["/etc/trojan-rs/intermediate.der"] }
 ```
 
-证书更新后重启 Trojan-RS 以载入新文件。不支持 `.p12/.pfx`、JKS 或加密私钥。
+静态证书更新后重启 Trojan-RS 以载入新文件。不支持 `.p12/.pfx`、JKS 或加密私钥。
+
+## ACME
+
+内置 ACME 使用 Let's Encrypt 的 TLS-ALPN-01 挑战，会自动创建账户、签发、续期并在进程内更新证书，不依赖 acme.sh。`domain` 必须解析到本机；该域名的 TCP `443` 必须由设置了 `acme = true` 的入口监听并可从公网访问。`cache_dir` 必须持久化保存，首次验证时可将 `staging = true`，确认成功后改回 `false` 并重启服务以签发正式证书。
 
 ## 协议支持
 

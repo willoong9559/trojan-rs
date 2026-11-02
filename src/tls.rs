@@ -144,6 +144,9 @@ mod tests {
 
     #[test]
     fn accepts_der_certificate_and_pkcs8_private_key() {
+        // The binary installs AWS-LC before constructing any TLS config. Unit
+        // tests call this helper directly, so reproduce that process setup.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let key = rcgen::KeyPair::generate().unwrap();
         let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         let certificate = params.self_signed(&key).unwrap();

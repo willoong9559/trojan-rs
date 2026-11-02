@@ -1,3 +1,4 @@
+mod acme;
 mod config;
 mod error;
 mod grpc;
@@ -162,6 +163,7 @@ pub struct Server {
     pub grpc_limits: grpc::GrpcLimits,
     connection_limits: ConnectionLimits,
     pub tls_acceptor: Option<TlsAcceptor>,
+    pub acme_tls: Option<acme::AcmeTls>,
     pub reality_acceptor: Option<reality::RealityAcceptor>,
     pub inbound_tag: Option<String>,
 }
@@ -699,7 +701,9 @@ impl Server {
             TransportMode::WebSocket => "WebSocket",
             TransportMode::Grpc => "gRPC",
         };
-        let tls_enabled = server.tls_acceptor.is_some() || server.reality_acceptor.is_some();
+        let tls_enabled = server.tls_acceptor.is_some()
+            || server.acme_tls.is_some()
+            || server.reality_acceptor.is_some();
 
         log::info!(
             inbound = server.inbound_tag.as_deref().unwrap_or("legacy"),
@@ -811,6 +815,36 @@ impl Server {
                                     ))
                                 }
                             }
+                        } else if let Some(ref acme_tls) = server_clone.acme_tls {
+                            let handshake_result = {
+                                let _handshake_permit = match server_clone
+                                    .connection_limits
+                                    .try_acquire_tls_handshake()
+                                {
+                                    Some(permit) => permit,
+                                    None => {
+                                        log::warn!(peer = %peer_addr, "Connection rejected: TLS handshake limit reached");
+                                        return;
+                                    }
+                                };
+                                acme_tls.accept(stream).await
+                            };
+
+                            match handshake_result {
+                                Ok(Some(tls_stream)) => {
+                                    log::info!(peer = %peer_addr, "ACME TLS handshake successful");
+                                    accept_connection(server_clone, tls_stream, peer_addr.clone())
+                                        .await
+                                }
+                                Ok(None) => {
+                                    log::info!(peer = %peer_addr, "ACME TLS-ALPN-01 validation completed");
+                                    Ok(())
+                                }
+                                Err(e) => {
+                                    log::error!(peer = %peer_addr, error = %e, "ACME TLS handshake failed");
+                                    Err(anyhow!("ACME TLS handshake failed: {e}"))
+                                }
+                            }
                         } else {
                             accept_connection(server_clone, stream, peer_addr.clone()).await
                         };
@@ -834,9 +868,30 @@ impl Server {
 }
 
 pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
+    let acme_manager = if config.use_acme {
+        let settings = config
+            .acme_settings()?
+            .ok_or_else(|| anyhow!("ACME inbound requires [server.acme]"))?;
+        Some(acme::AcmeManager::new(&settings)?)
+    } else {
+        None
+    };
+    build_server_with_acme(config, acme_manager).await
+}
+
+async fn build_server_with_acme(
+    config: config::ServerConfig,
+    acme_manager: Option<acme::AcmeManager>,
+) -> Result<Server> {
     let reality = config.reality_settings()?;
     if reality.is_some() && config.unix_path.is_some() {
         return Err(anyhow!("REALITY requires a TCP listener"));
+    }
+    if config.use_acme && config.unix_path.is_some() {
+        return Err(anyhow!("ACME requires a TCP listener"));
+    }
+    if config.use_acme && acme_manager.is_none() {
+        return Err(anyhow!("ACME inbound requires an ACME TLS resolver"));
     }
     let listener = if let Some(ref path) = config.unix_path {
         #[cfg(unix)]
@@ -883,7 +938,18 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         TransportMode::Tcp
     };
 
-    let tls_acceptor = if reality.is_some() {
+    let acme_tls = if config.use_acme {
+        Some(
+            acme_manager
+                .as_ref()
+                .expect("ACME manager validated above")
+                .tls_for_transport(transport_mode),
+        )
+    } else {
+        None
+    };
+
+    let tls_acceptor = if reality.is_some() || config.use_acme {
         None
     } else {
         tls::get_tls_acceptor(config.cert, config.key, config.cert_chain, transport_mode)?
@@ -900,6 +966,7 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         grpc_limits,
         connection_limits,
         tls_acceptor,
+        acme_tls,
         reality_acceptor,
         inbound_tag: config.inbound_tag,
     })
@@ -909,6 +976,14 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
 /// shared so adding listeners cannot bypass the process-wide safety limits.
 pub async fn build_servers(config: config::ServerConfig) -> Result<Vec<Server>> {
     let inbound_configs = config.expand_inbounds()?;
+    let shared_acme_manager = if inbound_configs.iter().any(|inbound| inbound.use_acme) {
+        let settings = config
+            .acme_settings()?
+            .ok_or_else(|| anyhow!("ACME inbound requires [server.acme]"))?;
+        Some(acme::AcmeManager::new(&settings)?)
+    } else {
+        None
+    };
     let shared_limits = ConnectionLimits::new(
         config.max_connections,
         config.max_tls_handshakes,
@@ -916,7 +991,11 @@ pub async fn build_servers(config: config::ServerConfig) -> Result<Vec<Server>> 
     );
     let mut servers = Vec::with_capacity(inbound_configs.len());
     for inbound_config in inbound_configs {
-        let mut server = build_server(inbound_config).await?;
+        let acme_manager = inbound_config
+            .use_acme
+            .then(|| shared_acme_manager.clone())
+            .flatten();
+        let mut server = build_server_with_acme(inbound_config, acme_manager).await?;
         server.connection_limits = shared_limits.clone();
         servers.push(server);
     }
@@ -1027,6 +1106,7 @@ mod tests {
                 ws_path: None,
                 grpc_service_name: None,
                 tls: None,
+                acme: false,
                 reality: None,
             },
             config::InboundSettings {
@@ -1039,6 +1119,7 @@ mod tests {
                 ws_path: None,
                 grpc_service_name: Some("GunService".to_string()),
                 tls: None,
+                acme: false,
                 reality: None,
             },
         ];
@@ -1140,6 +1221,8 @@ mod tests {
             cert: None,
             key: None,
             cert_chain: Vec::new(),
+            acme: None,
+            use_acme: false,
             enable_reality: false,
             reality_dest: None,
             reality_private_key: None,

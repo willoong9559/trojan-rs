@@ -11,6 +11,20 @@ use crate::grpc::{
 pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 pub const DEFAULT_MAX_TLS_HANDSHAKES: usize = 64;
 pub const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 32;
+pub const DEFAULT_ACME_CACHE_DIR: &str = "/var/lib/trojan-rs/acme";
+
+/// Shared, built-in ACME configuration. Certificates are provisioned and
+/// renewed with TLS-ALPN-01; individual inbounds opt into it with `acme = true`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeSettings {
+    pub domain: String,
+    pub email: String,
+    #[serde(default = "default_acme_cache_dir")]
+    pub cache_dir: String,
+    #[serde(default)]
+    pub staging: bool,
+}
 /// Settings for a REALITY listener.  The destination is the public TLS site
 /// mirrored for unauthenticated connections (for example `www.example.com:443`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +67,8 @@ pub struct InboundSettings {
     pub grpc_service_name: Option<String>,
     #[serde(default)]
     pub tls: Option<TlsSettings>,
+    #[serde(default)]
+    pub acme: bool,
     #[serde(default)]
     pub reality: Option<RealityTomlSettings>,
 }
@@ -113,6 +129,12 @@ pub struct ServerConfig {
 
     #[arg(skip)]
     pub cert_chain: Vec<String>,
+
+    #[arg(skip)]
+    pub acme: Option<AcmeSettings>,
+
+    #[arg(skip)]
+    pub use_acme: bool,
 
     #[arg(skip)]
     pub enable_reality: bool,
@@ -197,6 +219,7 @@ impl ServerConfig {
             ));
         }
 
+        config.acme = config.acme_settings()?;
         config.grpc_limits()?;
         config.validate_connection_limits()?;
 
@@ -215,6 +238,12 @@ impl ServerConfig {
                 "move legacy [reality] settings into the appropriate [[inbounds]] entry"
             ));
         }
+        let has_acme = self.acme_settings()?.is_some();
+        if has_acme && !self.inbounds.iter().any(|inbound| inbound.acme) {
+            return Err(anyhow!(
+                "[server.acme] is configured but no inbound enables acme"
+            ));
+        }
 
         let mut expanded = Vec::new();
         for inbound in &self.inbounds {
@@ -223,9 +252,28 @@ impl ServerConfig {
                     "each [[inbounds]] entry requires listen and/or unix_path"
                 ));
             }
-            if inbound.tls.is_some() && inbound.reality.is_some() {
+            if [
+                inbound.tls.is_some(),
+                inbound.acme,
+                inbound.reality.is_some(),
+            ]
+            .into_iter()
+            .filter(|enabled| *enabled)
+            .count()
+                > 1
+            {
                 return Err(anyhow!(
-                    "an inbound cannot enable ordinary TLS and REALITY together"
+                    "an inbound can use only one of tls, acme, or reality"
+                ));
+            }
+            if inbound.acme && !has_acme {
+                return Err(anyhow!(
+                    "an inbound enables ACME but [server.acme] is not configured"
+                ));
+            }
+            if inbound.acme && inbound.unix_path.is_some() {
+                return Err(anyhow!(
+                    "ACME requires a TCP listener and cannot use unix_path"
                 ));
             }
 
@@ -246,6 +294,7 @@ impl ServerConfig {
                 config.grpc_service_name =
                     normalize_grpc_service_name(inbound.grpc_service_name.clone())?;
                 config.password = inbound.password.trim().to_string();
+                config.use_acme = inbound.acme;
                 if config.password.is_empty() {
                     return Err(anyhow!("inbound password cannot be empty"));
                 }
@@ -295,6 +344,7 @@ impl ServerConfig {
                 config.grpc_service_name =
                     normalize_grpc_service_name(inbound.grpc_service_name.clone())?;
                 config.password = inbound.password.trim().to_string();
+                config.use_acme = inbound.acme;
                 if config.password.is_empty() {
                     return Err(anyhow!("inbound password cannot be empty"));
                 }
@@ -411,6 +461,24 @@ impl ServerConfig {
             max_time_diff_ms: self.reality_max_time_diff_ms,
         }))
     }
+
+    pub fn acme_settings(&self) -> Result<Option<AcmeSettings>> {
+        let Some(mut acme) = self.acme.clone() else {
+            return Ok(None);
+        };
+
+        acme.domain = normalize_required_value(acme.domain, "ACME domain")?;
+        acme.email = normalize_required_value(acme.email, "ACME email")?;
+        acme.cache_dir = normalize_required_value(acme.cache_dir, "ACME cache directory")?;
+        if !acme.domain.contains('.') || acme.domain.starts_with('.') || acme.domain.ends_with('.')
+        {
+            return Err(anyhow!("ACME domain must be a fully qualified domain name"));
+        }
+        if !acme.email.contains('@') {
+            return Err(anyhow!("ACME email must contain '@'"));
+        }
+        Ok(Some(acme))
+    }
 }
 
 // =============== TOML 配置部分 ==================
@@ -428,6 +496,9 @@ pub struct TomlConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerSettings {
+    #[serde(default)]
+    pub acme: Option<AcmeSettings>,
+
     #[serde(default = "default_grpc_max_concurrent_streams")]
     pub grpc_max_concurrent_streams: u32,
 
@@ -488,6 +559,10 @@ const fn default_max_connections_per_ip() -> usize {
     DEFAULT_MAX_CONNECTIONS_PER_IP
 }
 
+fn default_acme_cache_dir() -> String {
+    DEFAULT_ACME_CACHE_DIR.to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsSettings {
@@ -528,6 +603,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
             ws_path: None,
             grpc_service_name: None,
             tls: tls(),
+            acme: false,
             reality: None,
         },
         InboundSettings {
@@ -540,6 +616,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
             ws_path: Some("/trojan".to_string()),
             grpc_service_name: None,
             tls: tls(),
+            acme: false,
             reality: None,
         },
         InboundSettings {
@@ -552,6 +629,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
             ws_path: None,
             grpc_service_name: Some("GunService".to_string()),
             tls: tls(),
+            acme: false,
             reality: None,
         },
         InboundSettings {
@@ -564,6 +642,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
             ws_path: Some("/trojan-uds".to_string()),
             grpc_service_name: None,
             tls: None,
+            acme: false,
             reality: None,
         },
     ]
@@ -581,6 +660,7 @@ impl TomlConfig {
     pub fn generate_example<P: AsRef<Path>>(path: P) -> Result<()> {
         let example = TomlConfig {
             server: ServerSettings {
+                acme: None,
                 grpc_max_concurrent_streams: default_grpc_max_concurrent_streams(),
                 grpc_max_read_buffer_bytes: default_grpc_max_read_buffer_bytes(),
                 grpc_max_message_bytes: default_grpc_max_message_bytes(),
@@ -621,6 +701,8 @@ impl TomlConfig {
             cert: None,
             key: None,
             cert_chain: Vec::new(),
+            acme: self.server.acme,
+            use_acme: false,
             enable_reality: false,
             reality_dest: None,
             reality_private_key: None,
@@ -649,6 +731,11 @@ fn normalize_optional_value(value: Option<String>, field_name: &str) -> Result<O
         }
         None => Ok(None),
     }
+}
+
+fn normalize_required_value(value: String, field_name: &str) -> Result<String> {
+    normalize_optional_value(Some(value), field_name)?
+        .ok_or_else(|| anyhow!("{field_name} is required"))
 }
 
 fn normalize_ws_path(value: Option<String>) -> Result<Option<String>> {
@@ -756,6 +843,69 @@ mod tests {
     #[test]
     fn optional_value_rejects_empty_input() {
         assert!(normalize_optional_value(Some("   ".to_string()), "test field").is_err());
+    }
+
+    #[test]
+    fn acme_is_shared_in_server_settings_and_selected_per_inbound() {
+        let config: super::TomlConfig = toml::from_str(
+            r#"
+                [server]
+                acme = { domain = "tunnel.example.com", email = "admin@example.com", staging = true }
+
+                [[inbounds]]
+                listen = ["0.0.0.0:443"]
+                password = "acme-password"
+                acme = true
+
+                [[inbounds]]
+                listen = ["127.0.0.1:8443"]
+                password = "plain-password"
+            "#,
+        )
+        .unwrap();
+
+        let expanded = config.to_server_config().expand_inbounds().unwrap();
+        assert!(expanded[0].use_acme);
+        assert!(!expanded[1].use_acme);
+        assert_eq!(
+            expanded[0].acme.as_ref().unwrap().cache_dir,
+            super::DEFAULT_ACME_CACHE_DIR
+        );
+    }
+
+    #[test]
+    fn acme_requires_shared_settings_and_is_mutually_exclusive() {
+        let missing_settings: super::TomlConfig = toml::from_str(
+            r#"
+                [server]
+                [[inbounds]]
+                listen = ["127.0.0.1:443"]
+                password = "test-password"
+                acme = true
+            "#,
+        )
+        .unwrap();
+        assert!(missing_settings
+            .to_server_config()
+            .expand_inbounds()
+            .is_err());
+
+        let conflicting_settings: super::TomlConfig = toml::from_str(
+            r#"
+                [server]
+                acme = { domain = "tunnel.example.com", email = "admin@example.com" }
+                [[inbounds]]
+                listen = ["127.0.0.1:443"]
+                password = "test-password"
+                acme = true
+                tls = { cert = "cert.pem", key = "key.pem" }
+            "#,
+        )
+        .unwrap();
+        assert!(conflicting_settings
+            .to_server_config()
+            .expand_inbounds()
+            .is_err());
     }
 
     #[test]
