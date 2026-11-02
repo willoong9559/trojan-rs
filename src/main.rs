@@ -1,4 +1,3 @@
-mod acme;
 mod config;
 mod error;
 mod grpc;
@@ -15,6 +14,7 @@ use logger::log;
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -73,6 +73,21 @@ impl Listener {
             }
         }
     }
+}
+
+/// Bind an explicitly configured inbound address. IPv6 listeners are made
+/// v6-only so `[::]:PORT` can safely coexist with `0.0.0.0:PORT`.
+fn bind_inbound_tcp_listener(addr: SocketAddr) -> Result<TcpListener> {
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    let listener: std::net::TcpListener = socket.into();
+    Ok(TcpListener::from_std(listener)?)
 }
 
 pub enum ConnectionStream {
@@ -146,12 +161,12 @@ pub struct Server {
     pub grpc_service_name: Option<String>,
     pub grpc_limits: grpc::GrpcLimits,
     connection_limits: ConnectionLimits,
-    acme: Option<config::AcmeSettings>,
-    pub enable_udp: bool,
     pub tls_acceptor: Option<TlsAcceptor>,
     pub reality_acceptor: Option<reality::RealityAcceptor>,
+    pub inbound_tag: Option<String>,
 }
 
+#[derive(Clone)]
 struct ConnectionLimits {
     active_connections: Arc<Semaphore>,
     tls_handshakes: Arc<Semaphore>,
@@ -394,21 +409,12 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             handle_connect(&mut stream, request.addr, request.payload, peer_addr).await
         }
         TrojanCmd::UdpAssociate => {
-            if !server.enable_udp {
-                log::warn!(peer = %peer_addr, "UDP associate request rejected: UDP support is disabled");
-                return Err(anyhow!("UDP support is disabled"));
-            }
             udp::handle_udp_associate(stream, request.addr, request.payload, peer_addr).await
         }
     }
 }
 
-async fn process_grpc_stream<S>(
-    password: [u8; 56],
-    enable_udp: bool,
-    mut stream: S,
-    peer_addr: String,
-) -> Result<()>
+async fn process_grpc_stream<S>(password: [u8; 56], mut stream: S, peer_addr: String) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -437,15 +443,6 @@ where
             finish_grpc_stream(&mut stream, result, &peer_addr).await
         }
         TrojanCmd::UdpAssociate => {
-            if !enable_udp {
-                log::warn!(peer = %peer_addr, "UDP associate request rejected: UDP support is disabled");
-                return finish_grpc_stream(
-                    &mut stream,
-                    Err(anyhow!("UDP support is disabled")),
-                    &peer_addr,
-                )
-                .await;
-            }
             udp::handle_udp_associate(stream, request.addr, request.payload, peer_addr).await
         }
     }
@@ -661,17 +658,13 @@ where
                 server.grpc_limits,
             )
             .await?;
-            let result =
-                grpc_conn
-                    .run(move |transport| {
-                        let password = server.password;
-                        let enable_udp = server.enable_udp;
-                        let peer_addr = peer_addr.clone();
-                        async move {
-                            process_grpc_stream(password, enable_udp, transport, peer_addr).await
-                        }
-                    })
-                    .await;
+            let result = grpc_conn
+                .run(move |transport| {
+                    let password = server.password;
+                    let peer_addr = peer_addr.clone();
+                    async move { process_grpc_stream(password, transport, peer_addr).await }
+                })
+                .await;
 
             match &result {
                 Ok(()) => {
@@ -699,10 +692,6 @@ where
 
 impl Server {
     pub async fn run(self) -> Result<()> {
-        if let Some(acme) = self.acme.clone() {
-            return self.run_with_acme(acme).await;
-        }
-
         let server = Arc::new(self);
         let addr = server.listener.local_addr_string()?;
         let mode = match server.transport_mode {
@@ -712,7 +701,13 @@ impl Server {
         };
         let tls_enabled = server.tls_acceptor.is_some() || server.reality_acceptor.is_some();
 
-        log::info!(address = %addr, mode = mode, tls = tls_enabled, "Server started");
+        log::info!(
+            inbound = server.inbound_tag.as_deref().unwrap_or("legacy"),
+            address = %addr,
+            mode = mode,
+            tls = tls_enabled,
+            "Server started"
+        );
 
         loop {
             match server.listener.accept().await {
@@ -836,98 +831,10 @@ impl Server {
 
         Ok(())
     }
-
-    async fn run_with_acme(self, acme: config::AcmeSettings) -> Result<()> {
-        if !matches!(self.listener, Listener::Tcp(_)) {
-            return Err(anyhow!("ACME requires a TCP listener"));
-        }
-
-        let server = Arc::new(self);
-        let addr = server.listener.local_addr_string()?;
-        let acme_tls = acme::AcmeTls::new(&acme, server.transport_mode)?;
-
-        log::info!(
-            address = %addr,
-            domain = %acme.domain,
-            staging = acme.staging,
-            cache_dir = %acme.cache_dir,
-            "ACME TLS-ALPN-01 enabled"
-        );
-
-        loop {
-            match server.listener.accept().await {
-                Ok((stream, peer_addr, peer_ip)) => {
-                    let connection_permit = match server
-                        .connection_limits
-                        .try_acquire_connection(peer_ip)
-                    {
-                        Ok(permit) => permit,
-                        Err(ConnectionLimitError::Total) => {
-                            log::warn!(peer = %peer_addr, "Connection rejected: total connection limit reached");
-                            continue;
-                        }
-                        Err(ConnectionLimitError::PerIp(ip)) => {
-                            log::warn!(peer = %peer_addr, ip = %ip, "Connection rejected: per-IP connection limit reached");
-                            continue;
-                        }
-                    };
-
-                    let server_clone = Arc::clone(&server);
-                    let acme_tls = acme_tls.clone();
-                    tokio::spawn(async move {
-                        let _connection_permit = connection_permit;
-                        let _handshake_permit = match server_clone
-                            .connection_limits
-                            .try_acquire_tls_handshake()
-                        {
-                            Some(permit) => permit,
-                            None => {
-                                log::warn!(peer = %peer_addr, "Connection rejected: TLS handshake limit reached");
-                                return;
-                            }
-                        };
-
-                        let tls_stream = match acme_tls.accept(stream).await {
-                            Ok(Some(stream)) => stream,
-                            Ok(None) => {
-                                log::info!(peer = %peer_addr, "ACME TLS-ALPN-01 validation completed");
-                                return;
-                            }
-                            Err(error) => {
-                                log::debug!(peer = %peer_addr, error = %error, "TLS handshake rejected");
-                                return;
-                            }
-                        };
-                        drop(_handshake_permit);
-
-                        if let Err(error) =
-                            accept_connection(server_clone, tls_stream, peer_addr.clone()).await
-                        {
-                            log::error!(peer = %peer_addr, error = %error, "Connection error");
-                        } else {
-                            log::connection(&peer_addr, "closed");
-                        }
-                    });
-                }
-                Err(error) => {
-                    log::error!(error = %error, "Failed to accept connection");
-                    break;
-                }
-            }
-        }
-
-        Ok(())
-    }
 }
 
 pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
-    let acme = config.acme_settings()?;
     let reality = config.reality_settings()?;
-    if acme.is_some() && config.unix_path.is_some() {
-        return Err(anyhow!(
-            "ACME cannot be used with a Unix Domain Socket listener"
-        ));
-    }
     if reality.is_some() && config.unix_path.is_some() {
         return Err(anyhow!("REALITY requires a TCP listener"));
     }
@@ -948,6 +855,10 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
                 "Unix Domain Sockets are not supported on this platform"
             ));
         }
+    } else if let Some(ref listen_addr) = config.listen_addr {
+        Listener::Tcp(bind_inbound_tcp_listener(listen_addr.parse().map_err(
+            |_| anyhow!("invalid inbound listen address {listen_addr:?}"),
+        )?)?)
     } else {
         let addr: String = format!("{}:{}", config.host, config.port);
         let tcp_listener = TcpListener::bind(addr).await?;
@@ -972,7 +883,7 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         TransportMode::Tcp
     };
 
-    let tls_acceptor = if acme.is_some() || reality.is_some() {
+    let tls_acceptor = if reality.is_some() {
         None
     } else {
         tls::get_tls_acceptor(config.cert, config.key, transport_mode)
@@ -988,11 +899,33 @@ pub async fn build_server(config: config::ServerConfig) -> Result<Server> {
         grpc_service_name: config.grpc_service_name,
         grpc_limits,
         connection_limits,
-        acme,
-        enable_udp: config.enable_udp,
         tls_acceptor,
         reality_acceptor,
+        inbound_tag: config.inbound_tag,
     })
+}
+
+/// Build one runtime server per configured inbound. Connection limits are
+/// shared so adding listeners cannot bypass the process-wide safety limits.
+pub async fn build_servers(config: config::ServerConfig) -> Result<Vec<Server>> {
+    let inbound_configs = config.expand_inbounds()?;
+    let shared_limits = ConnectionLimits::new(
+        config.max_connections,
+        config.max_tls_handshakes,
+        config.max_connections_per_ip,
+    );
+    let mut servers = Vec::with_capacity(inbound_configs.len());
+    for inbound_config in inbound_configs {
+        let mut server = build_server(inbound_config).await?;
+        server.connection_limits = shared_limits.clone();
+        servers.push(server);
+    }
+    Ok(servers)
+}
+
+async fn run_servers(servers: Vec<Server>) -> Result<()> {
+    futures::future::try_join_all(servers.into_iter().map(Server::run)).await?;
+    Ok(())
 }
 
 #[tokio::main]
@@ -1006,8 +939,8 @@ async fn main() -> Result<()> {
 
     let config = config::ServerConfig::load()?;
 
-    let server = build_server(config).await?;
-    server.run().await
+    let servers = build_servers(config).await?;
+    run_servers(servers).await
 }
 
 #[cfg(test)]
@@ -1074,6 +1007,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multiple_inbounds_bind_independent_listeners_with_shared_limits() {
+        let mut config = toml::from_str::<config::TomlConfig>(
+            r#"
+                [server]
+                max_connections = 7
+            "#,
+        )
+        .unwrap()
+        .to_server_config();
+        config.inbounds = vec![
+            config::InboundSettings {
+                tag: Some("first".to_string()),
+                listen: vec!["127.0.0.1:0".to_string()],
+                transport: config::InboundTransport::Tcp,
+                password: "test-password".to_string(),
+                unix_path: None,
+                ws_host: None,
+                ws_path: None,
+                grpc_service_name: None,
+                tls: None,
+                reality: None,
+            },
+            config::InboundSettings {
+                tag: Some("second".to_string()),
+                listen: vec!["127.0.0.1:0".to_string()],
+                transport: config::InboundTransport::Grpc,
+                password: "test-password".to_string(),
+                unix_path: None,
+                ws_host: None,
+                ws_path: None,
+                grpc_service_name: Some("GunService".to_string()),
+                tls: None,
+                reality: None,
+            },
+        ];
+
+        let servers = build_servers(config).await.unwrap();
+        assert_eq!(servers.len(), 2);
+        assert!(matches!(servers[0].listener, Listener::Tcp(_)));
+        assert!(matches!(servers[1].listener, Listener::Tcp(_)));
+        assert_eq!(servers[0].inbound_tag.as_deref(), Some("first"));
+        assert_eq!(servers[1].inbound_tag.as_deref(), Some("second"));
+        assert!(matches!(servers[1].transport_mode, TransportMode::Grpc));
+        assert!(Arc::ptr_eq(
+            &servers[0].connection_limits.active_connections,
+            &servers[1].connection_limits.active_connections,
+        ));
+    }
+
+    #[tokio::test]
     async fn grpc_password_failure_sends_ok_trailers() {
         let (server_io, client_io) = tokio::io::duplex(1024 * 1024);
         let password = [0x11; 56];
@@ -1084,8 +1067,7 @@ mod tests {
                     .await
                     .expect("server handshake should succeed");
                 conn.run(move |transport| async move {
-                    process_grpc_stream(password, false, transport, "127.0.0.1:12345".to_string())
-                        .await
+                    process_grpc_stream(password, transport, "127.0.0.1:12345".to_string()).await
                 })
                 .await
             }
@@ -1155,11 +1137,6 @@ mod tests {
             max_connections: 10,
             max_tls_handshakes: 2,
             max_connections_per_ip: 3,
-            acme_domain: None,
-            acme_email: None,
-            acme_cache_dir: config::DEFAULT_ACME_CACHE_DIR.to_string(),
-            acme_staging: false,
-            enable_udp: false,
             cert: None,
             key: None,
             enable_reality: false,
@@ -1172,6 +1149,9 @@ mod tests {
             generate_reality_keypair: false,
             log_level: None,
             unix_path: Some(unix_path.clone()),
+            inbounds: Vec::new(),
+            listen_addr: None,
+            inbound_tag: None,
         };
 
         let server = build_server(config).await.expect("failed to build server");

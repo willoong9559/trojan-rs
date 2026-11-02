@@ -14,8 +14,8 @@ hex = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 tokio-rustls = "0.26.4"
-# Ordinary TLS and ACME stay on the upstream crate. REALITY uses the vendored
-# fork below under a distinct crate name.
+# Ordinary TLS stays on the upstream crate. REALITY uses the vendored fork
+# below under a distinct crate name.
 rustls = "0.23.36"
 rustls-reality = { package = "rustls", path = "vendor/rustls-reality/rustls" }
 rustls-pemfile = "2.2.0"
@@ -27,7 +27,6 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "0.9"
 tonic = "0.14"
 tokio-stream = "0.1.18"
-tokio-rustls-acme = "0.9.1"
 futures = "0.3.31"
 h2 = "0.4.13"
 http = "1.4.0"

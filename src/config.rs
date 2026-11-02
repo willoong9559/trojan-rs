@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path};
+use std::{fs, net::SocketAddr, path::Path};
 
 use crate::grpc::{
     GrpcLimits, DEFAULT_GRPC_MAX_CONCURRENT_STREAMS, DEFAULT_GRPC_MAX_MESSAGE_BYTES,
@@ -11,16 +11,6 @@ use crate::grpc::{
 pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 pub const DEFAULT_MAX_TLS_HANDSHAKES: usize = 64;
 pub const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 32;
-pub const DEFAULT_ACME_CACHE_DIR: &str = "/var/lib/trojan-rs/acme";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AcmeSettings {
-    pub domain: String,
-    pub email: String,
-    pub cache_dir: String,
-    pub staging: bool,
-}
-
 /// Settings for a REALITY listener.  The destination is the public TLS site
 /// mirrored for unauthenticated connections (for example `www.example.com:443`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,120 +21,112 @@ pub struct RealitySettings {
     pub max_time_diff_ms: Option<u64>,
 }
 
+/// Transport selected for one independently bound inbound listener.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InboundTransport {
+    #[default]
+    Tcp,
+    #[serde(rename = "websocket", alias = "web_socket")]
+    WebSocket,
+    Grpc,
+}
+
+/// A listener declared in TOML's `[[inbounds]]` array.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboundSettings {
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listen: Vec<String>,
+    #[serde(default)]
+    pub transport: InboundTransport,
+    pub password: String,
+    #[serde(default)]
+    pub unix_path: Option<String>,
+    #[serde(default)]
+    pub ws_host: Option<String>,
+    #[serde(default)]
+    pub ws_path: Option<String>,
+    #[serde(default)]
+    pub grpc_service_name: Option<String>,
+    #[serde(default)]
+    pub tls: Option<TlsSettings>,
+    #[serde(default)]
+    pub reality: Option<RealityTomlSettings>,
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Trojan Server")]
 pub struct ServerConfig {
-    /// Host address
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(skip)]
     pub host: String,
 
-    /// Port number
-    #[arg(long, default_value = "35537")]
+    #[arg(skip)]
     pub port: String,
 
-    /// Password
-    #[arg(long, default_value = "")]
+    #[arg(skip)]
     pub password: String,
 
-    /// Enable WebSocket mode
-    #[arg(long, default_value_t = false)]
+    #[arg(skip)]
     pub enable_ws: bool,
 
-    /// Enable gRPC mode
-    #[arg(long, default_value_t = false)]
+    #[arg(skip)]
     pub enable_grpc: bool,
 
-    /// Expected WebSocket Host header
-    #[arg(long)]
+    #[arg(skip)]
     pub ws_host: Option<String>,
 
-    /// Expected WebSocket request path
-    #[arg(long)]
+    #[arg(skip)]
     pub ws_path: Option<String>,
 
-    /// Expected gRPC service name
-    #[arg(long)]
+    #[arg(skip)]
     pub grpc_service_name: Option<String>,
 
-    /// Maximum concurrent gRPC streams per HTTP/2 connection
-    #[arg(long, default_value_t = DEFAULT_GRPC_MAX_CONCURRENT_STREAMS)]
+    #[arg(skip)]
     pub grpc_max_concurrent_streams: u32,
 
-    /// Maximum buffered gRPC request bytes per stream
-    #[arg(long, default_value_t = DEFAULT_GRPC_MAX_READ_BUFFER_BYTES)]
+    #[arg(skip)]
     pub grpc_max_read_buffer_bytes: usize,
 
-    /// Maximum uncompressed payload in one gRPC message
-    #[arg(long, default_value_t = DEFAULT_GRPC_MAX_MESSAGE_BYTES)]
+    #[arg(skip)]
     pub grpc_max_message_bytes: usize,
 
-    /// Maximum queued gRPC response bytes per stream
-    #[arg(long, default_value_t = DEFAULT_GRPC_MAX_SEND_QUEUE_BYTES)]
+    #[arg(skip)]
     pub grpc_max_send_queue_bytes: usize,
 
-    /// Maximum active connections, including connections in TLS handshake
-    #[arg(long, default_value_t = DEFAULT_MAX_CONNECTIONS)]
+    #[arg(skip)]
     pub max_connections: usize,
 
-    /// Maximum concurrent TLS handshakes
-    #[arg(long, default_value_t = DEFAULT_MAX_TLS_HANDSHAKES)]
+    #[arg(skip)]
     pub max_tls_handshakes: usize,
 
-    /// Maximum active TCP connections from a single IP address
-    #[arg(long, default_value_t = DEFAULT_MAX_CONNECTIONS_PER_IP)]
+    #[arg(skip)]
     pub max_connections_per_ip: usize,
 
-    /// Domain name to provision through Let's Encrypt using TLS-ALPN-01
-    #[arg(long)]
-    pub acme_domain: Option<String>,
-
-    /// Let's Encrypt account contact email
-    #[arg(long)]
-    pub acme_email: Option<String>,
-
-    /// Directory for the ACME account and certificate cache
-    #[arg(long, default_value = DEFAULT_ACME_CACHE_DIR)]
-    pub acme_cache_dir: String,
-
-    /// Use the Let's Encrypt staging environment
-    #[arg(long, default_value_t = false)]
-    pub acme_staging: bool,
-
-    /// Enable UDP support
-    #[arg(long, default_value_t = true)]
-    pub enable_udp: bool,
-
-    /// TLS certificate file path (optional)
-    #[arg(long)]
+    #[arg(skip)]
     pub cert: Option<String>,
 
-    /// TLS private key file path (optional)
-    #[arg(long)]
+    #[arg(skip)]
     pub key: Option<String>,
 
-    /// Enable REALITY instead of ordinary TLS. Requires --reality-dest,
-    /// --reality-private-key and at least one --reality-short-id.
-    #[arg(long, default_value_t = false)]
+    #[arg(skip)]
     pub enable_reality: bool,
 
-    /// REALITY cover destination in `hostname:port` form
-    #[arg(long)]
+    #[arg(skip)]
     pub reality_dest: Option<String>,
 
-    /// REALITY X25519 private key, base64url without padding
-    #[arg(long)]
+    #[arg(skip)]
     pub reality_private_key: Option<String>,
 
-    /// Accepted REALITY short ID, 0-16 hexadecimal characters. May be repeated.
-    #[arg(long = "reality-short-id")]
+    #[arg(skip)]
     pub reality_short_ids: Vec<String>,
 
-    /// Optional maximum client clock skew for REALITY, in milliseconds
-    #[arg(long)]
+    #[arg(skip)]
     pub reality_max_time_diff_ms: Option<u64>,
 
-    /// Unix Domain Socket path (optional)
-    #[arg(long)]
+    #[arg(skip)]
     pub unix_path: Option<String>,
 
     /// Load configuration from TOML file
@@ -162,12 +144,23 @@ pub struct ServerConfig {
     /// Log level (trace, debug, info, warn, error)
     #[arg(long)]
     pub log_level: Option<String>,
+
+    /// TOML-only listener definitions. At least one is required at runtime.
+    #[arg(skip)]
+    pub inbounds: Vec<InboundSettings>,
+
+    /// Resolved socket address for one expanded inbound.
+    #[arg(skip)]
+    pub listen_addr: Option<String>,
+
+    #[arg(skip)]
+    pub inbound_tag: Option<String>,
 }
 
 impl ServerConfig {
     /// 从 TOML 文件或命令行参数加载配置
     pub fn load() -> Result<Self> {
-        let mut config = Self::parse();
+        let config = Self::parse();
 
         if config.generate_reality_keypair {
             let (private_key, public_key) = crate::reality::generate_keypair()?;
@@ -183,136 +176,138 @@ impl ServerConfig {
             std::process::exit(0);
         }
 
-        // 如果指定了配置文件，从文件加载
-        if let Some(ref config_path) = config.config_file {
-            println!("Loading configuration from: {}", config_path);
-            let toml_config = TomlConfig::from_file(config_path)?;
+        let config_path = config.config_file.clone().ok_or_else(|| {
+            anyhow!("a TOML configuration file is required; use --config-file <FILE>")
+        })?;
+        println!("Loading configuration from: {config_path}");
+        let mut config = TomlConfig::from_file(&config_path)?.to_server_config();
+        config.config_file = Some(config_path);
 
-            // 转换成 ServerConfig
-            let file_config = toml_config.to_server_config();
-
-            // 只有命令行参数为默认值时才使用文件配置
-            if config.host == "127.0.0.1" {
-                config.host = file_config.host;
-            }
-            if config.port == "35537" {
-                config.port = file_config.port;
-            }
-            if config.password.is_empty() {
-                config.password = file_config.password;
-            }
-            if !config.enable_ws {
-                config.enable_ws = file_config.enable_ws;
-            }
-            if !config.enable_grpc {
-                config.enable_grpc = file_config.enable_grpc;
-            }
-            if config.ws_host.is_none() {
-                config.ws_host = file_config.ws_host;
-            }
-            if config.ws_path.is_none() {
-                config.ws_path = file_config.ws_path;
-            }
-            if config.grpc_service_name.is_none() {
-                config.grpc_service_name = file_config.grpc_service_name;
-            }
-            if config.grpc_max_concurrent_streams == DEFAULT_GRPC_MAX_CONCURRENT_STREAMS {
-                config.grpc_max_concurrent_streams = file_config.grpc_max_concurrent_streams;
-            }
-            if config.grpc_max_read_buffer_bytes == DEFAULT_GRPC_MAX_READ_BUFFER_BYTES {
-                config.grpc_max_read_buffer_bytes = file_config.grpc_max_read_buffer_bytes;
-            }
-            if config.grpc_max_message_bytes == DEFAULT_GRPC_MAX_MESSAGE_BYTES {
-                config.grpc_max_message_bytes = file_config.grpc_max_message_bytes;
-            }
-            if config.grpc_max_send_queue_bytes == DEFAULT_GRPC_MAX_SEND_QUEUE_BYTES {
-                config.grpc_max_send_queue_bytes = file_config.grpc_max_send_queue_bytes;
-            }
-            if config.max_connections == DEFAULT_MAX_CONNECTIONS {
-                config.max_connections = file_config.max_connections;
-            }
-            if config.max_tls_handshakes == DEFAULT_MAX_TLS_HANDSHAKES {
-                config.max_tls_handshakes = file_config.max_tls_handshakes;
-            }
-            if config.max_connections_per_ip == DEFAULT_MAX_CONNECTIONS_PER_IP {
-                config.max_connections_per_ip = file_config.max_connections_per_ip;
-            }
-            if config.acme_domain.is_none() {
-                config.acme_domain = file_config.acme_domain;
-            }
-            if config.acme_email.is_none() {
-                config.acme_email = file_config.acme_email;
-            }
-            if config.acme_cache_dir == DEFAULT_ACME_CACHE_DIR {
-                config.acme_cache_dir = file_config.acme_cache_dir;
-            }
-            if !config.acme_staging {
-                config.acme_staging = file_config.acme_staging;
-            }
-            if config.enable_udp {
-                config.enable_udp = file_config.enable_udp;
-            }
-            if config.cert.is_none() {
-                config.cert = file_config.cert;
-            }
-            if config.key.is_none() {
-                config.key = file_config.key;
-            }
-            if !config.enable_reality {
-                config.enable_reality = file_config.enable_reality;
-            }
-            if config.reality_dest.is_none() {
-                config.reality_dest = file_config.reality_dest;
-            }
-            if config.reality_private_key.is_none() {
-                config.reality_private_key = file_config.reality_private_key;
-            }
-            if config.reality_short_ids.is_empty() {
-                config.reality_short_ids = file_config.reality_short_ids;
-            }
-            if config.reality_max_time_diff_ms.is_none() {
-                config.reality_max_time_diff_ms = file_config.reality_max_time_diff_ms;
-            }
-            if config.unix_path.is_none() {
-                config.unix_path = file_config.unix_path;
-            }
-            if config.log_level.is_none() {
-                config.log_level = file_config.log_level;
-            }
-        }
-
-        // 验证密码不为空
-        if config.password.is_empty() {
+        if config.inbounds.is_empty()
+            || config
+                .inbounds
+                .iter()
+                .any(|inbound| inbound.password.trim().is_empty())
+        {
             return Err(anyhow!(
-                "Password must be provided either via --password or config file"
+                "every configured inbound must provide a non-empty password"
             ));
         }
 
-        if config.enable_ws && config.enable_grpc {
-            return Err(anyhow!(
-                "WebSocket mode and gRPC mode cannot be enabled simultaneously"
-            ));
-        }
-
-        config.ws_host = normalize_optional_value(config.ws_host, "WebSocket host")?;
-        config.ws_path = normalize_ws_path(config.ws_path)?;
-        config.grpc_service_name = normalize_grpc_service_name(config.grpc_service_name)?;
-        config.unix_path = normalize_optional_value(config.unix_path, "Unix Domain Socket path")?;
         config.grpc_limits()?;
         config.validate_connection_limits()?;
-        config.acme_settings()?;
-        config.reality_settings()?;
-
-        if config.enable_reality && (config.cert.is_some() || config.key.is_some()) {
-            return Err(anyhow!(
-                "REALITY cannot be enabled together with a static TLS certificate"
-            ));
-        }
-        if config.enable_reality && config.acme_domain.is_some() {
-            return Err(anyhow!("REALITY cannot be enabled together with ACME"));
-        }
 
         Ok(config)
+    }
+
+    /// Expands TOML `[[inbounds]]` into one runtime configuration per socket.
+    pub fn expand_inbounds(&self) -> Result<Vec<Self>> {
+        if self.inbounds.is_empty() {
+            return Err(anyhow!(
+                "configuration requires at least one [[inbounds]] entry"
+            ));
+        }
+        if self.enable_reality {
+            return Err(anyhow!(
+                "move legacy [reality] settings into the appropriate [[inbounds]] entry"
+            ));
+        }
+
+        let mut expanded = Vec::new();
+        for inbound in &self.inbounds {
+            if inbound.listen.is_empty() && inbound.unix_path.is_none() {
+                return Err(anyhow!(
+                    "each [[inbounds]] entry requires listen and/or unix_path"
+                ));
+            }
+            if inbound.tls.is_some() && inbound.reality.is_some() {
+                return Err(anyhow!(
+                    "an inbound cannot enable ordinary TLS and REALITY together"
+                ));
+            }
+
+            for listen in &inbound.listen {
+                let address: SocketAddr = listen.parse().map_err(|_| {
+                    anyhow!(
+                        "invalid inbound listen address {listen:?}; use 0.0.0.0:PORT or [::]:PORT"
+                    )
+                })?;
+                let mut config = self.clone();
+                config.inbounds.clear();
+                config.listen_addr = Some(address.to_string());
+                config.inbound_tag = inbound.tag.clone();
+                config.enable_ws = matches!(inbound.transport, InboundTransport::WebSocket);
+                config.enable_grpc = matches!(inbound.transport, InboundTransport::Grpc);
+                config.ws_host = inbound.ws_host.clone();
+                config.ws_path = normalize_ws_path(inbound.ws_path.clone())?;
+                config.grpc_service_name =
+                    normalize_grpc_service_name(inbound.grpc_service_name.clone())?;
+                config.password = inbound.password.trim().to_string();
+                if config.password.is_empty() {
+                    return Err(anyhow!("inbound password cannot be empty"));
+                }
+
+                if let Some(tls) = &inbound.tls {
+                    config.cert = Some(tls.cert.clone());
+                    config.key = Some(tls.key.clone());
+                }
+                config.enable_reality = inbound.reality.is_some();
+                if let Some(reality) = &inbound.reality {
+                    config.cert = None;
+                    config.key = None;
+                    config.reality_dest = Some(reality.dest.clone());
+                    config.reality_private_key = Some(reality.private_key.clone());
+                    config.reality_short_ids = reality.short_ids.clone();
+                    config.reality_max_time_diff_ms = reality.max_time_diff_ms;
+                } else {
+                    config.reality_dest = None;
+                    config.reality_private_key = None;
+                    config.reality_short_ids.clear();
+                    config.reality_max_time_diff_ms = None;
+                }
+
+                config.grpc_limits()?;
+                config.reality_settings()?;
+                expanded.push(config);
+            }
+
+            if let Some(path) = &inbound.unix_path {
+                if inbound.reality.is_some() {
+                    return Err(anyhow!("REALITY requires a TCP listen address"));
+                }
+
+                let mut config = self.clone();
+                config.inbounds.clear();
+                config.listen_addr = None;
+                config.inbound_tag = inbound.tag.clone();
+                config.unix_path = normalize_optional_value(
+                    Some(path.clone()),
+                    "inbound Unix Domain Socket path",
+                )?;
+                config.enable_ws = matches!(inbound.transport, InboundTransport::WebSocket);
+                config.enable_grpc = matches!(inbound.transport, InboundTransport::Grpc);
+                config.ws_host = inbound.ws_host.clone();
+                config.ws_path = normalize_ws_path(inbound.ws_path.clone())?;
+                config.grpc_service_name =
+                    normalize_grpc_service_name(inbound.grpc_service_name.clone())?;
+                config.password = inbound.password.trim().to_string();
+                if config.password.is_empty() {
+                    return Err(anyhow!("inbound password cannot be empty"));
+                }
+                if let Some(tls) = &inbound.tls {
+                    config.cert = Some(tls.cert.clone());
+                    config.key = Some(tls.key.clone());
+                }
+                config.enable_reality = false;
+                config.reality_dest = None;
+                config.reality_private_key = None;
+                config.reality_short_ids.clear();
+                config.reality_max_time_diff_ms = None;
+                config.grpc_limits()?;
+                expanded.push(config);
+            }
+        }
+        Ok(expanded)
     }
 
     pub fn grpc_limits(&self) -> Result<GrpcLimits> {
@@ -370,41 +365,6 @@ impl ServerConfig {
         Ok(())
     }
 
-    pub fn acme_settings(&self) -> Result<Option<AcmeSettings>> {
-        let domain = normalize_optional_value(self.acme_domain.clone(), "ACME domain")?;
-        let email = normalize_optional_value(self.acme_email.clone(), "ACME email")?;
-
-        match (domain, email) {
-            (None, None) => Ok(None),
-            (Some(domain), Some(email)) => {
-                if self.cert.is_some() || self.key.is_some() {
-                    return Err(anyhow!(
-                        "ACME settings cannot be combined with --cert or --key"
-                    ));
-                }
-                if !domain.contains('.') || domain.starts_with('.') || domain.ends_with('.') {
-                    return Err(anyhow!("ACME domain must be a fully qualified domain name"));
-                }
-                if !email.contains('@') {
-                    return Err(anyhow!("ACME email must contain '@'"));
-                }
-                let cache_dir = self.acme_cache_dir.trim();
-                if cache_dir.is_empty() {
-                    return Err(anyhow!("ACME cache directory cannot be empty"));
-                }
-                Ok(Some(AcmeSettings {
-                    domain,
-                    email,
-                    cache_dir: cache_dir.to_string(),
-                    staging: self.acme_staging,
-                }))
-            }
-            _ => Err(anyhow!(
-                "ACME domain and ACME email must be configured together"
-            )),
-        }
-    }
-
     pub fn reality_settings(&self) -> Result<Option<RealitySettings>> {
         if !self.enable_reality {
             return Ok(None);
@@ -451,37 +411,18 @@ impl ServerConfig {
 // =============== TOML 配置部分 ==================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TomlConfig {
     pub server: ServerSettings,
     #[serde(default)]
-    pub tls: Option<TlsSettings>,
-    #[serde(default)]
-    pub reality: Option<RealityTomlSettings>,
-    #[serde(default)]
     pub log: Option<LogSettings>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inbounds: Vec<InboundSettings>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerSettings {
-    pub host: String,
-    pub port: String,
-    pub password: String,
-
-    #[serde(default)]
-    pub enable_ws: bool,
-
-    #[serde(default)]
-    pub enable_grpc: bool,
-
-    #[serde(default)]
-    pub ws_host: Option<String>,
-
-    #[serde(default)]
-    pub ws_path: Option<String>,
-
-    #[serde(default)]
-    pub grpc_service_name: Option<String>,
-
     #[serde(default = "default_grpc_max_concurrent_streams")]
     pub grpc_max_concurrent_streams: u32,
 
@@ -502,37 +443,16 @@ pub struct ServerSettings {
 
     #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: usize,
-
-    #[serde(default = "default_enable_udp")]
-    pub enable_udp: bool,
-
-    #[serde(default)]
-    pub unix_path: Option<String>,
-
-    #[serde(default)]
-    pub acme_domain: Option<String>,
-
-    #[serde(default)]
-    pub acme_email: Option<String>,
-
-    #[serde(default = "default_acme_cache_dir")]
-    pub acme_cache_dir: String,
-
-    #[serde(default)]
-    pub acme_staging: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RealityTomlSettings {
     pub dest: String,
     pub private_key: String,
     pub short_ids: Vec<String>,
     #[serde(default)]
     pub max_time_diff_ms: Option<u64>,
-}
-
-const fn default_enable_udp() -> bool {
-    true
 }
 
 const fn default_grpc_max_concurrent_streams() -> u32 {
@@ -563,11 +483,8 @@ const fn default_max_connections_per_ip() -> usize {
     DEFAULT_MAX_CONNECTIONS_PER_IP
 }
 
-fn default_acme_cache_dir() -> String {
-    DEFAULT_ACME_CACHE_DIR.to_string()
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsSettings {
     pub cert: String,
     pub key: String,
@@ -584,6 +501,66 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+fn example_inbounds() -> Vec<InboundSettings> {
+    let tls = || {
+        Some(TlsSettings {
+            cert: "/path/to/cert.pem".to_string(),
+            key: "/path/to/key.pem".to_string(),
+        })
+    };
+
+    vec![
+        InboundSettings {
+            tag: Some("trojan-tcp".to_string()),
+            listen: vec!["0.0.0.0:443".to_string(), "[::]:443".to_string()],
+            transport: InboundTransport::Tcp,
+            password: "your_password_here".to_string(),
+            unix_path: None,
+            ws_host: None,
+            ws_path: None,
+            grpc_service_name: None,
+            tls: tls(),
+            reality: None,
+        },
+        InboundSettings {
+            tag: Some("trojan-websocket".to_string()),
+            listen: vec!["0.0.0.0:8443".to_string(), "[::]:8443".to_string()],
+            transport: InboundTransport::WebSocket,
+            password: "your_password_here".to_string(),
+            unix_path: None,
+            ws_host: Some("cdn.example.com".to_string()),
+            ws_path: Some("/trojan".to_string()),
+            grpc_service_name: None,
+            tls: tls(),
+            reality: None,
+        },
+        InboundSettings {
+            tag: Some("trojan-grpc".to_string()),
+            listen: vec!["0.0.0.0:9443".to_string(), "[::]:9443".to_string()],
+            transport: InboundTransport::Grpc,
+            password: "your_password_here".to_string(),
+            unix_path: None,
+            ws_host: None,
+            ws_path: None,
+            grpc_service_name: Some("GunService".to_string()),
+            tls: tls(),
+            reality: None,
+        },
+        InboundSettings {
+            tag: Some("trojan-uds".to_string()),
+            listen: Vec::new(),
+            transport: InboundTransport::WebSocket,
+            password: "your_password_here".to_string(),
+            unix_path: Some("/run/trojan-rs/trojan.sock".to_string()),
+            ws_host: None,
+            ws_path: Some("/trojan-uds".to_string()),
+            grpc_service_name: None,
+            tls: None,
+            reality: None,
+        },
+    ]
+}
+
 impl TomlConfig {
     /// 从文件加载配置
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -596,14 +573,6 @@ impl TomlConfig {
     pub fn generate_example<P: AsRef<Path>>(path: P) -> Result<()> {
         let example = TomlConfig {
             server: ServerSettings {
-                host: "127.0.0.1".to_string(),
-                port: "35537".to_string(),
-                password: "your_password_here".to_string(),
-                enable_ws: true,
-                enable_grpc: false,
-                ws_host: Some("cdn.example.com".to_string()),
-                ws_path: Some("/ws".to_string()),
-                grpc_service_name: Some("GunService".to_string()),
                 grpc_max_concurrent_streams: default_grpc_max_concurrent_streams(),
                 grpc_max_read_buffer_bytes: default_grpc_max_read_buffer_bytes(),
                 grpc_max_message_bytes: default_grpc_max_message_bytes(),
@@ -611,36 +580,14 @@ impl TomlConfig {
                 max_connections: default_max_connections(),
                 max_tls_handshakes: default_max_tls_handshakes(),
                 max_connections_per_ip: default_max_connections_per_ip(),
-                enable_udp: true,
-                unix_path: None,
-                acme_domain: None,
-                acme_email: None,
-                acme_cache_dir: default_acme_cache_dir(),
-                acme_staging: false,
             },
-            tls: Some(TlsSettings {
-                cert: "/path/to/cert.pem".to_string(),
-                key: "/path/to/key.pem".to_string(),
-            }),
-            reality: None,
             log: Some(LogSettings {
                 level: "info".to_string(),
             }),
+            inbounds: example_inbounds(),
         };
 
-        let mut toml_str = toml::to_string_pretty(&example)?;
-        toml_str.push_str(
-            r#"
-
-# REALITY is an alternative to [tls] and ACME. Uncomment this block only after
-# removing [tls] and the ACME settings above.
-# [reality]
-# dest = "www.example.com:443"
-# private_key = "base64url-x25519-private-key"
-# short_ids = ["0123456789abcdef"]
-# max_time_diff_ms = 60000
-"#,
-        );
+        let toml_str = toml::to_string_pretty(&example)?;
         fs::write(path, toml_str)?;
         Ok(())
     }
@@ -648,14 +595,14 @@ impl TomlConfig {
     /// 转换为 ServerConfig
     pub fn to_server_config(self) -> ServerConfig {
         ServerConfig {
-            host: self.server.host,
-            port: self.server.port,
-            password: self.server.password,
-            enable_ws: self.server.enable_ws,
-            enable_grpc: self.server.enable_grpc,
-            ws_host: self.server.ws_host,
-            ws_path: self.server.ws_path,
-            grpc_service_name: self.server.grpc_service_name,
+            host: String::new(),
+            port: String::new(),
+            password: String::new(),
+            enable_ws: false,
+            enable_grpc: false,
+            ws_host: None,
+            ws_path: None,
+            grpc_service_name: None,
             grpc_max_concurrent_streams: self.server.grpc_max_concurrent_streams,
             grpc_max_read_buffer_bytes: self.server.grpc_max_read_buffer_bytes,
             grpc_max_message_bytes: self.server.grpc_max_message_bytes,
@@ -663,27 +610,21 @@ impl TomlConfig {
             max_connections: self.server.max_connections,
             max_tls_handshakes: self.server.max_tls_handshakes,
             max_connections_per_ip: self.server.max_connections_per_ip,
-            enable_udp: self.server.enable_udp,
-            cert: self.tls.as_ref().map(|t| t.cert.clone()),
-            key: self.tls.as_ref().map(|t| t.key.clone()),
-            enable_reality: self.reality.is_some(),
-            reality_dest: self.reality.as_ref().map(|r| r.dest.clone()),
-            reality_private_key: self.reality.as_ref().map(|r| r.private_key.clone()),
-            reality_short_ids: self
-                .reality
-                .as_ref()
-                .map(|r| r.short_ids.clone())
-                .unwrap_or_default(),
-            reality_max_time_diff_ms: self.reality.as_ref().and_then(|r| r.max_time_diff_ms),
+            cert: None,
+            key: None,
+            enable_reality: false,
+            reality_dest: None,
+            reality_private_key: None,
+            reality_short_ids: Vec::new(),
+            reality_max_time_diff_ms: None,
             config_file: None,
             generate_config: None,
             generate_reality_keypair: false,
             log_level: self.log.map(|l| l.level),
-            unix_path: self.server.unix_path,
-            acme_domain: self.server.acme_domain,
-            acme_email: self.server.acme_email,
-            acme_cache_dir: self.server.acme_cache_dir,
-            acme_staging: self.server.acme_staging,
+            unix_path: None,
+            inbounds: self.inbounds,
+            listen_addr: None,
+            inbound_tag: None,
         }
     }
 }
@@ -746,6 +687,45 @@ mod tests {
     };
     use clap::Parser;
 
+    fn test_config() -> ServerConfig {
+        toml::from_str::<super::TomlConfig>(
+            r#"
+                [server]
+
+                [[inbounds]]
+                listen = ["127.0.0.1:0"]
+                password = "test-password"
+            "#,
+        )
+        .unwrap()
+        .to_server_config()
+    }
+
+    #[test]
+    fn each_inbound_requires_its_own_password() {
+        let missing_password = toml::from_str::<super::TomlConfig>(
+            r#"
+                [server]
+
+                [[inbounds]]
+                listen = ["127.0.0.1:0"]
+            "#,
+        );
+        assert!(missing_password.is_err());
+
+        let global_setting = toml::from_str::<super::TomlConfig>(
+            r#"
+                [server]
+                enable_udp = true
+
+                [[inbounds]]
+                listen = ["127.0.0.1:0"]
+                password = "inbound-password"
+            "#,
+        );
+        assert!(global_setting.is_err());
+    }
+
     #[test]
     fn websocket_path_is_normalized_with_leading_slash() {
         assert_eq!(
@@ -771,8 +751,7 @@ mod tests {
 
     #[test]
     fn grpc_limits_use_conservative_defaults() {
-        let config =
-            ServerConfig::try_parse_from(["trojan-rs", "--password", "test-password"]).unwrap();
+        let config = test_config();
         let limits = config.grpc_limits().unwrap();
 
         assert_eq!(limits.max_concurrent_streams, 128);
@@ -783,113 +762,47 @@ mod tests {
 
     #[test]
     fn grpc_limits_reject_an_undersized_read_buffer() {
-        let config = ServerConfig::try_parse_from([
-            "trojan-rs",
-            "--password",
-            "test-password",
-            "--grpc-max-read-buffer-bytes",
-            "1024",
-        ])
-        .unwrap();
+        let mut config = test_config();
+        config.grpc_max_read_buffer_bytes = 1024;
 
         assert!(config.grpc_limits().is_err());
     }
 
     #[test]
     fn connection_limits_use_defaults_and_reject_zero() {
-        let default_config =
-            ServerConfig::try_parse_from(["trojan-rs", "--password", "test-password"]).unwrap();
+        let default_config = test_config();
         assert_eq!(default_config.max_connections, 1024);
         assert_eq!(default_config.max_tls_handshakes, 64);
         assert_eq!(default_config.max_connections_per_ip, 32);
         assert!(default_config.validate_connection_limits().is_ok());
 
-        let invalid_config = ServerConfig::try_parse_from([
-            "trojan-rs",
-            "--password",
-            "test-password",
-            "--max-connections-per-ip",
-            "0",
-        ])
-        .unwrap();
+        let mut invalid_config = test_config();
+        invalid_config.max_connections_per_ip = 0;
         assert!(invalid_config.validate_connection_limits().is_err());
     }
 
     #[test]
-    fn acme_requires_domain_and_email_without_static_certificates() {
-        let config = ServerConfig::try_parse_from([
-            "trojan-rs",
-            "--password",
-            "test-password",
-            "--acme-domain",
-            "tunnel.example.com",
-            "--acme-email",
-            "admin@example.com",
-            "--acme-staging",
-        ])
-        .unwrap();
-        assert_eq!(
-            config.acme_settings().unwrap(),
-            Some(super::AcmeSettings {
-                domain: "tunnel.example.com".to_string(),
-                email: "admin@example.com".to_string(),
-                cache_dir: super::DEFAULT_ACME_CACHE_DIR.to_string(),
-                staging: true,
-            })
-        );
-
-        let incomplete = ServerConfig::try_parse_from([
-            "trojan-rs",
-            "--password",
-            "test-password",
-            "--acme-domain",
-            "tunnel.example.com",
-        ])
-        .unwrap();
-        assert!(incomplete.acme_settings().is_err());
-    }
-
-    #[test]
     fn reality_requires_complete_dns_based_settings() {
-        let incomplete = ServerConfig::try_parse_from([
-            "trojan-rs",
-            "--password",
-            "test-password",
-            "--enable-reality",
-        ])
-        .unwrap();
+        let mut incomplete = test_config();
+        incomplete.enable_reality = true;
         assert!(incomplete.reality_settings().is_err());
 
-        let complete = ServerConfig::try_parse_from([
-            "trojan-rs",
-            "--password",
-            "test-password",
-            "--enable-reality",
-            "--reality-dest",
-            "cover.example:443",
-            "--reality-private-key",
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "--reality-short-id",
-            "0123456789abcdef",
-        ])
-        .unwrap();
+        let mut complete = test_config();
+        complete.enable_reality = true;
+        complete.reality_dest = Some("cover.example:443".to_string());
+        complete.reality_private_key =
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string());
+        complete.reality_short_ids = vec!["0123456789abcdef".to_string()];
         let settings = complete.reality_settings().unwrap().unwrap();
         assert_eq!(settings.dest, "cover.example:443");
         assert_eq!(settings.short_ids, ["0123456789abcdef"]);
 
-        let ip_dest = ServerConfig::try_parse_from([
-            "trojan-rs",
-            "--password",
-            "test-password",
-            "--enable-reality",
-            "--reality-dest",
-            "127.0.0.1:443",
-            "--reality-private-key",
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "--reality-short-id",
-            "01",
-        ])
-        .unwrap();
+        let mut ip_dest = test_config();
+        ip_dest.enable_reality = true;
+        ip_dest.reality_dest = Some("127.0.0.1:443".to_string());
+        ip_dest.reality_private_key =
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string());
+        ip_dest.reality_short_ids = vec!["01".to_string()];
         assert!(ip_dest.reality_settings().is_err());
     }
 
@@ -898,5 +811,79 @@ mod tests {
         let config =
             ServerConfig::try_parse_from(["trojan-rs", "--generate-reality-keypair"]).unwrap();
         assert!(config.generate_reality_keypair);
+    }
+
+    #[test]
+    fn inbounds_expand_addresses_transports_and_per_inbound_settings() {
+        let toml_config: super::TomlConfig = toml::from_str(
+            r#"
+                [server]
+
+                [[inbounds]]
+                tag = "tcp-dual-stack"
+                listen = ["0.0.0.0:8443", "[::]:8443"]
+                transport = "tcp"
+                password = "tcp-password"
+
+                [[inbounds]]
+                tag = "grpc"
+                listen = ["127.0.0.1:9443"]
+                transport = "grpc"
+                password = "grpc-password"
+                tls = { cert = "grpc.crt", key = "grpc.key" }
+
+                [[inbounds]]
+                tag = "unix"
+                unix_path = "/tmp/trojan-rs.sock"
+                transport = "websocket"
+                password = "unix-password"
+                ws_path = "/trojan-uds"
+            "#,
+        )
+        .unwrap();
+
+        let expanded = toml_config.to_server_config().expand_inbounds().unwrap();
+        assert_eq!(expanded.len(), 4);
+        assert_eq!(expanded[0].listen_addr.as_deref(), Some("0.0.0.0:8443"));
+        assert_eq!(expanded[1].listen_addr.as_deref(), Some("[::]:8443"));
+        assert_eq!(expanded[0].inbound_tag.as_deref(), Some("tcp-dual-stack"));
+        assert!(expanded[2].enable_grpc);
+        assert_eq!(expanded[2].password, "grpc-password");
+        assert_eq!(expanded[2].cert.as_deref(), Some("grpc.crt"));
+        assert_eq!(
+            expanded[3].unix_path.as_deref(),
+            Some("/tmp/trojan-rs.sock")
+        );
+        assert!(expanded[3].enable_ws);
+        assert_eq!(expanded[3].ws_path.as_deref(), Some("/trojan-uds"));
+    }
+
+    #[test]
+    fn inbound_websocket_transport_uses_the_documented_name() {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            transport: super::InboundTransport,
+        }
+        let wrapper: Wrapper = toml::from_str("transport = \"websocket\"").unwrap();
+        assert_eq!(wrapper.transport, super::InboundTransport::WebSocket);
+    }
+
+    #[test]
+    fn legacy_single_inbound_toml_sections_are_rejected() {
+        let old_config = r#"
+            [server]
+
+            [tls]
+            cert = "cert.pem"
+            key = "key.pem"
+        "#;
+        assert!(toml::from_str::<super::TomlConfig>(old_config).is_err());
+    }
+
+    #[test]
+    fn runtime_requires_at_least_one_inbound() {
+        let mut config = test_config();
+        config.inbounds.clear();
+        assert!(config.expand_inbounds().is_err());
     }
 }
