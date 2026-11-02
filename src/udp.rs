@@ -1,7 +1,7 @@
 use crate::logger::log;
 use crate::socks5;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use bytes::{Bytes, BytesMut};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
@@ -17,6 +17,7 @@ const UDP_CHANNEL_BUFFER_SIZE: usize = 64;
 const TCP_WRITE_CHANNEL_BUFFER_SIZE: usize = 32;
 const TCP_WRITE_BATCH_BYTES: usize = 256 * 1024;
 const CLEANUP_TIMEOUT_SECS: u64 = 5;
+const VLESS_UDP_MAX_PACKET_SIZE: usize = u16::MAX as usize;
 
 // UDP Packet for Trojan UDP Associate
 #[derive(Debug)]
@@ -446,6 +447,84 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     result
 }
 
+/// Handles standard VLESS UDP. The VLESS request header fixes the destination,
+/// and body packets are encoded as `u16 length || payload`; connecting the UDP
+/// socket to that destination deliberately does not provide Full Cone behavior.
+pub async fn handle_vless_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    client_stream: S,
+    target: socks5::Address,
+    initial_payload: Bytes,
+    peer_addr: String,
+) -> Result<()> {
+    let remote = target.to_socket_addr().await?;
+    let socket = match remote {
+        SocketAddr::V4(_) => UdpSocket::bind("0.0.0.0:0").await?,
+        SocketAddr::V6(_) => UdpSocket::bind("[::]:0").await?,
+    };
+    socket.connect(remote).await?;
+    log::info!(peer = %peer_addr, target = %target.to_key(), "Starting VLESS UDP associate");
+
+    let (mut client_read, mut client_write) = tokio::io::split(client_stream);
+    let mut incoming = BytesMut::with_capacity(BUF_SIZE);
+    incoming.extend_from_slice(&initial_payload);
+    let mut client_read_buf = vec![0_u8; BUF_SIZE];
+    let mut udp_read_buf = vec![0_u8; VLESS_UDP_MAX_PACKET_SIZE];
+    let mut last_activity = Instant::now();
+
+    loop {
+        while let Some((packet, consumed)) = decode_vless_udp_packet(&incoming)? {
+            let _ = incoming.split_to(consumed);
+            if !packet.is_empty() {
+                socket.send(&packet).await?;
+            }
+            last_activity = Instant::now();
+        }
+        if incoming.len() > VLESS_UDP_MAX_PACKET_SIZE + 2 {
+            return Err(anyhow!("VLESS UDP packet exceeds maximum size"));
+        }
+
+        let idle_remaining =
+            std::time::Duration::from_secs(UDP_TIMEOUT).saturating_sub(last_activity.elapsed());
+        tokio::select! {
+            _ = tokio::time::sleep(idle_remaining) => {
+                log::info!(peer = %peer_addr, "VLESS UDP associate timeout due to inactivity");
+                break;
+            }
+            read_result = client_read.read(&mut client_read_buf) => {
+                match read_result {
+                    Ok(0) => break,
+                    Ok(length) => incoming.extend_from_slice(&client_read_buf[..length]),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            recv_result = socket.recv(&mut udp_read_buf) => {
+                let length = recv_result?;
+                client_write.write_all(&(length as u16).to_be_bytes()).await?;
+                client_write.write_all(&udp_read_buf[..length]).await?;
+                client_write.flush().await?;
+                last_activity = Instant::now();
+            }
+        }
+    }
+
+    client_write.shutdown().await?;
+    Ok(())
+}
+
+fn decode_vless_udp_packet(buf: &[u8]) -> Result<Option<(Bytes, usize)>> {
+    if buf.len() < 2 {
+        return Ok(None);
+    }
+    let length = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+    if buf.len() < length + 2 {
+        return Ok(None);
+    }
+    Ok(Some((
+        Bytes::copy_from_slice(&buf[2..length + 2]),
+        length + 2,
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,5 +582,35 @@ mod tests {
             .await
             .expect("UDP associate task should join")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn vless_udp_sends_length_prefixed_initial_packet() {
+        let udp_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = udp_server.local_addr().unwrap();
+        let (client_stream, mut client_side) = tokio::io::duplex(1024);
+        let initial_payload = Bytes::from_static(&[0, 4, b'p', b'i', b'n', b'g']);
+        let handle = tokio::spawn(handle_vless_udp_associate(
+            client_stream,
+            socks5::Address::IPv4(
+                match addr.ip() {
+                    IpAddr::V4(ip) => ip.octets(),
+                    IpAddr::V6(_) => panic!("test UDP server must be IPv4"),
+                },
+                addr.port(),
+            ),
+            initial_payload,
+            "127.0.0.1:12345".to_string(),
+        ));
+
+        let mut received = [0_u8; 16];
+        let (length, _) = timeout(Duration::from_secs(3), udp_server.recv_from(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&received[..length], b"ping");
+
+        client_side.shutdown().await.unwrap();
+        handle.await.unwrap().unwrap();
     }
 }

@@ -46,6 +46,15 @@ pub enum InboundTransport {
     Grpc,
 }
 
+/// Application protocol accepted by one inbound listener.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InboundProtocol {
+    #[default]
+    Trojan,
+    Vless,
+}
+
 /// A listener declared in TOML's `[[inbounds]]` array.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,6 +65,7 @@ pub struct InboundSettings {
     pub listen: Vec<String>,
     #[serde(default)]
     pub transport: InboundTransport,
+    pub protocol: InboundProtocol,
     pub password: String,
     #[serde(default)]
     pub unix_path: Option<String>,
@@ -84,6 +94,9 @@ pub struct ServerConfig {
 
     #[arg(skip)]
     pub password: String,
+
+    #[arg(skip)]
+    pub protocol: InboundProtocol,
 
     #[arg(skip)]
     pub enable_ws: bool,
@@ -218,6 +231,11 @@ impl ServerConfig {
                 "every configured inbound must provide a non-empty password"
             ));
         }
+        for inbound in &config.inbounds {
+            if inbound.protocol == InboundProtocol::Vless {
+                crate::vless::parse_uuid(&inbound.password)?;
+            }
+        }
 
         config.acme = config.acme_settings()?;
         config.grpc_limits()?;
@@ -247,6 +265,9 @@ impl ServerConfig {
 
         let mut expanded = Vec::new();
         for inbound in &self.inbounds {
+            if inbound.protocol == InboundProtocol::Vless {
+                crate::vless::parse_uuid(&inbound.password)?;
+            }
             if inbound.listen.is_empty() && inbound.unix_path.is_none() {
                 return Err(anyhow!(
                     "each [[inbounds]] entry requires listen and/or unix_path"
@@ -294,6 +315,7 @@ impl ServerConfig {
                 config.grpc_service_name =
                     normalize_grpc_service_name(inbound.grpc_service_name.clone())?;
                 config.password = inbound.password.trim().to_string();
+                config.protocol = inbound.protocol;
                 config.use_acme = inbound.acme;
                 if config.password.is_empty() {
                     return Err(anyhow!("inbound password cannot be empty"));
@@ -344,6 +366,7 @@ impl ServerConfig {
                 config.grpc_service_name =
                     normalize_grpc_service_name(inbound.grpc_service_name.clone())?;
                 config.password = inbound.password.trim().to_string();
+                config.protocol = inbound.protocol;
                 config.use_acme = inbound.acme;
                 if config.password.is_empty() {
                     return Err(anyhow!("inbound password cannot be empty"));
@@ -597,6 +620,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
             tag: Some("trojan-tcp".to_string()),
             listen: vec!["0.0.0.0:443".to_string(), "[::]:443".to_string()],
             transport: InboundTransport::Tcp,
+            protocol: InboundProtocol::Trojan,
             password: "your_password_here".to_string(),
             unix_path: None,
             ws_host: None,
@@ -610,6 +634,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
             tag: Some("trojan-websocket".to_string()),
             listen: vec!["0.0.0.0:8443".to_string(), "[::]:8443".to_string()],
             transport: InboundTransport::WebSocket,
+            protocol: InboundProtocol::Trojan,
             password: "your_password_here".to_string(),
             unix_path: None,
             ws_host: Some("cdn.example.com".to_string()),
@@ -623,6 +648,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
             tag: Some("trojan-grpc".to_string()),
             listen: vec!["0.0.0.0:9443".to_string(), "[::]:9443".to_string()],
             transport: InboundTransport::Grpc,
+            protocol: InboundProtocol::Trojan,
             password: "your_password_here".to_string(),
             unix_path: None,
             ws_host: None,
@@ -636,6 +662,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
             tag: Some("trojan-uds".to_string()),
             listen: Vec::new(),
             transport: InboundTransport::WebSocket,
+            protocol: InboundProtocol::Trojan,
             password: "your_password_here".to_string(),
             unix_path: Some("/run/trojan-rs/trojan.sock".to_string()),
             ws_host: None,
@@ -686,6 +713,7 @@ impl TomlConfig {
             host: String::new(),
             port: String::new(),
             password: String::new(),
+            protocol: InboundProtocol::Trojan,
             enable_ws: false,
             enable_grpc: false,
             ws_host: None,
@@ -790,6 +818,7 @@ mod tests {
 
                 [[inbounds]]
                 listen = ["127.0.0.1:0"]
+                protocol = "trojan"
                 password = "test-password"
             "#,
         )
@@ -816,10 +845,32 @@ mod tests {
 
                 [[inbounds]]
                 listen = ["127.0.0.1:0"]
+                protocol = "trojan"
                 password = "inbound-password"
             "#,
         );
         assert!(global_setting.is_err());
+    }
+
+    #[test]
+    fn each_inbound_requires_an_explicit_protocol() {
+        let config = toml::from_str::<super::TomlConfig>(
+            r#"
+                [server]
+                [[inbounds]]
+                listen = ["127.0.0.1:0"]
+                password = "test-password"
+            "#,
+        );
+        assert!(config.is_err());
+    }
+
+    #[test]
+    fn vless_password_must_be_a_uuid() {
+        let mut config = test_config();
+        config.inbounds[0].protocol = super::InboundProtocol::Vless;
+        config.inbounds[0].password = "not-a-uuid".to_string();
+        assert!(config.expand_inbounds().is_err());
     }
 
     #[test]
@@ -854,11 +905,13 @@ mod tests {
 
                 [[inbounds]]
                 listen = ["0.0.0.0:443"]
+                protocol = "trojan"
                 password = "acme-password"
                 acme = true
 
                 [[inbounds]]
                 listen = ["127.0.0.1:8443"]
+                protocol = "trojan"
                 password = "plain-password"
             "#,
         )
@@ -880,6 +933,7 @@ mod tests {
                 [server]
                 [[inbounds]]
                 listen = ["127.0.0.1:443"]
+                protocol = "trojan"
                 password = "test-password"
                 acme = true
             "#,
@@ -896,6 +950,7 @@ mod tests {
                 acme = { domain = "tunnel.example.com", email = "admin@example.com" }
                 [[inbounds]]
                 listen = ["127.0.0.1:443"]
+                protocol = "trojan"
                 password = "test-password"
                 acme = true
                 tls = { cert = "cert.pem", key = "key.pem" }
@@ -982,12 +1037,14 @@ mod tests {
                 tag = "tcp-dual-stack"
                 listen = ["0.0.0.0:8443", "[::]:8443"]
                 transport = "tcp"
+                protocol = "trojan"
                 password = "tcp-password"
 
                 [[inbounds]]
                 tag = "grpc"
                 listen = ["127.0.0.1:9443"]
                 transport = "grpc"
+                protocol = "trojan"
                 password = "grpc-password"
                 tls = { cert = "grpc.crt", key = "grpc.key" }
 
@@ -995,6 +1052,7 @@ mod tests {
                 tag = "unix"
                 unix_path = "/tmp/trojan-rs.sock"
                 transport = "websocket"
+                protocol = "trojan"
                 password = "unix-password"
                 ws_path = "/trojan-uds"
             "#,

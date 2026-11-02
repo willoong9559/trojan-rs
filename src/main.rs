@@ -9,6 +9,7 @@ mod socks5;
 mod tls;
 mod udp;
 mod utils;
+mod vless;
 mod ws;
 
 use logger::log;
@@ -156,6 +157,8 @@ pub enum TransportMode {
 pub struct Server {
     pub listener: Listener,
     pub password: [u8; 56],
+    pub protocol: config::InboundProtocol,
+    pub vless_user_id: Option<[u8; 16]>,
     pub transport_mode: TransportMode,
     pub ws_host: Option<String>,
     pub ws_path: Option<String>,
@@ -387,8 +390,10 @@ async fn handle_connection<S>(server: Arc<Server>, stream: S, peer_addr: String)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // 只需要一套 Trojan 协议处理逻辑
-    process_trojan(server, stream, peer_addr).await
+    match server.protocol {
+        config::InboundProtocol::Trojan => process_trojan(server, stream, peer_addr).await,
+        config::InboundProtocol::Vless => process_vless(server, stream, peer_addr).await,
+    }
 }
 
 async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
@@ -400,7 +405,7 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
     // 验证密码
     if request.password != server.password {
-        log_incorrect_password(server.transport_mode, &peer_addr);
+        log_incorrect_credential(server.protocol, server.transport_mode, &peer_addr);
         return Err(anyhow!("Incorrect password"));
     }
 
@@ -416,7 +421,45 @@ async fn process_trojan<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     }
 }
 
-async fn process_grpc_stream<S>(password: [u8; 56], mut stream: S, peer_addr: String) -> Result<()>
+async fn process_vless<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    server: Arc<Server>,
+    mut stream: S,
+    peer_addr: String,
+) -> Result<()> {
+    let request = read_vless_request(&mut stream).await?;
+    let user_id = server
+        .vless_user_id
+        .ok_or_else(|| anyhow!("VLESS inbound has no configured UUID"))?;
+    if request.user_id != user_id {
+        log_incorrect_credential(server.protocol, server.transport_mode, &peer_addr);
+        return Err(anyhow!("Incorrect VLESS UUID"));
+    }
+
+    log::authentication(&peer_addr, true);
+    stream.write_all(&request.response_header()).await?;
+    match request.command {
+        vless::Command::Tcp => {
+            handle_connect(&mut stream, request.addr, request.payload, peer_addr).await
+        }
+        vless::Command::Udp => {
+            udp::handle_vless_udp_associate(stream, request.addr, request.payload, peer_addr).await
+        }
+    }
+}
+
+async fn process_grpc_stream<S>(server: Arc<Server>, stream: S, peer_addr: String) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match server.protocol {
+        config::InboundProtocol::Trojan => {
+            process_grpc_trojan(server.password, stream, peer_addr).await
+        }
+        config::InboundProtocol::Vless => process_grpc_vless(server, stream, peer_addr).await,
+    }
+}
+
+async fn process_grpc_trojan<S>(password: [u8; 56], mut stream: S, peer_addr: String) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -426,7 +469,11 @@ where
     };
 
     if request.password != password {
-        log_incorrect_password(TransportMode::Grpc, &peer_addr);
+        log_incorrect_credential(
+            config::InboundProtocol::Trojan,
+            TransportMode::Grpc,
+            &peer_addr,
+        );
         return finish_grpc_stream(&mut stream, Err(anyhow!("Incorrect password")), &peer_addr)
             .await;
     }
@@ -446,6 +493,46 @@ where
         }
         TrojanCmd::UdpAssociate => {
             udp::handle_udp_associate(stream, request.addr, request.payload, peer_addr).await
+        }
+    }
+}
+
+async fn process_grpc_vless<S>(server: Arc<Server>, mut stream: S, peer_addr: String) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let request = match read_vless_request(&mut stream).await {
+        Ok(request) => request,
+        Err(error) => return finish_grpc_stream(&mut stream, Err(error), &peer_addr).await,
+    };
+    let user_id = server
+        .vless_user_id
+        .ok_or_else(|| anyhow!("VLESS inbound has no configured UUID"))?;
+    if request.user_id != user_id {
+        log_incorrect_credential(server.protocol, TransportMode::Grpc, &peer_addr);
+        return finish_grpc_stream(
+            &mut stream,
+            Err(anyhow!("Incorrect VLESS UUID")),
+            &peer_addr,
+        )
+        .await;
+    }
+
+    log::authentication(&peer_addr, true);
+    stream.write_all(&request.response_header()).await?;
+    match request.command {
+        vless::Command::Tcp => {
+            let result = handle_connect(
+                &mut stream,
+                request.addr,
+                request.payload,
+                peer_addr.clone(),
+            )
+            .await;
+            finish_grpc_stream(&mut stream, result, &peer_addr).await
+        }
+        vless::Command::Udp => {
+            udp::handle_vless_udp_associate(stream, request.addr, request.payload, peer_addr).await
         }
     }
 }
@@ -515,14 +602,60 @@ where
     })?
 }
 
-fn log_incorrect_password(transport_mode: TransportMode, peer_addr: &str) {
+async fn read_vless_request<S>(stream: &mut S) -> Result<vless::Request>
+where
+    S: AsyncRead + Unpin,
+{
+    tokio::time::timeout(
+        tokio::time::Duration::from_secs(REQUEST_HEADER_TIMEOUT_SECS),
+        async {
+            let mut read_buf = vec![0u8; BUF_SIZE];
+            let mut server_buffer = Vec::with_capacity(BUF_SIZE);
+
+            loop {
+                if server_buffer.len() >= BUF_SIZE {
+                    return Err(anyhow!("VLESS request exceeds maximum buffer size"));
+                }
+                let remaining = BUF_SIZE - server_buffer.len();
+                let read_len = remaining.min(read_buf.len());
+                let n = stream.read(&mut read_buf[..read_len]).await?;
+                if n == 0 {
+                    return Err(anyhow!(
+                        "Connection closed before receiving complete VLESS request"
+                    ));
+                }
+                server_buffer.extend_from_slice(&read_buf[..n]);
+                if let Some((request, _consumed)) = vless::Request::decode(&server_buffer)? {
+                    break Ok(request);
+                }
+            }
+        },
+    )
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "Timed out waiting for VLESS request header after {} seconds",
+            REQUEST_HEADER_TIMEOUT_SECS
+        )
+    })?
+}
+
+fn log_incorrect_credential(
+    protocol: config::InboundProtocol,
+    transport_mode: TransportMode,
+    peer_addr: &str,
+) {
     let transport = match transport_mode {
         TransportMode::Tcp => "TCP",
         TransportMode::WebSocket => "WS",
         TransportMode::Grpc => "gRPC",
     };
     log::authentication(peer_addr, false);
-    log::warn!(peer = %peer_addr, transport = transport, "Incorrect password");
+    let protocol = match protocol {
+        config::InboundProtocol::Trojan => "Trojan",
+        config::InboundProtocol::Vless => "VLESS",
+    };
+    log::warn!(peer = %peer_addr, protocol = protocol, transport = transport, "Incorrect credential");
 }
 
 // 统一的 CONNECT 处理
@@ -662,9 +795,9 @@ where
             .await?;
             let result = grpc_conn
                 .run(move |transport| {
-                    let password = server.password;
+                    let server = Arc::clone(&server);
                     let peer_addr = peer_addr.clone();
-                    async move { process_grpc_stream(password, transport, peer_addr).await }
+                    async move { process_grpc_stream(server, transport, peer_addr).await }
                 })
                 .await;
 
@@ -920,7 +1053,11 @@ async fn build_server_with_acme(
         Listener::Tcp(tcp_listener)
     };
 
-    let password = utils::password_to_hex(&config.password);
+    let protocol = config.protocol;
+    let (password, vless_user_id) = match protocol {
+        config::InboundProtocol::Trojan => (utils::password_to_hex(&config.password), None),
+        config::InboundProtocol::Vless => ([0_u8; 56], Some(vless::parse_uuid(&config.password)?)),
+    };
     let grpc_limits = config.grpc_limits()?;
     config.validate_connection_limits()?;
     let connection_limits = ConnectionLimits::new(
@@ -959,6 +1096,8 @@ async fn build_server_with_acme(
     Ok(Server {
         listener,
         password,
+        protocol,
+        vless_user_id,
         transport_mode,
         ws_host: config.ws_host,
         ws_path: config.ws_path,
@@ -1100,6 +1239,7 @@ mod tests {
                 tag: Some("first".to_string()),
                 listen: vec!["127.0.0.1:0".to_string()],
                 transport: config::InboundTransport::Tcp,
+                protocol: config::InboundProtocol::Trojan,
                 password: "test-password".to_string(),
                 unix_path: None,
                 ws_host: None,
@@ -1113,6 +1253,7 @@ mod tests {
                 tag: Some("second".to_string()),
                 listen: vec!["127.0.0.1:0".to_string()],
                 transport: config::InboundTransport::Grpc,
+                protocol: config::InboundProtocol::Trojan,
                 password: "test-password".to_string(),
                 unix_path: None,
                 ws_host: None,
@@ -1148,7 +1289,7 @@ mod tests {
                     .await
                     .expect("server handshake should succeed");
                 conn.run(move |transport| async move {
-                    process_grpc_stream(password, transport, "127.0.0.1:12345".to_string()).await
+                    process_grpc_trojan(password, transport, "127.0.0.1:12345".to_string()).await
                 })
                 .await
             }
@@ -1206,6 +1347,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: "35537".to_string(),
             password: "test_password".to_string(),
+            protocol: config::InboundProtocol::Trojan,
             enable_ws: false,
             enable_grpc: false,
             ws_host: None,
