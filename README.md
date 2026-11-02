@@ -30,7 +30,6 @@ cargo build --release
 
 ```toml
 [server]
-
 # 所有入口共享这些限制。
 max_connections = 1024
 max_tls_handshakes = 64
@@ -69,7 +68,16 @@ grpc_service_name = "GunService"
 password = "a-separate-strong-password"
 tls = { cert = "/etc/trojan-rs/cert.pem", key = "/etc/trojan-rs/key.pem" }
 
-# 4. Unix Domain Socket（仅本机进程可连接）
+# 4. Trojan gRPC over REALITY
+[[inbounds]]
+tag = "trojan-reality-grpc"
+listen = ["0.0.0.0:10443", "[::]:10443"]
+transport = "grpc"
+grpc_service_name = "RealityService"
+password = "reality-strong-password"
+reality = { dest = "www.example.com:443", private_key = "base64url-x25519-private-key", short_ids = ["0123456789abcdef"], max_time_diff_ms = 60000 }
+
+# 5. Unix Domain Socket（仅本机进程可连接）
 [[inbounds]]
 tag = "trojan-uds"
 unix_path = "/run/trojan-rs/trojan.sock"
@@ -83,18 +91,9 @@ level = "info"
 
 `transport` 可取：`tcp`、`websocket`、`grpc`。`ws_host`、`ws_path` 只用于 WebSocket；`grpc_service_name` 只用于 gRPC。`unix_path` 为 Unix Domain Socket 路径；它可以与 `listen` 同时配置，但不能用于 REALITY。
 
-## REALITY 入口
+REALITY 不能和同一入口的 `tls` 同时设置。
 
-REALITY 也是一个独立入口，不能和同一入口的 `tls` 同时设置：
-
-```toml
-[[inbounds]]
-tag = "trojan-reality"
-listen = ["0.0.0.0:10443", "[::]:10443"]
-transport = "tcp"
-password = "reality-strong-password"
-reality = { dest = "www.example.com:443", private_key = "base64url-x25519-private-key", short_ids = ["0123456789abcdef"], max_time_diff_ms = 60000 }
-```
+## REALITY 密钥
 
 生成 X25519 密钥对：
 
