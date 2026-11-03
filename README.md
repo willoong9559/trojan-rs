@@ -33,7 +33,7 @@ cargo build --release
 # 所有入口共享这些限制。
 max_connections = 1024
 max_tls_handshakes = 64
-max_connections_per_ip = 32
+max_connections_per_ip = 128
 
 # 所有 gRPC 入口共享这些限制。
 grpc_max_concurrent_streams = 128
