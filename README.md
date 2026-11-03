@@ -32,8 +32,10 @@ cargo build --release
 [server]
 # 所有入口共享这些限制。
 max_connections = 1024
+# 同时进行中的 TLS/REALITY 握手数，并非 TLS 连接总数。
 max_tls_handshakes = 64
-max_connections_per_ip = 128
+# 注意：若使用 TCP 或 WebSocket，客户端可能并发建立多个连接；请考虑提高到 128 及以上。
+max_connections_per_ip = 32
 
 # 所有 gRPC 入口共享这些限制。
 grpc_max_concurrent_streams = 128
