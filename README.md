@@ -86,7 +86,17 @@ grpc_service_name = "RealityService"
 password = "reality-strong-password"
 reality = { dest = "www.example.com:443", private_key = "base64url-x25519-private-key", short_ids = ["0123456789abcdef"], max_time_diff_ms = 60000 }
 
-# 5. Unix Domain Socket（仅本机进程可连接）
+# 5. VLESS TCP + REALITY + XTLS RPRX Vision
+[[inbounds]]
+tag = "vless-reality-vision"
+listen = ["0.0.0.0:11443", "[::]:11443"]
+transport = "tcp"
+protocol = "vless"
+password = "01234567-89ab-cdef-0123-456789abcdef"
+flow = "xtls-rprx-vision"
+reality = { dest = "www.example.com:443", private_key = "base64url-x25519-private-key", short_ids = ["0123456789abcdef"], max_time_diff_ms = 60000 }
+
+# 6. Unix Domain Socket（仅本机进程可连接）
 [[inbounds]]
 tag = "trojan-uds"
 unix_path = "/run/trojan-rs/trojan.sock"
@@ -101,7 +111,9 @@ level = "info"
 
 `protocol` 必须为 `trojan` 或 `vless`；`transport` 可取：`tcp`、`websocket`、`grpc`。`ws_host`、`ws_path` 只用于 WebSocket；`grpc_service_name` 只用于 gRPC。`unix_path` 为 Unix Domain Socket 路径；它可以与 `listen` 同时配置，但不能用于 REALITY。
 
-VLESS 支持 TCP 与标准 UDP。VLESS UDP 使用请求头中的单一目标地址和 `u16` 长度分包，不支持 XUDP、Vision Flow 或 Full Cone。
+VLESS 支持 TCP 与标准 UDP。VLESS UDP 使用请求头中的单一目标地址和 `u16` 长度分包，不支持 XUDP 或 Full Cone。
+
+`flow = "xtls-rprx-vision"` 仅用于 VLESS 的 `transport = "tcp"`，并要求使用 `tls` 或 `reality`。它不能用于 Trojan、WebSocket、gRPC 或 ACME。Vision TCP 请求必须携带同名 Flow；UDP 请求则不携带 Flow，并继续使用标准 VLESS UDP 分包。
 
 入口只能在 `tls`、`acme = true`、`reality` 三种 TLS 方式中选择一种。`acme = true` 必须配合 `[server]` 中的 `acme`；所有选用 ACME 的入口共享同一账户和证书。ACME 只能用于 TCP 监听，不能用于 `unix_path`。
 

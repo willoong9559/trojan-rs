@@ -55,6 +55,13 @@ pub enum InboundProtocol {
     Vless,
 }
 
+/// VLESS flow control negotiated in the request header addons.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum InboundFlow {
+    XtlsRprxVision,
+}
+
 /// A listener declared in TOML's `[[inbounds]]` array.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,6 +74,8 @@ pub struct InboundSettings {
     pub transport: InboundTransport,
     pub protocol: InboundProtocol,
     pub password: String,
+    #[serde(default)]
+    pub flow: Option<InboundFlow>,
     #[serde(default)]
     pub unix_path: Option<String>,
     #[serde(default)]
@@ -97,6 +106,9 @@ pub struct ServerConfig {
 
     #[arg(skip)]
     pub protocol: InboundProtocol,
+
+    #[arg(skip)]
+    pub flow: Option<InboundFlow>,
 
     #[arg(skip)]
     pub enable_ws: bool,
@@ -273,6 +285,21 @@ impl ServerConfig {
                     "each [[inbounds]] entry requires listen and/or unix_path"
                 ));
             }
+            if inbound.flow.is_some() {
+                if inbound.protocol != InboundProtocol::Vless {
+                    return Err(anyhow!(
+                        "xtls-rprx-vision is defined only for VLESS; Trojan has no compatible Flow negotiation"
+                    ));
+                }
+                if inbound.transport != InboundTransport::Tcp {
+                    return Err(anyhow!("xtls-rprx-vision requires transport = \"tcp\""));
+                }
+                if inbound.acme || (inbound.tls.is_none() && inbound.reality.is_none()) {
+                    return Err(anyhow!(
+                        "xtls-rprx-vision requires exactly one of tls or reality"
+                    ));
+                }
+            }
             if [
                 inbound.tls.is_some(),
                 inbound.acme,
@@ -316,6 +343,7 @@ impl ServerConfig {
                     normalize_grpc_service_name(inbound.grpc_service_name.clone())?;
                 config.password = inbound.password.trim().to_string();
                 config.protocol = inbound.protocol;
+                config.flow = inbound.flow;
                 config.use_acme = inbound.acme;
                 if config.password.is_empty() {
                     return Err(anyhow!("inbound password cannot be empty"));
@@ -367,6 +395,7 @@ impl ServerConfig {
                     normalize_grpc_service_name(inbound.grpc_service_name.clone())?;
                 config.password = inbound.password.trim().to_string();
                 config.protocol = inbound.protocol;
+                config.flow = inbound.flow;
                 config.use_acme = inbound.acme;
                 if config.password.is_empty() {
                     return Err(anyhow!("inbound password cannot be empty"));
@@ -621,6 +650,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
             listen: vec!["0.0.0.0:443".to_string(), "[::]:443".to_string()],
             transport: InboundTransport::Tcp,
             protocol: InboundProtocol::Trojan,
+            flow: None,
             password: "your_password_here".to_string(),
             unix_path: None,
             ws_host: None,
@@ -635,6 +665,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
             listen: vec!["0.0.0.0:8443".to_string(), "[::]:8443".to_string()],
             transport: InboundTransport::WebSocket,
             protocol: InboundProtocol::Trojan,
+            flow: None,
             password: "your_password_here".to_string(),
             unix_path: None,
             ws_host: Some("cdn.example.com".to_string()),
@@ -649,6 +680,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
             listen: vec!["0.0.0.0:9443".to_string(), "[::]:9443".to_string()],
             transport: InboundTransport::Grpc,
             protocol: InboundProtocol::Trojan,
+            flow: None,
             password: "your_password_here".to_string(),
             unix_path: None,
             ws_host: None,
@@ -663,6 +695,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
             listen: Vec::new(),
             transport: InboundTransport::WebSocket,
             protocol: InboundProtocol::Trojan,
+            flow: None,
             password: "your_password_here".to_string(),
             unix_path: Some("/run/trojan-rs/trojan.sock".to_string()),
             ws_host: None,
@@ -714,6 +747,7 @@ impl TomlConfig {
             port: String::new(),
             password: String::new(),
             protocol: InboundProtocol::Trojan,
+            flow: None,
             enable_ws: false,
             enable_grpc: false,
             ws_host: None,
@@ -871,6 +905,53 @@ mod tests {
         config.inbounds[0].protocol = super::InboundProtocol::Vless;
         config.inbounds[0].password = "not-a-uuid".to_string();
         assert!(config.expand_inbounds().is_err());
+    }
+
+    #[test]
+    fn vision_requires_vless_tcp_and_tls_or_reality() {
+        let valid: super::TomlConfig = toml::from_str(
+            r#"
+                [server]
+                [[inbounds]]
+                listen = ["127.0.0.1:0"]
+                transport = "tcp"
+                protocol = "vless"
+                password = "01234567-89ab-cdef-0123-456789abcdef"
+                flow = "xtls-rprx-vision"
+                tls = { cert = "cert.pem", key = "key.pem" }
+            "#,
+        )
+        .unwrap();
+        assert!(valid.to_server_config().expand_inbounds().is_ok());
+
+        let trojan: super::TomlConfig = toml::from_str(
+            r#"
+                [server]
+                [[inbounds]]
+                listen = ["127.0.0.1:0"]
+                protocol = "trojan"
+                password = "password"
+                flow = "xtls-rprx-vision"
+                tls = { cert = "cert.pem", key = "key.pem" }
+            "#,
+        )
+        .unwrap();
+        assert!(trojan.to_server_config().expand_inbounds().is_err());
+
+        let websocket: super::TomlConfig = toml::from_str(
+            r#"
+                [server]
+                [[inbounds]]
+                listen = ["127.0.0.1:0"]
+                transport = "websocket"
+                protocol = "vless"
+                password = "01234567-89ab-cdef-0123-456789abcdef"
+                flow = "xtls-rprx-vision"
+                tls = { cert = "cert.pem", key = "key.pem" }
+            "#,
+        )
+        .unwrap();
+        assert!(websocket.to_server_config().expand_inbounds().is_err());
     }
 
     #[test]

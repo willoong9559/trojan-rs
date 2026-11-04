@@ -14,7 +14,7 @@ use aws_lc_rs::{
     signature::{Ed25519KeyPair, KeyPair},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 use rustls_reality as rustls;
 use rustls_reality::{
     pki_types::CertificateDer,
@@ -577,6 +577,13 @@ enum ReceiveStatus {
 }
 
 impl RealityTlsStream {
+    /// Transfers a freshly accepted REALITY TLS connection to the Vision
+    /// transport.  `RealityAcceptor::accept` has not read application data at
+    /// this point, so no decrypted bytes are lost during the hand-off.
+    pub(crate) fn into_vision_parts(self) -> (TcpStream, rustls::ServerConnection, BytesMut) {
+        (self.io, self.session, BytesMut::from(&self.prefix[..]))
+    }
+
     fn poll_drain(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         let this = self.as_mut().get_mut();
         while !this.prefix.is_empty() {

@@ -9,6 +9,7 @@ mod socks5;
 mod tls;
 mod udp;
 mod utils;
+mod vision;
 mod vless;
 mod ws;
 
@@ -158,6 +159,7 @@ pub struct Server {
     pub listener: Listener,
     pub password: [u8; 56],
     pub protocol: config::InboundProtocol,
+    pub flow: Option<config::InboundFlow>,
     pub vless_user_id: Option<[u8; 16]>,
     pub transport_mode: TransportMode,
     pub ws_host: Option<String>,
@@ -166,6 +168,7 @@ pub struct Server {
     pub grpc_limits: grpc::GrpcLimits,
     connection_limits: ConnectionLimits,
     pub tls_acceptor: Option<TlsAcceptor>,
+    pub vision_tls_config: Option<Arc<rustls_reality::ServerConfig>>,
     pub acme_tls: Option<acme::AcmeTls>,
     pub reality_acceptor: Option<reality::RealityAcceptor>,
     pub inbound_tag: Option<String>,
@@ -445,6 +448,89 @@ async fn process_vless<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             udp::handle_vless_udp_associate(stream, request.addr, request.payload, peer_addr).await
         }
     }
+}
+
+async fn process_vless_vision(
+    server: Arc<Server>,
+    mut stream: vision::TlsStream,
+    peer_addr: String,
+) -> Result<()> {
+    let request = read_vless_request(&mut stream).await?;
+    let user_id = server
+        .vless_user_id
+        .ok_or_else(|| anyhow!("VLESS Vision inbound has no configured UUID"))?;
+    if request.user_id != user_id {
+        log_incorrect_credential(server.protocol, server.transport_mode, &peer_addr);
+        return Err(anyhow!("Incorrect VLESS UUID"));
+    }
+    log::authentication(&peer_addr, true);
+
+    match (request.command, request.flow) {
+        // Xray clients intentionally send UDP without the Vision Flow even for
+        // a Vision-enabled VLESS user.  Keep that standard UDP-over-TCP path.
+        (vless::Command::Udp, None) => {
+            stream.write_all(&request.response_header()).await?;
+            udp::handle_vless_udp_associate(stream, request.addr, request.payload, peer_addr).await
+        }
+        (vless::Command::Udp, Some(_)) => Err(anyhow!(
+            "VLESS UDP must not carry xtls-rprx-vision; use the normal UDP framing"
+        )),
+        (vless::Command::Tcp, Some(vless::Flow::XtlsRprxVision)) => {
+            // The VLESS response header is deliberately outside Vision body
+            // framing, matching Xray's EncodeResponseHeader + VisionWriter.
+            stream.write_all(&request.response_header()).await?;
+            stream.flush().await?;
+            let mut vision_stream = vision::Stream::new(stream, user_id, request.payload);
+            handle_connect(&mut vision_stream, request.addr, Bytes::new(), peer_addr).await
+        }
+        (vless::Command::Tcp, None) => Err(anyhow!(
+            "VLESS TCP connection is missing required flow xtls-rprx-vision"
+        )),
+    }
+}
+
+async fn accept_vision_connection(
+    server: Arc<Server>,
+    stream: ConnectionStream,
+    peer_addr: String,
+) -> Result<()> {
+    let tcp = match stream {
+        ConnectionStream::Tcp(stream) => stream,
+        #[cfg(unix)]
+        ConnectionStream::Unix(_) => return Err(anyhow!("XTLS Vision requires a TCP listener")),
+    };
+    let _handshake_permit = server
+        .connection_limits
+        .try_acquire_tls_handshake()
+        .ok_or_else(|| anyhow!("TLS handshake limit reached"))?;
+
+    let tls_stream = if let Some(ref reality_acceptor) = server.reality_acceptor {
+        match tokio::time::timeout(Duration::from_secs(30), reality_acceptor.accept(tcp)).await {
+            Ok(Ok(reality::Accepted::Reality(stream))) => {
+                log::info!(peer = %peer_addr, "REALITY Vision handshake successful");
+                vision::TlsStream::from_reality(stream)
+            }
+            Ok(Ok(reality::Accepted::Fallback(mut client, mut target))) => {
+                tokio::io::copy_bidirectional(&mut client, &mut target).await?;
+                return Ok(());
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(anyhow!("REALITY handshake timeout after 30 seconds")),
+        }
+    } else {
+        let config = server
+            .vision_tls_config
+            .clone()
+            .ok_or_else(|| anyhow!("Vision TLS configuration is missing"))?;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            vision::TlsStream::accept(config, tcp),
+        )
+        .await
+        .map_err(|_| anyhow!("TLS handshake timeout after 30 seconds"))??
+    };
+    drop(_handshake_permit);
+    process_vless_vision(server, tls_stream, peer_addr).await
 }
 
 async fn process_grpc_stream<S>(server: Arc<Server>, stream: S, peer_addr: String) -> Result<()>
@@ -869,9 +955,9 @@ impl Server {
 
                     tokio::spawn(async move {
                         let _connection_permit = connection_permit;
-                        let result = if let Some(ref reality_acceptor) =
-                            server_clone.reality_acceptor
-                        {
+                        let result = if server_clone.flow.is_some() {
+                            accept_vision_connection(server_clone, stream, peer_addr.clone()).await
+                        } else if let Some(ref reality_acceptor) = server_clone.reality_acceptor {
                             let handshake_result = {
                                 let _handshake_permit = match server_clone
                                     .connection_limits
@@ -1054,6 +1140,7 @@ async fn build_server_with_acme(
     };
 
     let protocol = config.protocol;
+    let flow = config.flow;
     let (password, vless_user_id) = match protocol {
         config::InboundProtocol::Trojan => (utils::password_to_hex(&config.password), None),
         config::InboundProtocol::Vless => ([0_u8; 56], Some(vless::parse_uuid(&config.password)?)),
@@ -1086,7 +1173,16 @@ async fn build_server_with_acme(
         None
     };
 
-    let tls_acceptor = if reality.is_some() || config.use_acme {
+    let vision_tls_config = if flow.is_some() && reality.is_none() {
+        Some(tls::get_vision_tls_config(
+            config.cert.clone(),
+            config.key.clone(),
+            config.cert_chain.clone(),
+        )?)
+    } else {
+        None
+    };
+    let tls_acceptor = if reality.is_some() || config.use_acme || flow.is_some() {
         None
     } else {
         tls::get_tls_acceptor(config.cert, config.key, config.cert_chain, transport_mode)?
@@ -1097,6 +1193,7 @@ async fn build_server_with_acme(
         listener,
         password,
         protocol,
+        flow,
         vless_user_id,
         transport_mode,
         ws_host: config.ws_host,
@@ -1105,6 +1202,7 @@ async fn build_server_with_acme(
         grpc_limits,
         connection_limits,
         tls_acceptor,
+        vision_tls_config,
         acme_tls,
         reality_acceptor,
         inbound_tag: config.inbound_tag,
@@ -1240,6 +1338,7 @@ mod tests {
                 listen: vec!["127.0.0.1:0".to_string()],
                 transport: config::InboundTransport::Tcp,
                 protocol: config::InboundProtocol::Trojan,
+                flow: None,
                 password: "test-password".to_string(),
                 unix_path: None,
                 ws_host: None,
@@ -1254,6 +1353,7 @@ mod tests {
                 listen: vec!["127.0.0.1:0".to_string()],
                 transport: config::InboundTransport::Grpc,
                 protocol: config::InboundProtocol::Trojan,
+                flow: None,
                 password: "test-password".to_string(),
                 unix_path: None,
                 ws_host: None,
@@ -1348,6 +1448,7 @@ mod tests {
             port: "35537".to_string(),
             password: "test_password".to_string(),
             protocol: config::InboundProtocol::Trojan,
+            flow: None,
             enable_ws: false,
             enable_grpc: false,
             ws_host: None,

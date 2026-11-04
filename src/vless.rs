@@ -13,11 +13,17 @@ pub enum Command {
     Udp,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flow {
+    XtlsRprxVision,
+}
+
 #[derive(Debug)]
 pub struct Request {
     pub version: u8,
     pub user_id: [u8; 16],
     pub command: Command,
+    pub flow: Option<Flow>,
     pub addr: socks5::Address,
     pub payload: Bytes,
 }
@@ -39,9 +45,7 @@ impl Request {
         if buf.len() < cursor + addons_len + 1 {
             return Ok(None);
         }
-        if addons_len != 0 {
-            return Err(anyhow!("VLESS addons and Flow are not supported"));
-        }
+        let flow = decode_addons(&buf[cursor..cursor + addons_len])?;
         cursor += addons_len;
 
         let command = match buf[cursor] {
@@ -104,6 +108,7 @@ impl Request {
                 version: VERSION,
                 user_id,
                 command,
+                flow,
                 addr,
                 payload: Bytes::copy_from_slice(&buf[cursor..]),
             },
@@ -114,6 +119,55 @@ impl Request {
     pub fn response_header(&self) -> [u8; 2] {
         [self.version, 0]
     }
+}
+
+/// Decode the small protobuf `encoding.Addons` value used by Xray and mihomo.
+/// Vision uses field 1 (the Flow string). Field 2 (`Seed`) is accepted and
+/// ignored: it is defined by the VLESS protobuf schema but does not affect the
+/// server-side Vision framing.
+fn decode_addons(addons: &[u8]) -> Result<Option<Flow>> {
+    if addons.is_empty() {
+        return Ok(None);
+    }
+    let mut cursor = 0;
+    let mut flow = None;
+    while cursor < addons.len() {
+        let tag = addons[cursor];
+        cursor += 1;
+        if tag != 0x0a && tag != 0x12 {
+            return Err(anyhow!("unsupported VLESS addons"));
+        }
+        let (length, consumed) = decode_varint(&addons[cursor..])?;
+        cursor += consumed;
+        let end = cursor
+            .checked_add(length)
+            .ok_or_else(|| anyhow!("invalid VLESS addons length"))?;
+        let value = addons
+            .get(cursor..end)
+            .ok_or_else(|| anyhow!("truncated VLESS addons"))?;
+        if tag == 0x0a {
+            flow = Some(match std::str::from_utf8(value)? {
+                "xtls-rprx-vision" => Flow::XtlsRprxVision,
+                flow => return Err(anyhow!("unsupported VLESS flow {flow:?}")),
+            });
+        }
+        cursor = end;
+    }
+    Ok(flow)
+}
+
+fn decode_varint(input: &[u8]) -> Result<(usize, usize)> {
+    let mut value = 0_usize;
+    for (index, byte) in input.iter().copied().enumerate() {
+        if index >= 10 {
+            return Err(anyhow!("invalid VLESS addon length"));
+        }
+        value |= usize::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            return Ok((value, index + 1));
+        }
+    }
+    Err(anyhow!("truncated VLESS addon length"))
 }
 
 pub fn parse_uuid(value: &str) -> Result<[u8; 16]> {
@@ -154,7 +208,7 @@ pub fn parse_uuid(value: &str) -> Result<[u8; 16]> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_uuid, Command, Request, COMMAND_TCP};
+    use super::{parse_uuid, Command, Flow, Request, COMMAND_TCP};
 
     #[test]
     fn parses_standard_tcp_request() {
@@ -165,16 +219,32 @@ mod tests {
 
         let (decoded, consumed) = Request::decode(&request).unwrap().unwrap();
         assert_eq!(decoded.command, Command::Tcp);
+        assert_eq!(decoded.flow, None);
         assert_eq!(decoded.addr.to_key(), "127.0.0.1:443");
         assert_eq!(decoded.payload, "payload");
         assert_eq!(consumed, request.len() - "payload".len());
     }
 
     #[test]
-    fn rejects_non_empty_addons() {
+    fn parses_vision_addon() {
         let mut request = vec![0];
         request.extend_from_slice(&[0; 16]);
-        request.extend_from_slice(&[1, 0, COMMAND_TCP]);
-        assert!(Request::decode(&request).is_err());
+        request.extend_from_slice(&[18, 0x0a, 16]);
+        request.extend_from_slice(b"xtls-rprx-vision");
+        request.extend_from_slice(&[COMMAND_TCP, 0x01, 0xbb, 1, 127, 0, 0, 1]);
+        let (decoded, _) = Request::decode(&request).unwrap().unwrap();
+        assert_eq!(decoded.flow, Some(Flow::XtlsRprxVision));
+    }
+
+    #[test]
+    fn accepts_vision_addon_with_seed() {
+        let mut request = vec![0];
+        request.extend_from_slice(&[0; 16]);
+        request.extend_from_slice(&[22, 0x0a, 16]);
+        request.extend_from_slice(b"xtls-rprx-vision");
+        request.extend_from_slice(&[0x12, 2, 1, 2]);
+        request.extend_from_slice(&[COMMAND_TCP, 0x01, 0xbb, 1, 127, 0, 0, 1]);
+        let (decoded, _) = Request::decode(&request).unwrap().unwrap();
+        assert_eq!(decoded.flow, Some(Flow::XtlsRprxVision));
     }
 }

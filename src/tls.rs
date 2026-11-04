@@ -11,6 +11,65 @@ use tokio_rustls::TlsAcceptor;
 use crate::logger::log;
 use crate::TransportMode;
 
+/// Load a TLS 1.3 server configuration for Vision.  Vision must own the TLS
+/// record reader so it can safely hand the connection to raw TCP later; the
+/// ordinary tokio-rustls acceptor cannot expose that boundary.
+pub fn get_vision_tls_config(
+    cert_path: Option<String>,
+    key_path: Option<String>,
+    cert_chain_paths: Vec<String>,
+) -> Result<std::sync::Arc<rustls_reality::ServerConfig>> {
+    let (cert_path, key_path) = match (cert_path, key_path) {
+        (Some(cert), Some(key)) => (cert, key),
+        (None, None) => return Err(anyhow!("xtls-rprx-vision requires tls or reality")),
+        _ => return Err(anyhow!("TLS requires both cert and key")),
+    };
+    let mut certs = load_certificates(&cert_path)?;
+    for chain_path in cert_chain_paths {
+        certs.extend(load_certificates(&chain_path)?);
+    }
+    let key_bytes = fs::read(&key_path)
+        .with_context(|| format!("failed to read TLS private key {key_path}"))?;
+    if is_pem(&key_bytes) {
+        let mut reader = BufReader::new(Cursor::new(key_bytes));
+        let key = rustls_pemfile::private_key(&mut reader)
+            .with_context(|| format!("failed to parse PEM private key {key_path}"))?
+            .ok_or_else(|| anyhow!("no private key found in {key_path}"))?;
+        return vision_config_with_key(certs, key);
+    }
+
+    let candidates = [
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_bytes.clone())),
+        PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(key_bytes.clone())),
+        PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(key_bytes)),
+    ];
+    let mut errors = Vec::new();
+    for key in candidates {
+        match vision_config_with_key(certs.clone(), key) {
+            Ok(config) => return Ok(config),
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    Err(anyhow!(
+        "failed to parse Vision TLS private key {key_path}: {}",
+        errors.join("; ")
+    ))
+}
+
+fn vision_config_with_key(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<std::sync::Arc<rustls_reality::ServerConfig>> {
+    let provider = std::sync::Arc::new(rustls_reality::crypto::aws_lc_rs::default_provider());
+    rustls_reality::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls_reality::version::TLS13])
+        .map_err(|e| anyhow!(e))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map(std::sync::Arc::new)
+        .map_err(Into::into)
+}
+
 pub fn get_tls_acceptor(
     cert_path: Option<String>,
     key_path: Option<String>,
