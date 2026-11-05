@@ -53,6 +53,7 @@ pub enum InboundProtocol {
     #[default]
     Trojan,
     Vless,
+    Vmess,
 }
 
 /// A listener declared in TOML's `[[inbounds]]` array.
@@ -232,7 +233,10 @@ impl ServerConfig {
             ));
         }
         for inbound in &config.inbounds {
-            if inbound.protocol == InboundProtocol::Vless {
+            if matches!(
+                inbound.protocol,
+                InboundProtocol::Vless | InboundProtocol::Vmess
+            ) {
                 crate::vless::parse_uuid(&inbound.password)?;
             }
         }
@@ -265,7 +269,10 @@ impl ServerConfig {
 
         let mut expanded = Vec::new();
         for inbound in &self.inbounds {
-            if inbound.protocol == InboundProtocol::Vless {
+            if matches!(
+                inbound.protocol,
+                InboundProtocol::Vless | InboundProtocol::Vmess
+            ) {
                 crate::vless::parse_uuid(&inbound.password)?;
             }
             if inbound.listen.is_empty() && inbound.unix_path.is_none() {
@@ -659,6 +666,20 @@ fn example_inbounds() -> Vec<InboundSettings> {
             reality: None,
         },
         InboundSettings {
+            tag: Some("vmess-tcp".to_string()),
+            listen: vec!["0.0.0.0:10443".to_string(), "[::]:10443".to_string()],
+            transport: InboundTransport::Tcp,
+            protocol: InboundProtocol::Vmess,
+            password: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
+            unix_path: None,
+            ws_host: None,
+            ws_path: None,
+            grpc_service_name: None,
+            tls: tls(),
+            acme: false,
+            reality: None,
+        },
+        InboundSettings {
             tag: Some("trojan-uds".to_string()),
             listen: Vec::new(),
             transport: InboundTransport::WebSocket,
@@ -866,10 +887,13 @@ mod tests {
     }
 
     #[test]
-    fn vless_password_must_be_a_uuid() {
+    fn uuid_protocol_password_must_be_a_uuid() {
         let mut config = test_config();
         config.inbounds[0].protocol = super::InboundProtocol::Vless;
         config.inbounds[0].password = "not-a-uuid".to_string();
+        assert!(config.expand_inbounds().is_err());
+
+        config.inbounds[0].protocol = super::InboundProtocol::Vmess;
         assert!(config.expand_inbounds().is_err());
     }
 

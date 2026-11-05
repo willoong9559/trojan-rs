@@ -10,6 +10,7 @@ mod tls;
 mod udp;
 mod utils;
 mod vless;
+mod vmess;
 mod ws;
 
 use logger::log;
@@ -159,6 +160,7 @@ pub struct Server {
     pub password: [u8; 56],
     pub protocol: config::InboundProtocol,
     pub vless_user_id: Option<[u8; 16]>,
+    pub vmess_user_id: Option<[u8; 16]>,
     pub transport_mode: TransportMode,
     pub ws_host: Option<String>,
     pub ws_path: Option<String>,
@@ -393,6 +395,33 @@ where
     match server.protocol {
         config::InboundProtocol::Trojan => process_trojan(server, stream, peer_addr).await,
         config::InboundProtocol::Vless => process_vless(server, stream, peer_addr).await,
+        config::InboundProtocol::Vmess => process_vmess(server, stream, peer_addr).await,
+    }
+}
+
+async fn process_vmess<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    server: Arc<Server>,
+    stream: S,
+    peer_addr: String,
+) -> Result<()> {
+    let user_id = server
+        .vmess_user_id
+        .ok_or_else(|| anyhow!("VMess inbound has no configured UUID"))?;
+    let mut accepted = vmess::accept(stream, user_id).await?;
+    log::authentication(&peer_addr, true);
+    match accepted.request.command {
+        vmess::Command::Tcp => {
+            handle_connect(
+                &mut accepted.stream,
+                accepted.request.addr,
+                Bytes::new(),
+                peer_addr,
+            )
+            .await
+        }
+        vmess::Command::Udp => {
+            udp::handle_vmess_udp_associate(accepted.stream, accepted.request.addr, peer_addr).await
+        }
     }
 }
 
@@ -456,6 +485,37 @@ where
             process_grpc_trojan(server.password, stream, peer_addr).await
         }
         config::InboundProtocol::Vless => process_grpc_vless(server, stream, peer_addr).await,
+        config::InboundProtocol::Vmess => process_grpc_vmess(server, stream, peer_addr).await,
+    }
+}
+
+async fn process_grpc_vmess<S>(server: Arc<Server>, stream: S, peer_addr: String) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let user_id = server
+        .vmess_user_id
+        .ok_or_else(|| anyhow!("VMess inbound has no configured UUID"))?;
+    let accepted = match vmess::accept(stream, user_id).await {
+        Ok(accepted) => accepted,
+        Err(error) => return Err(error),
+    };
+    log::authentication(&peer_addr, true);
+    match accepted.request.command {
+        vmess::Command::Tcp => {
+            let mut stream = accepted.stream;
+            let result = handle_connect(
+                &mut stream,
+                accepted.request.addr,
+                Bytes::new(),
+                peer_addr.clone(),
+            )
+            .await;
+            finish_grpc_stream(&mut stream, result, &peer_addr).await
+        }
+        vmess::Command::Udp => {
+            udp::handle_vmess_udp_associate(accepted.stream, accepted.request.addr, peer_addr).await
+        }
     }
 }
 
@@ -654,6 +714,7 @@ fn log_incorrect_credential(
     let protocol = match protocol {
         config::InboundProtocol::Trojan => "Trojan",
         config::InboundProtocol::Vless => "VLESS",
+        config::InboundProtocol::Vmess => "VMess",
     };
     log::warn!(peer = %peer_addr, protocol = protocol, transport = transport, "Incorrect credential");
 }
@@ -1054,9 +1115,14 @@ async fn build_server_with_acme(
     };
 
     let protocol = config.protocol;
-    let (password, vless_user_id) = match protocol {
-        config::InboundProtocol::Trojan => (utils::password_to_hex(&config.password), None),
-        config::InboundProtocol::Vless => ([0_u8; 56], Some(vless::parse_uuid(&config.password)?)),
+    let (password, vless_user_id, vmess_user_id) = match protocol {
+        config::InboundProtocol::Trojan => (utils::password_to_hex(&config.password), None, None),
+        config::InboundProtocol::Vless => {
+            ([0_u8; 56], Some(vless::parse_uuid(&config.password)?), None)
+        }
+        config::InboundProtocol::Vmess => {
+            ([0_u8; 56], None, Some(vless::parse_uuid(&config.password)?))
+        }
     };
     let grpc_limits = config.grpc_limits()?;
     config.validate_connection_limits()?;
@@ -1098,6 +1164,7 @@ async fn build_server_with_acme(
         password,
         protocol,
         vless_user_id,
+        vmess_user_id,
         transport_mode,
         ws_host: config.ws_host,
         ws_path: config.ws_path,

@@ -1,5 +1,6 @@
 use crate::logger::log;
 use crate::socks5;
+use crate::vmess;
 
 use anyhow::{anyhow, Result};
 use bytes::{Bytes, BytesMut};
@@ -508,6 +509,51 @@ pub async fn handle_vless_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send
     }
 
     client_write.shutdown().await?;
+    Ok(())
+}
+
+/// Handles VMess UDP over TCP. The VMess header establishes exactly one target;
+/// each encrypted VMess record is one UDP datagram in either direction.
+pub async fn handle_vmess_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    mut client_stream: vmess::Stream<S>,
+    target: socks5::Address,
+    peer_addr: String,
+) -> Result<()> {
+    let remote = target.to_socket_addr().await?;
+    let socket = match remote {
+        SocketAddr::V4(_) => UdpSocket::bind("0.0.0.0:0").await?,
+        SocketAddr::V6(_) => UdpSocket::bind("[::]:0").await?,
+    };
+    socket.connect(remote).await?;
+    log::info!(peer = %peer_addr, target = %target.to_key(), "Starting VMess UDP associate");
+
+    let mut udp_read_buf = vec![0_u8; VLESS_UDP_MAX_PACKET_SIZE];
+    let mut last_activity = Instant::now();
+    loop {
+        let idle_remaining =
+            std::time::Duration::from_secs(UDP_TIMEOUT).saturating_sub(last_activity.elapsed());
+        tokio::select! {
+            _ = tokio::time::sleep(idle_remaining) => {
+                log::info!(peer = %peer_addr, "VMess UDP associate timeout due to inactivity");
+                break;
+            }
+            packet = client_stream.read_packet() => match packet? {
+                Some(packet) => {
+                    if !packet.is_empty() {
+                        socket.send(&packet).await?;
+                    }
+                    last_activity = Instant::now();
+                }
+                None => break,
+            },
+            received = socket.recv(&mut udp_read_buf) => {
+                let length = received?;
+                client_stream.write_packet(&udp_read_buf[..length]).await?;
+                last_activity = Instant::now();
+            }
+        }
+    }
+    client_stream.shutdown().await?;
     Ok(())
 }
 

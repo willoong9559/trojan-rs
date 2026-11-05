@@ -26,7 +26,7 @@ cargo build --release
 
 ## 配置
 
-`[server]` 定义共享的资源限制、gRPC 限制和可选的内置 ACME 设置。每个 `[[inbounds]]` 必须设置自己的 `protocol` 和 `password`。`trojan` 的 `password` 是普通密码，`vless` 的 `password` 必须是 UUID。`listen` 是 Socket 地址数组，因此 `0.0.0.0:PORT` 与 `[::]:PORT` 可以同时监听同一端口的 IPv4 和 IPv6。
+`[server]` 定义共享的资源限制、gRPC 限制和可选的内置 ACME 设置。每个 `[[inbounds]]` 必须设置自己的 `protocol` 和 `password`。`trojan` 的 `password` 是普通密码；`vless` 和 `vmess` 的 `password` 必须是 UUID。`listen` 是 Socket 地址数组，因此 `0.0.0.0:PORT` 与 `[::]:PORT` 可以同时监听同一端口的 IPv4 和 IPv6。
 
 ```toml
 [server]
@@ -74,7 +74,16 @@ protocol = "vless"
 password = "01234567-89ab-cdef-0123-456789abcdef"
 tls = { cert = "/etc/trojan-rs/cert.pem", key = "/etc/trojan-rs/key.pem" }
 
-# 4. Trojan gRPC over REALITY
+# 4. VMess TCP over TLS
+[[inbounds]]
+tag = "vmess-tcp"
+listen = ["0.0.0.0:10443", "[::]:10443"]
+transport = "tcp"
+protocol = "vmess"
+password = "01234567-89ab-cdef-0123-456789abcdef"
+tls = { cert = "/etc/trojan-rs/cert.pem", key = "/etc/trojan-rs/key.pem" }
+
+# 5. Trojan gRPC over REALITY
 [[inbounds]]
 tag = "trojan-reality-grpc"
 listen = ["0.0.0.0:10443", "[::]:10443"]
@@ -84,7 +93,7 @@ grpc_service_name = "RealityService"
 password = "reality-strong-password"
 reality = { dest = "www.example.com:443", private_key = "base64url-x25519-private-key", short_ids = ["0123456789abcdef"], max_time_diff_ms = 60000 }
 
-# 5. Unix Domain Socket（仅本机进程可连接）
+# 6. Unix Domain Socket（仅本机进程可连接）
 [[inbounds]]
 tag = "trojan-uds"
 unix_path = "/run/trojan-rs/trojan.sock"
@@ -97,9 +106,13 @@ ws_path = "/trojan-uds"
 level = "info"
 ```
 
-`protocol` 必须为 `trojan` 或 `vless`；`transport` 可取：`tcp`、`websocket`、`grpc`。`ws_host`、`ws_path` 只用于 WebSocket；`grpc_service_name` 只用于 gRPC。`unix_path` 为 Unix Domain Socket 路径；它可以与 `listen` 同时配置，但不能用于 REALITY。
+`protocol` 必须为 `trojan`、`vless` 或 `vmess`；`transport` 可取：`tcp`、`websocket`、`grpc`。`ws_host`、`ws_path` 只用于 WebSocket；`grpc_service_name` 只用于 gRPC。`unix_path` 为 Unix Domain Socket 路径；它可以与 `listen` 同时配置，但不能用于 REALITY。
 
-VLESS 支持 TCP 与标准 UDP。VLESS UDP 使用请求头中的单一目标地址和 `u16` 长度分包，不支持 XUDP、Vision Flow 或 Full Cone。
+VLESS 支持 TCP 与标准 UDP。VLESS UDP 使用请求头中的单一目标地址和 `u16` 长度分包。
+
+VMess 支持 Xray 的 AEAD（`alterId = 0`）认证方式及 `aes-128-gcm`、`chacha20-poly1305` 数据加密，可与 TCP、WebSocket、gRPC、TLS 或 REALITY 组合。VMess UDP 使用请求头中的单一目标地址和每个 VMess 数据分块一个 UDP 包。
+
+Xray 客户端默认会为部分 UDP 目标启用 XUDP/Mux；使用本实现的 VMess UDP 时，需将客户端环境变量设为 `XRAY_CONE_DISABLED=true`，使其发送标准 VMess UDP 命令。
 
 入口只能在 `tls`、`acme = true`、`reality` 三种 TLS 方式中选择一种。`acme = true` 必须配合 `[server]` 中的 `acme`；所有选用 ACME 的入口共享同一账户和证书。ACME 只能用于 TCP 监听，不能用于 `unix_path`。
 
@@ -127,7 +140,7 @@ tls = { cert = "/etc/trojan-rs/cert.der", key = "/etc/trojan-rs/key.der", cert_c
 
 ## 协议支持
 
-- Trojan 与 VLESS
+- Trojan、VLESS 与 VMess
 - TCP CONNECT
 - Trojan UDP ASSOCIATE 与标准 VLESS UDP（均为 UDP over TCP）
 - IPv4、IPv6 与域名目标
