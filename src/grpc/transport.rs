@@ -14,6 +14,11 @@ use super::codec::{encode_grpc_message, parse_grpc_header};
 use super::{GrpcLimits, MAX_FRAME_SIZE};
 
 const INIT_BUF: usize = 16 * 1024;
+// Keep one Hunk well below a peer's initial HTTP/2 connection window.  Some
+// gRPC clients only return flow-control credit after a complete Hunk has been
+// decoded; large Hunks from several multiplexed streams can otherwise leave
+// every stream waiting on a partial message.
+const MAX_OUTBOUND_GRPC_PAYLOAD_BYTES: usize = 1024;
 
 /// gRPC 传输层（兼容 v2ray）
 ///
@@ -52,7 +57,11 @@ impl GrpcH2cTransport {
             pending_release_capacity: 0,
             send_queue: VecDeque::new(),
             send_queue_bytes: 0,
-            pending_payload: BytesMut::with_capacity(limits.max_message_bytes),
+            pending_payload: BytesMut::with_capacity(
+                limits
+                    .max_message_bytes
+                    .min(MAX_OUTBOUND_GRPC_PAYLOAD_BYTES),
+            ),
             current_frame: None,
             current_frame_offset: 0,
             recv_closed: false,
@@ -66,6 +75,12 @@ impl GrpcH2cTransport {
 
     fn clear_send_capacity_deadline(&mut self) {
         self.send_capacity_deadline = None;
+    }
+
+    fn max_outbound_payload_bytes(&self) -> usize {
+        self.limits
+            .max_message_bytes
+            .min(MAX_OUTBOUND_GRPC_PAYLOAD_BYTES)
     }
 
     fn send_capacity_timed_out(&mut self, cx: &mut Context<'_>) -> bool {
@@ -446,10 +461,11 @@ impl AsyncWrite for GrpcH2cTransport {
             }
         }
 
-        let remaining = self.limits.max_message_bytes - self.pending_payload.len();
+        let max_outbound_payload_bytes = self.max_outbound_payload_bytes();
+        let remaining = max_outbound_payload_bytes - self.pending_payload.len();
         let to_write = buf.len().min(remaining);
         self.pending_payload.extend_from_slice(&buf[..to_write]);
-        if self.pending_payload.len() == self.limits.max_message_bytes {
+        if self.pending_payload.len() == max_outbound_payload_bytes {
             self.queue_pending_payload();
         }
 

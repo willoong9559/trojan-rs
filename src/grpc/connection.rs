@@ -51,7 +51,6 @@ where
         let h2_conn = server::Builder::new()
             .max_frame_size(MAX_FRAME_SIZE)
             .max_concurrent_streams(limits.max_concurrent_streams)
-            .max_send_buffer_size(limits.max_send_queue_bytes)
             .handshake(stream)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("h2 handshake: {}", e)))?;
