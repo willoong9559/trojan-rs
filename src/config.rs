@@ -68,6 +68,10 @@ pub struct InboundSettings {
     pub transport: InboundTransport,
     pub protocol: InboundProtocol,
     pub password: String,
+    /// Enables legacy VMess header authentication when non-zero. The value is
+    /// the client's `alterId` count; the default keeps modern VMess AEAD only.
+    #[serde(default)]
+    pub vmess_alter_id: u16,
     #[serde(default)]
     pub unix_path: Option<String>,
     #[serde(default)]
@@ -113,6 +117,9 @@ pub struct ServerConfig {
 
     #[arg(skip)]
     pub grpc_service_name: Option<String>,
+
+    #[arg(skip)]
+    pub vmess_alter_id: u16,
 
     #[arg(skip)]
     pub grpc_max_concurrent_streams: u32,
@@ -275,6 +282,17 @@ impl ServerConfig {
             ) {
                 crate::vless::parse_uuid(&inbound.password)?;
             }
+            if inbound.vmess_alter_id > 0 && inbound.protocol != InboundProtocol::Vmess {
+                return Err(anyhow!(
+                    "vmess_alter_id can only be used with protocol = \\\"vmess\\\""
+                ));
+            }
+            if inbound.vmess_alter_id > crate::vmess::MAX_LEGACY_ALTER_ID {
+                return Err(anyhow!(
+                    "vmess_alter_id must not exceed {}",
+                    crate::vmess::MAX_LEGACY_ALTER_ID
+                ));
+            }
             if inbound.listen.is_empty() && inbound.unix_path.is_none() {
                 return Err(anyhow!(
                     "each [[inbounds]] entry requires listen and/or unix_path"
@@ -323,6 +341,7 @@ impl ServerConfig {
                     normalize_grpc_service_name(inbound.grpc_service_name.clone())?;
                 config.password = inbound.password.trim().to_string();
                 config.protocol = inbound.protocol;
+                config.vmess_alter_id = inbound.vmess_alter_id;
                 config.use_acme = inbound.acme;
                 if config.password.is_empty() {
                     return Err(anyhow!("inbound password cannot be empty"));
@@ -374,6 +393,7 @@ impl ServerConfig {
                     normalize_grpc_service_name(inbound.grpc_service_name.clone())?;
                 config.password = inbound.password.trim().to_string();
                 config.protocol = inbound.protocol;
+                config.vmess_alter_id = inbound.vmess_alter_id;
                 config.use_acme = inbound.acme;
                 if config.password.is_empty() {
                     return Err(anyhow!("inbound password cannot be empty"));
@@ -629,6 +649,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
             transport: InboundTransport::Tcp,
             protocol: InboundProtocol::Trojan,
             password: "your_password_here".to_string(),
+            vmess_alter_id: 0,
             unix_path: None,
             ws_host: None,
             ws_path: None,
@@ -643,6 +664,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
             transport: InboundTransport::WebSocket,
             protocol: InboundProtocol::Trojan,
             password: "your_password_here".to_string(),
+            vmess_alter_id: 0,
             unix_path: None,
             ws_host: Some("cdn.example.com".to_string()),
             ws_path: Some("/trojan".to_string()),
@@ -657,6 +679,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
             transport: InboundTransport::Grpc,
             protocol: InboundProtocol::Trojan,
             password: "your_password_here".to_string(),
+            vmess_alter_id: 0,
             unix_path: None,
             ws_host: None,
             ws_path: None,
@@ -671,6 +694,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
             transport: InboundTransport::Tcp,
             protocol: InboundProtocol::Vmess,
             password: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
+            vmess_alter_id: 0,
             unix_path: None,
             ws_host: None,
             ws_path: None,
@@ -685,6 +709,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
             transport: InboundTransport::WebSocket,
             protocol: InboundProtocol::Trojan,
             password: "your_password_here".to_string(),
+            vmess_alter_id: 0,
             unix_path: Some("/run/trojan-rs/trojan.sock".to_string()),
             ws_host: None,
             ws_path: Some("/trojan-uds".to_string()),
@@ -740,6 +765,7 @@ impl TomlConfig {
             ws_host: None,
             ws_path: None,
             grpc_service_name: None,
+            vmess_alter_id: 0,
             grpc_max_concurrent_streams: self.server.grpc_max_concurrent_streams,
             grpc_max_read_buffer_bytes: self.server.grpc_max_read_buffer_bytes,
             grpc_max_message_bytes: self.server.grpc_max_message_bytes,
@@ -894,6 +920,21 @@ mod tests {
         assert!(config.expand_inbounds().is_err());
 
         config.inbounds[0].protocol = super::InboundProtocol::Vmess;
+        assert!(config.expand_inbounds().is_err());
+    }
+
+    #[test]
+    fn vmess_alter_id_is_limited_to_vmess_inbounds() {
+        let mut config = test_config();
+        config.inbounds[0].vmess_alter_id = 1;
+        assert!(config.expand_inbounds().is_err());
+
+        config.inbounds[0].protocol = super::InboundProtocol::Vmess;
+        config.inbounds[0].password = "01234567-89ab-cdef-0123-456789abcdef".to_string();
+        config.inbounds[0].vmess_alter_id = 64;
+        assert_eq!(config.expand_inbounds().unwrap()[0].vmess_alter_id, 64);
+
+        config.inbounds[0].vmess_alter_id = crate::vmess::MAX_LEGACY_ALTER_ID + 1;
         assert!(config.expand_inbounds().is_err());
     }
 

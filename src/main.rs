@@ -161,6 +161,7 @@ pub struct Server {
     pub protocol: config::InboundProtocol,
     pub vless_user_id: Option<[u8; 16]>,
     pub vmess_user_id: Option<[u8; 16]>,
+    pub vmess_legacy_authenticator: Option<Arc<vmess::LegacyAuthenticator>>,
     pub transport_mode: TransportMode,
     pub ws_host: Option<String>,
     pub ws_path: Option<String>,
@@ -407,7 +408,12 @@ async fn process_vmess<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let user_id = server
         .vmess_user_id
         .ok_or_else(|| anyhow!("VMess inbound has no configured UUID"))?;
-    let mut accepted = vmess::accept(stream, user_id).await?;
+    let mut accepted = vmess::accept(
+        stream,
+        user_id,
+        server.vmess_legacy_authenticator.as_deref(),
+    )
+    .await?;
     log::authentication(&peer_addr, true);
     match accepted.request.command {
         vmess::Command::Tcp => {
@@ -496,7 +502,13 @@ where
     let user_id = server
         .vmess_user_id
         .ok_or_else(|| anyhow!("VMess inbound has no configured UUID"))?;
-    let accepted = match vmess::accept(stream, user_id).await {
+    let accepted = match vmess::accept(
+        stream,
+        user_id,
+        server.vmess_legacy_authenticator.as_deref(),
+    )
+    .await
+    {
         Ok(accepted) => accepted,
         Err(error) => return Err(error),
     };
@@ -1124,6 +1136,15 @@ async fn build_server_with_acme(
             ([0_u8; 56], None, Some(vless::parse_uuid(&config.password)?))
         }
     };
+    let vmess_legacy_authenticator =
+        vmess_user_id
+            .filter(|_| config.vmess_alter_id > 0)
+            .map(|user_id| {
+                Arc::new(vmess::LegacyAuthenticator::new(
+                    user_id,
+                    config.vmess_alter_id,
+                ))
+            });
     let grpc_limits = config.grpc_limits()?;
     config.validate_connection_limits()?;
     let connection_limits = ConnectionLimits::new(
@@ -1165,6 +1186,7 @@ async fn build_server_with_acme(
         protocol,
         vless_user_id,
         vmess_user_id,
+        vmess_legacy_authenticator,
         transport_mode,
         ws_host: config.ws_host,
         ws_path: config.ws_path,
@@ -1308,6 +1330,7 @@ mod tests {
                 transport: config::InboundTransport::Tcp,
                 protocol: config::InboundProtocol::Trojan,
                 password: "test-password".to_string(),
+                vmess_alter_id: 0,
                 unix_path: None,
                 ws_host: None,
                 ws_path: None,
@@ -1322,6 +1345,7 @@ mod tests {
                 transport: config::InboundTransport::Grpc,
                 protocol: config::InboundProtocol::Trojan,
                 password: "test-password".to_string(),
+                vmess_alter_id: 0,
                 unix_path: None,
                 ws_host: None,
                 ws_path: None,
@@ -1420,6 +1444,7 @@ mod tests {
             ws_host: None,
             ws_path: None,
             grpc_service_name: None,
+            vmess_alter_id: 0,
             grpc_max_concurrent_streams: 7,
             grpc_max_read_buffer_bytes: 64 * 1024,
             grpc_max_message_bytes: 8 * 1024,

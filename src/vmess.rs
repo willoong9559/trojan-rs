@@ -1,20 +1,18 @@
-//! VMess AEAD (`alterId = 0`) inbound implementation.
-//!
-//! VMess authenticates its request header independently from the outer
-//! transport and then uses separately keyed AEAD records in each direction.
-//! This module deliberately accepts only the modern AEAD form: legacy
-//! alter-ID users are deprecated by Xray and cannot be authenticated without
-//! retaining a large set of rotating IDs.
+//! VMess inbound implementation, including modern AEAD and legacy alter-ID
+//! request headers.
 
 use std::{
-    cmp, io,
+    cmp,
+    collections::HashMap,
+    io,
     pin::Pin,
+    sync::Mutex,
     task::{Context, Poll},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use aes::{
-    cipher::{Block, BlockDecrypt, KeyInit},
+    cipher::{Block, BlockDecrypt, BlockEncrypt, KeyInit},
     Aes128,
 };
 use aes_gcm::{
@@ -25,6 +23,7 @@ use anyhow::{anyhow, Result};
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use chacha20poly1305::ChaCha20Poly1305;
 use crc32fast::hash as crc32;
+use hmac::{Hmac, Mac};
 use md5::{Digest as Md5Digest, Md5};
 use sha2::{Digest as Sha2Digest, Sha256};
 use sha3::{
@@ -38,6 +37,8 @@ use crate::socks5;
 const HEADER_MAX_LEN: usize = 1024;
 const MAX_CHUNK_LEN: usize = 16 * 1024;
 const AUTH_ID_MAX_TIME_DIFF_SECS: u64 = 120;
+const LEGACY_AUTH_CACHE_REFRESH_SECS: u64 = 10;
+pub const MAX_LEGACY_ALTER_ID: u16 = 256;
 const OPTION_CHUNK_STREAM: u8 = 0x01;
 const OPTION_CHUNK_MASKING: u8 = 0x04;
 const OPTION_GLOBAL_PADDING: u8 = 0x08;
@@ -58,6 +59,10 @@ const KDF_RESPONSE_LEN_KEY: &[u8] = b"AEAD Resp Header Len Key";
 const KDF_RESPONSE_LEN_NONCE: &[u8] = b"AEAD Resp Header Len IV";
 const KDF_RESPONSE_KEY: &[u8] = b"AEAD Resp Header Key";
 const KDF_RESPONSE_NONCE: &[u8] = b"AEAD Resp Header IV";
+const ALTER_ID_SALT: &[u8] = b"16167dc8-16b6-4e6d-b8bb-65dd68113a81";
+const ALTER_ID_REHASH_SALT: &[u8] = b"533eff8a-4113-4b10-b5ce-0f5d76b98cd2";
+
+type HmacMd5 = Hmac<Md5>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
@@ -159,6 +164,135 @@ fn command_key(user_id: &[u8; 16]) -> [u8; 16] {
     Md5Digest::update(&mut hash, user_id);
     Md5Digest::update(&mut hash, b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
     hash.finalize().into()
+}
+
+fn next_alter_id(user_id: &[u8; 16]) -> [u8; 16] {
+    let mut hash = Md5::new();
+    Md5Digest::update(&mut hash, user_id);
+    Md5Digest::update(&mut hash, ALTER_ID_SALT);
+    let next: [u8; 16] = hash.clone().finalize().into();
+    if &next != user_id {
+        return next;
+    }
+
+    // Match V2Ray's exceedingly rare collision fallback exactly.
+    Md5Digest::update(&mut hash, ALTER_ID_REHASH_SALT);
+    hash.finalize().into()
+}
+
+fn legacy_auth_id(user_id: &[u8; 16], timestamp: u64) -> [u8; 16] {
+    let mut mac = <HmacMd5 as Mac>::new_from_slice(user_id).expect("UUID is a fixed-size HMAC key");
+    Mac::update(&mut mac, &timestamp.to_be_bytes());
+    mac.finalize().into_bytes().into()
+}
+
+fn legacy_header_iv(timestamp: u64) -> [u8; 16] {
+    let mut hash = Md5::new();
+    let timestamp = timestamp.to_be_bytes();
+    for _ in 0..4 {
+        Md5Digest::update(&mut hash, timestamp);
+    }
+    hash.finalize().into()
+}
+
+/// Matches VMess's rotating legacy alter-ID authentication hashes. The cache
+/// covers the same +/- two-minute timestamp window used by VMess AEAD.
+pub struct LegacyAuthenticator {
+    ids: Vec<[u8; 16]>,
+    cache: Mutex<LegacyAuthCache>,
+}
+
+struct LegacyAuthCache {
+    refreshed_at: u64,
+    hashes: HashMap<[u8; 16], u64>,
+}
+
+impl LegacyAuthenticator {
+    pub fn new(user_id: [u8; 16], alter_id: u16) -> Self {
+        let mut ids = Vec::with_capacity(usize::from(alter_id) + 1);
+        ids.push(user_id);
+        let mut current = user_id;
+        for _ in 0..alter_id {
+            current = next_alter_id(&current);
+            ids.push(current);
+        }
+        Self {
+            ids,
+            cache: Mutex::new(LegacyAuthCache {
+                refreshed_at: 0,
+                hashes: HashMap::new(),
+            }),
+        }
+    }
+
+    fn match_auth_id(&self, auth_id: &[u8; 16]) -> Result<Option<u64>> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let mut cache = self.cache.lock().expect("legacy VMess auth cache poisoned");
+        if cache.hashes.is_empty()
+            || now < cache.refreshed_at
+            || now - cache.refreshed_at >= LEGACY_AUTH_CACHE_REFRESH_SECS
+        {
+            let start = now.saturating_sub(AUTH_ID_MAX_TIME_DIFF_SECS);
+            let end = now.saturating_add(AUTH_ID_MAX_TIME_DIFF_SECS);
+            let capacity = self.ids.len().saturating_mul(
+                usize::try_from(end.saturating_sub(start).saturating_add(1)).unwrap_or(usize::MAX),
+            );
+            let mut hashes = HashMap::with_capacity(capacity);
+            for timestamp in start..=end {
+                for user_id in &self.ids {
+                    hashes.insert(legacy_auth_id(user_id, timestamp), timestamp);
+                }
+            }
+            cache.refreshed_at = now;
+            cache.hashes = hashes;
+        }
+        Ok(cache.hashes.get(auth_id).copied())
+    }
+}
+
+/// Stateful AES-128-CFB used only by VMess's legacy request and response
+/// headers. Body encryption remains the configured AEAD stream cipher.
+struct AesCfb128 {
+    cipher: Aes128,
+    feedback: [u8; 16],
+    offset: usize,
+}
+
+impl AesCfb128 {
+    fn new(key: &[u8; 16], iv: &[u8; 16]) -> Self {
+        Self {
+            cipher: Aes128::new_from_slice(key).expect("fixed AES-128 key length"),
+            feedback: *iv,
+            offset: 0,
+        }
+    }
+
+    fn decrypt(&mut self, data: &mut [u8]) {
+        for byte in data {
+            if self.offset == 0 {
+                let mut block = Block::<Aes128>::clone_from_slice(&self.feedback);
+                self.cipher.encrypt_block(&mut block);
+                self.feedback.copy_from_slice(&block);
+            }
+            let ciphertext = *byte;
+            *byte ^= self.feedback[self.offset];
+            self.feedback[self.offset] = ciphertext;
+            self.offset = (self.offset + 1) % self.feedback.len();
+        }
+    }
+
+    fn encrypt(&mut self, data: &mut [u8]) {
+        for byte in data {
+            if self.offset == 0 {
+                let mut block = Block::<Aes128>::clone_from_slice(&self.feedback);
+                self.cipher.encrypt_block(&mut block);
+                self.feedback.copy_from_slice(&block);
+            }
+            *byte ^= self.feedback[self.offset];
+            self.feedback[self.offset] = *byte;
+            self.offset = (self.offset + 1) % self.feedback.len();
+        }
+    }
 }
 
 fn verify_auth_id(user_id: &[u8; 16], mut auth_id: [u8; 16]) -> Result<[u8; 16]> {
@@ -344,14 +478,116 @@ pub struct Accepted<S> {
     pub stream: Stream<S>,
 }
 
+async fn accept_legacy<S>(mut stream: S, user_id: [u8; 16], timestamp: u64) -> Result<Accepted<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let command_key = command_key(&user_id);
+    let header_iv = legacy_header_iv(timestamp);
+    let mut cfb = AesCfb128::new(&command_key, &header_iv);
+
+    let mut header = vec![0; 38];
+    stream.read_exact(&mut header).await?;
+    cfb.decrypt(&mut header);
+    if header[0] != 1 {
+        return Err(anyhow!("unsupported legacy VMess request header"));
+    }
+
+    let request_iv: [u8; 16] = header[1..17].try_into().unwrap();
+    let request_key: [u8; 16] = header[17..33].try_into().unwrap();
+    let response_auth = header[33];
+    let options = header[34];
+    let padding_len = (header[35] >> 4) as usize;
+    let security = header[35] & 0x0f;
+    if options & OPTION_CHUNK_STREAM == 0 {
+        return Err(anyhow!("VMess without chunk stream is not supported"));
+    }
+    if options & OPTION_AUTHENTICATED_LENGTH != 0 {
+        return Err(anyhow!("VMess authenticated length is not supported"));
+    }
+    let command = match header[37] {
+        1 => Command::Tcp,
+        2 => Command::Udp,
+        command => return Err(anyhow!("unsupported VMess command {command}")),
+    };
+
+    let mut address_prefix = [0; 3];
+    stream.read_exact(&mut address_prefix).await?;
+    cfb.decrypt(&mut address_prefix);
+    header.extend_from_slice(&address_prefix);
+    let address_remaining = match address_prefix[2] {
+        1 => 4,
+        2 => {
+            let mut length = [0; 1];
+            stream.read_exact(&mut length).await?;
+            cfb.decrypt(&mut length);
+            header.extend_from_slice(&length);
+            usize::from(length[0])
+        }
+        3 => 16,
+        kind => return Err(anyhow!("unsupported VMess address type {kind}")),
+    };
+    let mut address = vec![0; address_remaining];
+    stream.read_exact(&mut address).await?;
+    cfb.decrypt(&mut address);
+    header.extend_from_slice(&address);
+
+    let mut trailer = vec![0; padding_len + 4];
+    stream.read_exact(&mut trailer).await?;
+    cfb.decrypt(&mut trailer);
+    header.extend_from_slice(&trailer);
+
+    let mut cursor = 38;
+    let addr = decode_address(&header, &mut cursor)?;
+    let checksum_offset = cursor
+        .checked_add(padding_len)
+        .ok_or_else(|| anyhow!("invalid legacy VMess header padding"))?;
+    if checksum_offset + 4 != header.len() {
+        return Err(anyhow!("invalid legacy VMess request header size"));
+    }
+    let expected = u32::from_be_bytes(header[checksum_offset..].try_into().unwrap());
+    if fnv1a(&header[..checksum_offset]) != expected {
+        return Err(anyhow!("invalid legacy VMess request checksum"));
+    }
+
+    let response_key: [u8; 16] = Md5::digest(request_key).into();
+    let response_iv: [u8; 16] = Md5::digest(request_iv).into();
+    write_legacy_response_header(&mut stream, response_auth, &response_key, &response_iv).await?;
+
+    Ok(Accepted {
+        request: Request { command, addr },
+        stream: Stream::new(
+            stream,
+            request_key,
+            request_iv,
+            response_key,
+            response_iv,
+            security,
+            options,
+        )?,
+    })
+}
+
 /// Parse the AEAD request header and produce a decrypted bidirectional stream.
-pub async fn accept<S>(mut stream: S, user_id: [u8; 16]) -> Result<Accepted<S>>
+pub async fn accept<S>(
+    mut stream: S,
+    user_id: [u8; 16],
+    legacy_authenticator: Option<&LegacyAuthenticator>,
+) -> Result<Accepted<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut auth_id = [0; 16];
     stream.read_exact(&mut auth_id).await?;
-    verify_auth_id(&user_id, auth_id)?;
+    if verify_auth_id(&user_id, auth_id).is_err() {
+        let Some(legacy_authenticator) = legacy_authenticator else {
+            return Err(anyhow!("invalid VMess authentication ID"));
+        };
+        let Some(timestamp) = legacy_authenticator.match_auth_id(&auth_id)? else {
+            return Err(anyhow!("invalid legacy VMess authentication ID"));
+        };
+        return accept_legacy(stream, user_id, timestamp).await;
+    }
     let command_key = command_key(&user_id);
 
     let mut encrypted_length = [0; 18];
@@ -474,6 +710,19 @@ async fn write_response_header<S: AsyncWrite + Unpin>(
             &[],
         ))
         .await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn write_legacy_response_header<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    response_auth: u8,
+    key: &[u8; 16],
+    iv: &[u8; 16],
+) -> Result<()> {
+    let mut header = [response_auth, 0, 0, 0];
+    AesCfb128::new(key, iv).encrypt(&mut header);
+    stream.write_all(&header).await?;
     stream.flush().await?;
     Ok(())
 }
@@ -835,6 +1084,41 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Stream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn legacy_request(
+        user_id: [u8; 16],
+        alter_id: u16,
+        timestamp: u64,
+        request_iv: [u8; 16],
+        request_key: [u8; 16],
+        response_auth: u8,
+    ) -> Vec<u8> {
+        let mut selected_id = user_id;
+        for _ in 0..alter_id {
+            selected_id = next_alter_id(&selected_id);
+        }
+
+        let mut header = Vec::with_capacity(48);
+        header.push(1);
+        header.extend_from_slice(&request_iv);
+        header.extend_from_slice(&request_key);
+        header.push(response_auth);
+        header.push(OPTION_CHUNK_STREAM);
+        header.push(SECURITY_AES_128_GCM);
+        header.push(0);
+        header.push(1);
+        header.extend_from_slice(&443u16.to_be_bytes());
+        header.push(1);
+        header.extend_from_slice(&[127, 0, 0, 1]);
+        header.extend_from_slice(&fnv1a(&header).to_be_bytes());
+
+        let command_key = command_key(&user_id);
+        AesCfb128::new(&command_key, &legacy_header_iv(timestamp)).encrypt(&mut header);
+        let mut wire = legacy_auth_id(&selected_id, timestamp).to_vec();
+        wire.extend_from_slice(&header);
+        wire
+    }
 
     #[test]
     fn vmess_kdf_is_stable() {
@@ -852,5 +1136,62 @@ mod tests {
     fn parses_uuid_with_shared_vless_helper() {
         let id = crate::vless::parse_uuid("01234567-89ab-cdef-0123-456789abcdef").unwrap();
         assert_ne!(command_key(&id), [0; 16]);
+    }
+
+    #[test]
+    fn aes_cfb128_matches_the_nist_vector() {
+        let key: [u8; 16] = hex::decode("2b7e151628aed2a6abf7158809cf4f3c")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let iv: [u8; 16] = hex::decode("000102030405060708090a0b0c0d0e0f")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let plaintext = hex::decode("6bc1bee22e409f96e93d7e117393172a").unwrap();
+        let ciphertext = hex::decode("3b3fd92eb72dad20333449f8e83cfb4a").unwrap();
+
+        let mut encrypted = plaintext.clone();
+        AesCfb128::new(&key, &iv).encrypt(&mut encrypted);
+        assert_eq!(encrypted, ciphertext);
+        AesCfb128::new(&key, &iv).decrypt(&mut encrypted);
+        assert_eq!(encrypted, plaintext);
+    }
+
+    #[tokio::test]
+    async fn accepts_a_legacy_alter_id_header_and_returns_legacy_response_header() {
+        let user_id = *b"0123456789abcdef";
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let request_iv = [0x11; 16];
+        let request_key = [0x22; 16];
+        let response_auth = 0x5a;
+        let request = legacy_request(
+            user_id,
+            1,
+            timestamp,
+            request_iv,
+            request_key,
+            response_auth,
+        );
+        let authenticator = LegacyAuthenticator::new(user_id, 1);
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(&request).await.unwrap();
+
+        let accepted = accept(server, user_id, Some(&authenticator)).await.unwrap();
+        assert_eq!(accepted.request.command, Command::Tcp);
+        assert!(matches!(
+            accepted.request.addr,
+            socks5::Address::IPv4([127, 0, 0, 1], 443)
+        ));
+
+        let mut response = [0; 4];
+        client.read_exact(&mut response).await.unwrap();
+        let response_key: [u8; 16] = Md5::digest(request_key).into();
+        let response_iv: [u8; 16] = Md5::digest(request_iv).into();
+        AesCfb128::new(&response_key, &response_iv).decrypt(&mut response);
+        assert_eq!(response, [response_auth, 0, 0, 0]);
     }
 }

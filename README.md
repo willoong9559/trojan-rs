@@ -81,6 +81,8 @@ listen = ["0.0.0.0:10443", "[::]:10443"]
 transport = "tcp"
 protocol = "vmess"
 password = "01234567-89ab-cdef-0123-456789abcdef"
+# 旧版非 AEAD VMess 客户端才需要设置；省略或设为 0 时仅接受 AEAD。
+# vmess_alter_id = 64
 tls = { cert = "/etc/trojan-rs/cert.pem", key = "/etc/trojan-rs/key.pem" }
 
 # 5. Trojan gRPC over REALITY
@@ -110,7 +112,7 @@ level = "info"
 
 VLESS 支持 TCP 与标准 UDP。VLESS UDP 使用请求头中的单一目标地址和 `u16` 长度分包。
 
-VMess 支持 Xray 的 AEAD（`alterId = 0`）认证方式及 `aes-128-gcm`、`chacha20-poly1305` 数据加密，可与 TCP、WebSocket、gRPC、TLS 或 REALITY 组合。VMess UDP 使用请求头中的单一目标地址和每个 VMess 数据分块一个 UDP 包。
+VMess 默认支持 Xray 的 AEAD（`alterId = 0`）认证方式；为兼容旧版非 AEAD 客户端，可在 VMess 入口设置 `vmess_alter_id`（1–256）。两种方式均使用 `aes-128-gcm` 或 `chacha20-poly1305` 数据加密，可与 TCP、WebSocket、gRPC、TLS 或 REALITY 组合。VMess UDP 使用请求头中的单一目标地址和每个 VMess 数据分块一个 UDP 包。
 
 Xray 客户端默认会为部分 UDP 目标启用 XUDP/Mux；使用本实现的 VMess UDP 时，需将客户端环境变量设为 `XRAY_CONE_DISABLED=true`，使其发送标准 VMess UDP 命令。
 
