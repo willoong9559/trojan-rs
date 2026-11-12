@@ -112,7 +112,7 @@ level = "info"
 
 VLESS 支持 TCP 与标准 UDP。VLESS UDP 使用请求头中的单一目标地址和 `u16` 长度分包。
 
-VMess 默认支持 Xray 的 AEAD（`alterId = 0`）认证方式；为兼容旧版非 AEAD 客户端，可在 VMess 入口设置 `vmess_alter_id`（1–256）。两种方式均使用 `aes-128-gcm` 或 `chacha20-poly1305` 数据加密，可与 TCP、WebSocket、gRPC、TLS 或 REALITY 组合。VMess UDP 使用请求头中的单一目标地址和每个 VMess 数据分块一个 UDP 包。
+VMess 默认支持 Xray 的 AEAD（`alterId = 0`）认证方式；为兼容旧版非 AEAD 客户端，可在 VMess 入口设置 `vmess_alter_id`（1–256）。设置为非零值后，该入口仍会接受 AEAD 新客户端，同时也接受 `alterId` 相同的旧客户端。两种方式均使用 `aes-128-gcm` 或 `chacha20-poly1305` 数据加密，可与 TCP、WebSocket、gRPC、TLS 或 REALITY 组合。VMess UDP 使用请求头中的单一目标地址和每个 VMess 数据分块一个 UDP 包。
 
 Xray 客户端默认会为部分 UDP 目标启用 XUDP/Mux；使用本实现的 VMess UDP 时，需将客户端环境变量设为 `XRAY_CONE_DISABLED=true`，使其发送标准 VMess UDP 命令。
 
