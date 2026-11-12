@@ -400,6 +400,45 @@ where
     }
 }
 
+async fn accept_vmess_with_timeout<S>(
+    stream: S,
+    user_id: [u8; 16],
+    legacy_authenticator: Option<&vmess::LegacyAuthenticator>,
+    timeout_duration: Duration,
+) -> Result<vmess::Accepted<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::time::timeout(
+        timeout_duration,
+        vmess::accept(stream, user_id, legacy_authenticator),
+    )
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "Timed out waiting for VMess request header after {} seconds",
+            timeout_duration.as_secs()
+        )
+    })?
+}
+
+async fn accept_vmess<S>(
+    stream: S,
+    user_id: [u8; 16],
+    legacy_authenticator: Option<&vmess::LegacyAuthenticator>,
+) -> Result<vmess::Accepted<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    accept_vmess_with_timeout(
+        stream,
+        user_id,
+        legacy_authenticator,
+        Duration::from_secs(REQUEST_HEADER_TIMEOUT_SECS),
+    )
+    .await
+}
+
 async fn process_vmess<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     server: Arc<Server>,
     stream: S,
@@ -408,7 +447,7 @@ async fn process_vmess<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let user_id = server
         .vmess_user_id
         .ok_or_else(|| anyhow!("VMess inbound has no configured UUID"))?;
-    let mut accepted = vmess::accept(
+    let mut accepted = accept_vmess(
         stream,
         user_id,
         server.vmess_legacy_authenticator.as_deref(),
@@ -502,7 +541,7 @@ where
     let user_id = server
         .vmess_user_id
         .ok_or_else(|| anyhow!("VMess inbound has no configured UUID"))?;
-    let accepted = match vmess::accept(
+    let accepted = match accept_vmess(
         stream,
         user_id,
         server.vmess_legacy_authenticator.as_deref(),
@@ -1311,6 +1350,18 @@ mod tests {
             std::io::ErrorKind::TimedOut,
             "gRPC stream flow-control capacity timed out",
         )));
+    }
+
+    #[tokio::test]
+    async fn incomplete_vmess_request_times_out() {
+        let (server_io, _client_io) = tokio::io::duplex(16);
+        let result =
+            accept_vmess_with_timeout(server_io, [0_u8; 16], None, Duration::from_millis(1)).await;
+
+        assert!(matches!(
+            result,
+            Err(error) if error.to_string().contains("Timed out waiting for VMess request header")
+        ));
     }
 
     #[tokio::test]
