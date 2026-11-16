@@ -26,7 +26,7 @@ cargo build --release
 
 ## 配置
 
-`[server]` 定义共享的资源限制、gRPC 限制和可选的内置 ACME 设置。每个 `[[inbounds]]` 必须设置自己的 `protocol` 和 `password`。`trojan` 的 `password` 是普通密码；`vless` 和 `vmess` 的 `password` 必须是 UUID。`listen` 是 Socket 地址数组，因此 `0.0.0.0:PORT` 与 `[::]:PORT` 可以同时监听同一端口的 IPv4 和 IPv6。
+`[server]` 定义共享的资源限制、gRPC 限制和可选的内置 ACME 设置。每个 `[[inbounds]]` 必须设置自己的 `protocol` 和 `password`。`trojan` 与 `shadowsocks` 的 `password` 是普通密码；`vless` 和 `vmess` 的 `password` 必须是 UUID。`listen` 是 Socket 地址数组，因此 `0.0.0.0:PORT` 与 `[::]:PORT` 可以同时监听同一端口的 IPv4 和 IPv6。
 
 ```toml
 [server]
@@ -104,11 +104,22 @@ protocol = "trojan"
 password = "uds-strong-password"
 ws_path = "/trojan-uds"
 
+# 7. Shadowsocks TCP（标准 AEAD；也可设为 "none"）
+[[inbounds]]
+tag = "shadowsocks-tcp"
+listen = ["0.0.0.0:8388", "[::]:8388"]
+transport = "tcp"
+protocol = "shadowsocks"
+password = "ss-strong-password"
+shadowsocks_method = "chacha20-ietf-poly1305"
+
 [log]
 level = "info"
 ```
 
-`protocol` 必须为 `trojan`、`vless` 或 `vmess`；`transport` 可取：`tcp`、`websocket`、`grpc`。`ws_host`、`ws_path` 只用于 WebSocket；`grpc_service_name` 只用于 gRPC。`unix_path` 为 Unix Domain Socket 路径；它可以与 `listen` 同时配置，但不能用于 REALITY。
+`protocol` 必须为 `trojan`、`vless`、`vmess` 或 `shadowsocks`；`transport` 可取：`tcp`、`websocket`、`grpc`。`ws_host`、`ws_path` 只用于 WebSocket；`grpc_service_name` 只用于 gRPC。`unix_path` 为 Unix Domain Socket 路径；它可以与 `listen` 同时配置，但不能用于 REALITY。
+
+Shadowsocks 可使用 `tcp`、`websocket`、`grpc` 传输，也可组合 TLS、ACME 或 REALITY；其加密流位于这些外层之内。入口必须配置 `shadowsocks_method`，可选值为 `none`、`aes-128-gcm`、`aes-256-gcm`、`chacha20-ietf-poly1305`。后三者使用标准 Shadowsocks AEAD TCP 格式；`none` 不提供加密或有效认证，不建议用于公网。普通裸 `ss://` 客户端只能连接原生 TCP Shadowsocks；使用外层传输时，客户端必须配置相同的封装。
 
 VLESS 支持 TCP 与标准 UDP。VLESS UDP 使用请求头中的单一目标地址和 `u16` 长度分包。
 

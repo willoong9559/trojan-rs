@@ -5,6 +5,7 @@ mod grpc;
 mod logger;
 mod reality;
 mod relay;
+mod shadowsocks;
 mod socks5;
 mod tls;
 mod udp;
@@ -162,6 +163,7 @@ pub struct Server {
     pub vless_user_id: Option<[u8; 16]>,
     pub vmess_user_id: Option<[u8; 16]>,
     pub vmess_legacy_authenticator: Option<Arc<vmess::LegacyAuthenticator>>,
+    pub shadowsocks_cipher: Option<shadowsocks::Cipher>,
     pub transport_mode: TransportMode,
     pub ws_host: Option<String>,
     pub ws_path: Option<String>,
@@ -397,6 +399,13 @@ where
         config::InboundProtocol::Trojan => process_trojan(server, stream, peer_addr).await,
         config::InboundProtocol::Vless => process_vless(server, stream, peer_addr).await,
         config::InboundProtocol::Vmess => process_vmess(server, stream, peer_addr).await,
+        config::InboundProtocol::Shadowsocks => {
+            let cipher = server
+                .shadowsocks_cipher
+                .clone()
+                .ok_or_else(|| anyhow!("Shadowsocks inbound has no configured cipher"))?;
+            shadowsocks::handle_connection(cipher, stream, peer_addr).await
+        }
     }
 }
 
@@ -531,6 +540,13 @@ where
         }
         config::InboundProtocol::Vless => process_grpc_vless(server, stream, peer_addr).await,
         config::InboundProtocol::Vmess => process_grpc_vmess(server, stream, peer_addr).await,
+        config::InboundProtocol::Shadowsocks => {
+            let cipher = server
+                .shadowsocks_cipher
+                .clone()
+                .ok_or_else(|| anyhow!("Shadowsocks inbound has no configured cipher"))?;
+            shadowsocks::handle_connection(cipher, stream, peer_addr).await
+        }
     }
 }
 
@@ -766,6 +782,7 @@ fn log_incorrect_credential(
         config::InboundProtocol::Trojan => "Trojan",
         config::InboundProtocol::Vless => "VLESS",
         config::InboundProtocol::Vmess => "VMess",
+        config::InboundProtocol::Shadowsocks => "Shadowsocks",
     };
     log::warn!(peer = %peer_addr, protocol = protocol, transport = transport, "Incorrect credential");
 }
@@ -812,7 +829,7 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn connect_first_available(
+pub(crate) async fn connect_first_available(
     peer_addr: &str,
     addrs: &[SocketAddr],
 ) -> Result<(TcpStream, SocketAddr)> {
@@ -1174,6 +1191,18 @@ async fn build_server_with_acme(
         config::InboundProtocol::Vmess => {
             ([0_u8; 56], None, Some(vless::parse_uuid(&config.password)?))
         }
+        config::InboundProtocol::Shadowsocks => ([0_u8; 56], None, None),
+    };
+    let shadowsocks_cipher = if protocol == config::InboundProtocol::Shadowsocks {
+        Some(shadowsocks::Cipher::new(
+            config
+                .shadowsocks_method
+                .as_deref()
+                .ok_or_else(|| anyhow!("Shadowsocks requires shadowsocks_method"))?,
+            &config.password,
+        )?)
+    } else {
+        None
     };
     let vmess_legacy_authenticator =
         vmess_user_id
@@ -1226,6 +1255,7 @@ async fn build_server_with_acme(
         vless_user_id,
         vmess_user_id,
         vmess_legacy_authenticator,
+        shadowsocks_cipher,
         transport_mode,
         ws_host: config.ws_host,
         ws_path: config.ws_path,
@@ -1381,6 +1411,7 @@ mod tests {
                 transport: config::InboundTransport::Tcp,
                 protocol: config::InboundProtocol::Trojan,
                 password: "test-password".to_string(),
+                shadowsocks_method: None,
                 vmess_alter_id: 0,
                 unix_path: None,
                 ws_host: None,
@@ -1396,6 +1427,7 @@ mod tests {
                 transport: config::InboundTransport::Grpc,
                 protocol: config::InboundProtocol::Trojan,
                 password: "test-password".to_string(),
+                shadowsocks_method: None,
                 vmess_alter_id: 0,
                 unix_path: None,
                 ws_host: None,
@@ -1496,6 +1528,7 @@ mod tests {
             ws_path: None,
             grpc_service_name: None,
             vmess_alter_id: 0,
+            shadowsocks_method: None,
             grpc_max_concurrent_streams: 7,
             grpc_max_read_buffer_bytes: 64 * 1024,
             grpc_max_message_bytes: 8 * 1024,

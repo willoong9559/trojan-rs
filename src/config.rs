@@ -54,6 +54,7 @@ pub enum InboundProtocol {
     Trojan,
     Vless,
     Vmess,
+    Shadowsocks,
 }
 
 /// A listener declared in TOML's `[[inbounds]]` array.
@@ -68,10 +69,14 @@ pub struct InboundSettings {
     pub transport: InboundTransport,
     pub protocol: InboundProtocol,
     pub password: String,
+    /// Shadowsocks cipher. Required when `protocol = "shadowsocks"`.
+    #[serde(default)]
+    pub shadowsocks_method: Option<String>,
     /// Enables legacy VMess header authentication when non-zero. The value is
     /// the client's `alterId` count; the default keeps modern VMess AEAD only.
     #[serde(default)]
     pub vmess_alter_id: u16,
+
     #[serde(default)]
     pub unix_path: Option<String>,
     #[serde(default)]
@@ -120,6 +125,9 @@ pub struct ServerConfig {
 
     #[arg(skip)]
     pub vmess_alter_id: u16,
+
+    #[arg(skip)]
+    pub shadowsocks_method: Option<String>,
 
     #[arg(skip)]
     pub grpc_max_concurrent_streams: u32,
@@ -287,6 +295,17 @@ impl ServerConfig {
                     "vmess_alter_id can only be used with protocol = \\\"vmess\\\""
                 ));
             }
+            if inbound.protocol == InboundProtocol::Shadowsocks {
+                let method = inbound
+                    .shadowsocks_method
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("Shadowsocks requires shadowsocks_method"))?;
+                crate::shadowsocks::Method::parse(method)?;
+            } else if inbound.shadowsocks_method.is_some() {
+                return Err(anyhow!(
+                    "shadowsocks_method can only be used with protocol = \"shadowsocks\""
+                ));
+            }
             if inbound.vmess_alter_id > crate::vmess::MAX_LEGACY_ALTER_ID {
                 return Err(anyhow!(
                     "vmess_alter_id must not exceed {}",
@@ -342,6 +361,7 @@ impl ServerConfig {
                 config.password = inbound.password.trim().to_string();
                 config.protocol = inbound.protocol;
                 config.vmess_alter_id = inbound.vmess_alter_id;
+                config.shadowsocks_method = inbound.shadowsocks_method.clone();
                 config.use_acme = inbound.acme;
                 if config.password.is_empty() {
                     return Err(anyhow!("inbound password cannot be empty"));
@@ -394,6 +414,7 @@ impl ServerConfig {
                 config.password = inbound.password.trim().to_string();
                 config.protocol = inbound.protocol;
                 config.vmess_alter_id = inbound.vmess_alter_id;
+                config.shadowsocks_method = inbound.shadowsocks_method.clone();
                 config.use_acme = inbound.acme;
                 if config.password.is_empty() {
                     return Err(anyhow!("inbound password cannot be empty"));
@@ -649,6 +670,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
             transport: InboundTransport::Tcp,
             protocol: InboundProtocol::Trojan,
             password: "your_password_here".to_string(),
+            shadowsocks_method: None,
             vmess_alter_id: 0,
             unix_path: None,
             ws_host: None,
@@ -664,6 +686,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
             transport: InboundTransport::WebSocket,
             protocol: InboundProtocol::Trojan,
             password: "your_password_here".to_string(),
+            shadowsocks_method: None,
             vmess_alter_id: 0,
             unix_path: None,
             ws_host: Some("cdn.example.com".to_string()),
@@ -679,6 +702,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
             transport: InboundTransport::Grpc,
             protocol: InboundProtocol::Trojan,
             password: "your_password_here".to_string(),
+            shadowsocks_method: None,
             vmess_alter_id: 0,
             unix_path: None,
             ws_host: None,
@@ -694,6 +718,7 @@ fn example_inbounds() -> Vec<InboundSettings> {
             transport: InboundTransport::Tcp,
             protocol: InboundProtocol::Vmess,
             password: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
+            shadowsocks_method: None,
             vmess_alter_id: 0,
             unix_path: None,
             ws_host: None,
@@ -709,10 +734,27 @@ fn example_inbounds() -> Vec<InboundSettings> {
             transport: InboundTransport::WebSocket,
             protocol: InboundProtocol::Trojan,
             password: "your_password_here".to_string(),
+            shadowsocks_method: None,
             vmess_alter_id: 0,
             unix_path: Some("/run/trojan-rs/trojan.sock".to_string()),
             ws_host: None,
             ws_path: Some("/trojan-uds".to_string()),
+            grpc_service_name: None,
+            tls: None,
+            acme: false,
+            reality: None,
+        },
+        InboundSettings {
+            tag: Some("shadowsocks-tcp".to_string()),
+            listen: vec!["0.0.0.0:8388".to_string(), "[::]:8388".to_string()],
+            transport: InboundTransport::Tcp,
+            protocol: InboundProtocol::Shadowsocks,
+            password: "your_password_here".to_string(),
+            shadowsocks_method: Some("chacha20-ietf-poly1305".to_string()),
+            vmess_alter_id: 0,
+            unix_path: None,
+            ws_host: None,
+            ws_path: None,
             grpc_service_name: None,
             tls: None,
             acme: false,
@@ -766,6 +808,7 @@ impl TomlConfig {
             ws_path: None,
             grpc_service_name: None,
             vmess_alter_id: 0,
+            shadowsocks_method: None,
             grpc_max_concurrent_streams: self.server.grpc_max_concurrent_streams,
             grpc_max_read_buffer_bytes: self.server.grpc_max_read_buffer_bytes,
             grpc_max_message_bytes: self.server.grpc_max_message_bytes,
@@ -936,6 +979,33 @@ mod tests {
 
         config.inbounds[0].vmess_alter_id = crate::vmess::MAX_LEGACY_ALTER_ID + 1;
         assert!(config.expand_inbounds().is_err());
+    }
+
+    #[test]
+    fn shadowsocks_requires_a_supported_method() {
+        let mut config = test_config();
+        config.inbounds[0].protocol = super::InboundProtocol::Shadowsocks;
+        assert!(config.expand_inbounds().is_err());
+
+        config.inbounds[0].shadowsocks_method = Some("aes-256-gcm".to_string());
+        assert!(config.expand_inbounds().is_ok());
+
+        config.inbounds[0].transport = super::InboundTransport::WebSocket;
+        assert!(config.expand_inbounds().is_ok());
+
+        config.inbounds[0].transport = super::InboundTransport::Grpc;
+        assert!(config.expand_inbounds().is_ok());
+
+        config.inbounds[0].shadowsocks_method = Some("rc4-md5".to_string());
+        assert!(config.expand_inbounds().is_err());
+
+        config.inbounds[0].shadowsocks_method = Some("aes-128-gcm".to_string());
+        config.inbounds[0].tls = Some(super::TlsSettings {
+            cert: "cert.pem".to_string(),
+            key: "key.pem".to_string(),
+            cert_chain: Vec::new(),
+        });
+        assert!(config.expand_inbounds().is_ok());
     }
 
     #[test]
