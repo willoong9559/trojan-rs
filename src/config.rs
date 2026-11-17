@@ -7,6 +7,7 @@ use crate::grpc::{
     GrpcLimits, DEFAULT_GRPC_MAX_CONCURRENT_STREAMS, DEFAULT_GRPC_MAX_MESSAGE_BYTES,
     DEFAULT_GRPC_MAX_READ_BUFFER_BYTES, DEFAULT_GRPC_MAX_SEND_QUEUE_BYTES, MAX_FRAME_SIZE,
 };
+use crate::outbound::OutboundPolicySettings;
 
 pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 pub const DEFAULT_MAX_TLS_HANDSHAKES: usize = 64;
@@ -152,6 +153,9 @@ pub struct ServerConfig {
     pub max_connections_per_ip: usize,
 
     #[arg(skip)]
+    pub outbound_policy: OutboundPolicySettings,
+
+    #[arg(skip)]
     pub shutdown_timeout_secs: u64,
 
     #[arg(skip)]
@@ -268,6 +272,7 @@ impl ServerConfig {
         config.acme = config.acme_settings()?;
         config.grpc_limits()?;
         config.validate_connection_limits()?;
+        config.outbound_policy.validate()?;
 
         Ok(config)
     }
@@ -603,6 +608,9 @@ pub struct ServerSettings {
     #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: usize,
 
+    #[serde(default)]
+    pub outbound: OutboundPolicySettings,
+
     #[serde(default = "default_shutdown_timeout_secs")]
     pub shutdown_timeout_secs: u64,
 }
@@ -802,6 +810,7 @@ impl TomlConfig {
                 max_connections: default_max_connections(),
                 max_tls_handshakes: default_max_tls_handshakes(),
                 max_connections_per_ip: default_max_connections_per_ip(),
+                outbound: OutboundPolicySettings::default(),
                 shutdown_timeout_secs: default_shutdown_timeout_secs(),
             },
             log: Some(LogSettings {
@@ -836,6 +845,7 @@ impl TomlConfig {
             max_connections: self.server.max_connections,
             max_tls_handshakes: self.server.max_tls_handshakes,
             max_connections_per_ip: self.server.max_connections_per_ip,
+            outbound_policy: self.server.outbound,
             shutdown_timeout_secs: self.server.shutdown_timeout_secs,
             cert: None,
             key: None,

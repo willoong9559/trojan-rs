@@ -151,14 +151,19 @@ impl Address {
     }
 
     pub async fn resolve_socket_addrs(&self) -> Result<Vec<SocketAddr>> {
+        crate::outbound::check_address(self)?;
         match self {
             Address::IPv4(ip, port) => {
                 let addr = IpAddr::V4(std::net::Ipv4Addr::from(*ip));
-                Ok(vec![SocketAddr::new(addr, *port)])
+                let addr = SocketAddr::new(addr, *port);
+                crate::outbound::check_socket(addr)?;
+                Ok(vec![addr])
             }
             Address::IPv6(ip, port) => {
                 let addr = IpAddr::V6(std::net::Ipv6Addr::from(*ip));
-                Ok(vec![SocketAddr::new(addr, *port)])
+                let addr = SocketAddr::new(addr, *port);
+                crate::outbound::check_socket(addr)?;
+                Ok(vec![addr])
             }
             Address::Domain(domain, port) => {
                 let cache_key = dns_cache_key(domain, *port);
@@ -177,7 +182,9 @@ impl Address {
                         DNS_RESOLVE_TIMEOUT_SECS
                     )
                 })??;
-                let addrs: Vec<SocketAddr> = addrs.collect();
+                let addrs: Vec<SocketAddr> = addrs
+                    .filter_map(|addr| crate::outbound::check_socket(addr).ok().map(|_| addr))
+                    .collect();
                 if addrs.is_empty() {
                     return Err(anyhow!("Failed to resolve domain: {}", domain));
                 }

@@ -44,6 +44,16 @@ max_connections_per_ip = 32
 # 收到 SIGTERM 或 Ctrl-C 后，等待已有连接结束的最长秒数。
 shutdown_timeout_secs = 30
 
+# 默认拒绝访问回环、私网、链路本地、组播及未指定地址。
+[server.outbound]
+block_private_addresses = true
+# allow_cidrs = ["10.0.0.0/8"] # 显式放行私网或启用 CIDR 白名单。
+# deny_cidrs = ["203.0.113.0/24"]
+# allow_domains = ["example.com"] # 匹配该域名及其子域名。
+# deny_domains = ["metadata.internal"]
+# allow_ports = [80, 443]
+# deny_ports = [25]
+
 # 所有 gRPC 入口共享这些限制。
 grpc_max_concurrent_streams = 128
 grpc_max_read_buffer_bytes = 262144

@@ -3,6 +3,7 @@ mod config;
 mod error;
 mod grpc;
 mod logger;
+mod outbound;
 mod reality;
 mod relay;
 mod shadowsocks;
@@ -1422,6 +1423,7 @@ async fn main() -> Result<()> {
     logger::init_logger(log_level);
 
     let config = config::ServerConfig::load()?;
+    outbound::initialize(config.outbound_policy.build()?)?;
 
     if config.check_config {
         let inbound_count = validate_config_for_startup(&config)?;
@@ -1651,6 +1653,7 @@ mod tests {
             max_connections: 10,
             max_tls_handshakes: 2,
             max_connections_per_ip: 3,
+            outbound_policy: outbound::OutboundPolicySettings::default(),
             shutdown_timeout_secs: 30,
             cert: None,
             key: None,
