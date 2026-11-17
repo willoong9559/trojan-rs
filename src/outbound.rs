@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 use crate::socks5::Address;
 
@@ -77,26 +77,47 @@ impl OutboundPolicySettings {
     }
 }
 
-static POLICY: OnceLock<OutboundPolicy> = OnceLock::new();
+static POLICY: OnceLock<RwLock<OutboundPolicy>> = OnceLock::new();
 pub fn initialize(policy: OutboundPolicy) -> Result<()> {
     POLICY
-        .set(policy)
+        .set(RwLock::new(policy))
         .map_err(|_| anyhow!("outbound policy was already initialized"))
 }
-#[cfg(not(test))]
-fn policy() -> &'static OutboundPolicy {
-    POLICY.get_or_init(|| {
-        OutboundPolicySettings::default()
-            .build()
-            .expect("default policy is valid")
-    })
+
+/// Replaces the process-wide outbound policy used by subsequently resolved
+/// destinations. Existing relays are not interrupted.
+pub fn replace(policy: OutboundPolicy) -> Result<()> {
+    let policy_lock = POLICY.get_or_init(|| {
+        RwLock::new(
+            OutboundPolicySettings::default()
+                .build()
+                .expect("default policy is valid"),
+        )
+    });
+    let mut current = policy_lock
+        .write()
+        .map_err(|_| anyhow!("outbound policy lock poisoned"))?;
+    *current = policy;
+    Ok(())
 }
+
 #[cfg(test)]
-fn policy() -> &'static OutboundPolicy {
+fn policy() -> &'static RwLock<OutboundPolicy> {
     POLICY.get_or_init(|| {
         let mut settings = OutboundPolicySettings::default();
         settings.block_private_addresses = false;
-        settings.build().expect("test policy is valid")
+        RwLock::new(settings.build().expect("test policy is valid"))
+    })
+}
+
+#[cfg(not(test))]
+fn policy() -> &'static RwLock<OutboundPolicy> {
+    POLICY.get_or_init(|| {
+        RwLock::new(
+            OutboundPolicySettings::default()
+                .build()
+                .expect("default policy is valid"),
+        )
     })
 }
 
@@ -164,10 +185,16 @@ impl OutboundPolicy {
 }
 
 pub fn check_address(address: &Address) -> Result<()> {
-    policy().check_address(address)
+    policy()
+        .read()
+        .map_err(|_| anyhow!("outbound policy lock poisoned"))?
+        .check_address(address)
 }
 pub fn check_socket(address: SocketAddr) -> Result<()> {
-    policy().check_socket(address)
+    policy()
+        .read()
+        .map_err(|_| anyhow!("outbound policy lock poisoned"))?
+        .check_socket(address)
 }
 fn normalize_domain(value: &str) -> Option<String> {
     let value = value.trim().trim_end_matches('.').to_ascii_lowercase();

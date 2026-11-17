@@ -246,9 +246,19 @@ impl ServerConfig {
             anyhow!("a TOML configuration file is required; use --config-file <FILE>")
         })?;
         println!("Loading configuration from: {config_path}");
-        let mut config = TomlConfig::from_file(&config_path)?.to_server_config();
-        config.config_file = Some(config_path);
+        let mut config = Self::load_from_file(&config_path)?;
         config.check_config = cli.check_config;
+
+        Ok(config)
+    }
+
+    /// Loads and validates a TOML configuration without parsing command-line
+    /// arguments. This is used for in-process configuration reloads.
+    pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        let path_string = path.to_string_lossy().into_owned();
+        let mut config = TomlConfig::from_file(path)?.to_server_config();
+        config.config_file = Some(path_string);
 
         if config.inbounds.is_empty()
             || config

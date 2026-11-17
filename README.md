@@ -143,6 +143,16 @@ level = "info"
 
 `protocol` 必须为 `trojan`、`vless`、`vmess` 或 `shadowsocks`；`transport` 可取：`tcp`、`websocket`、`grpc`。`ws_host`、`ws_path` 只用于 WebSocket；`grpc_service_name` 只用于 gRPC。`unix_path` 为 Unix Domain Socket 路径；它可以与 `listen` 同时配置，但不能用于 REALITY。
 
+## 热加载配置
+
+在 Unix 平台，向进程发送 `SIGHUP` 可热加载同一个配置文件：
+
+```bash
+systemctl kill --signal=HUP trojan-rs
+```
+
+也可在 systemd 单元的 `[Service]` 中加入 `ExecReload=/bin/kill -HUP $MAINPID`，之后使用 `systemctl reload trojan-rs`。新配置会先完整解析和验证；验证失败会保留当前运行配置。成功后旧入口停止接收新连接、由新入口接管，已建立的连接保持运行直至自行结束；共享连接限制会在不忽略已有连接计数的前提下更新。`[server.outbound]` 会同步替换并用于后续目标连接。`[log]` 的日志等级在进程启动时初始化，修改它需要重启。更改 `[server.acme]` 的内容需要重启进程，以避免重复运行证书续期任务；Windows 不支持 `SIGHUP`，需重启服务。
+
 Shadowsocks 可使用 `tcp`、`websocket`、`grpc` 传输，也可组合 TLS、ACME 或 REALITY；其加密流位于这些外层之内。入口必须配置 `shadowsocks_method`，可选值为 `none`、`aes-128-gcm`、`aes-256-gcm`、`chacha20-ietf-poly1305`。后三者使用标准 Shadowsocks AEAD TCP 格式；`none` 不提供加密或有效认证，不建议用于公网。普通裸 `ss://` 客户端只能连接原生 TCP Shadowsocks；使用外层传输时，客户端必须配置相同的封装。
 
 VLESS 支持 TCP 与标准 UDP。VLESS UDP 使用请求头中的单一目标地址和 `u16` 长度分包。

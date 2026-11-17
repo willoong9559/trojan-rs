@@ -23,12 +23,13 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 
 const BUF_SIZE: usize = 32 * 1024;
@@ -196,16 +197,26 @@ pub struct Server {
 
 #[derive(Clone)]
 struct ConnectionLimits {
-    active_connections: Arc<Semaphore>,
-    max_connections: usize,
-    tls_handshakes: Arc<Semaphore>,
-    per_ip_limit: usize,
+    active_connections: Arc<AtomicUsize>,
+    tls_handshakes: Arc<AtomicUsize>,
+    settings: Arc<RwLock<ConnectionLimitSettings>>,
     per_ip_connections: Arc<Mutex<HashMap<IpAddr, usize>>>,
 }
 
+#[derive(Clone, Copy)]
+struct ConnectionLimitSettings {
+    max_connections: usize,
+    max_tls_handshakes: usize,
+    per_ip_limit: usize,
+}
+
 struct ConnectionPermit {
-    _total: OwnedSemaphorePermit,
+    active_connections: Arc<AtomicUsize>,
     _ip: Option<IpConnectionPermit>,
+}
+
+struct TlsHandshakePermit {
+    active_handshakes: Arc<AtomicUsize>,
 }
 
 struct IpConnectionPermit {
@@ -222,23 +233,44 @@ enum ConnectionLimitError {
 impl ConnectionLimits {
     fn new(max_connections: usize, max_tls_handshakes: usize, per_ip_limit: usize) -> Self {
         Self {
-            active_connections: Arc::new(Semaphore::new(max_connections)),
-            max_connections,
-            tls_handshakes: Arc::new(Semaphore::new(max_tls_handshakes)),
-            per_ip_limit,
+            active_connections: Arc::new(AtomicUsize::new(0)),
+            tls_handshakes: Arc::new(AtomicUsize::new(0)),
+            settings: Arc::new(RwLock::new(ConnectionLimitSettings {
+                max_connections,
+                max_tls_handshakes,
+                per_ip_limit,
+            })),
             per_ip_connections: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn update(&self, max_connections: usize, max_tls_handshakes: usize, per_ip_limit: usize) {
+        let mut settings = self
+            .settings
+            .write()
+            .expect("connection limit settings lock poisoned");
+        *settings = ConnectionLimitSettings {
+            max_connections,
+            max_tls_handshakes,
+            per_ip_limit,
+        };
+    }
+
+    fn settings(&self) -> ConnectionLimitSettings {
+        *self
+            .settings
+            .read()
+            .expect("connection limit settings lock poisoned")
     }
 
     fn try_acquire_connection(
         &self,
         peer_ip: Option<IpAddr>,
     ) -> std::result::Result<ConnectionPermit, ConnectionLimitError> {
-        let total = self
-            .active_connections
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| ConnectionLimitError::Total)?;
+        let settings = self.settings();
+        if !try_acquire_counter(&self.active_connections, settings.max_connections) {
+            return Err(ConnectionLimitError::Total);
+        }
 
         let ip = match peer_ip {
             Some(ip) => {
@@ -247,7 +279,8 @@ impl ConnectionLimits {
                     .lock()
                     .expect("per-IP connection counter lock poisoned");
                 let count = connections.entry(ip).or_default();
-                if *count >= self.per_ip_limit {
+                if *count >= settings.per_ip_limit {
+                    self.active_connections.fetch_sub(1, Ordering::Release);
                     return Err(ConnectionLimitError::PerIp(ip));
                 }
                 *count += 1;
@@ -260,18 +293,52 @@ impl ConnectionLimits {
         };
 
         Ok(ConnectionPermit {
-            _total: total,
+            active_connections: Arc::clone(&self.active_connections),
             _ip: ip,
         })
     }
 
-    fn try_acquire_tls_handshake(&self) -> Option<OwnedSemaphorePermit> {
-        self.tls_handshakes.clone().try_acquire_owned().ok()
+    fn try_acquire_tls_handshake(&self) -> Option<TlsHandshakePermit> {
+        let settings = self.settings();
+        try_acquire_counter(&self.tls_handshakes, settings.max_tls_handshakes).then(|| {
+            TlsHandshakePermit {
+                active_handshakes: Arc::clone(&self.tls_handshakes),
+            }
+        })
     }
 
     fn active_connection_count(&self) -> usize {
-        self.max_connections
-            .saturating_sub(self.active_connections.available_permits())
+        self.active_connections.load(Ordering::Acquire)
+    }
+}
+
+fn try_acquire_counter(counter: &AtomicUsize, limit: usize) -> bool {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        if current >= limit {
+            return false;
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(value) => current = value,
+        }
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.active_connections.fetch_sub(1, Ordering::Release);
+    }
+}
+
+impl Drop for TlsHandshakePermit {
+    fn drop(&mut self) {
+        self.active_handshakes.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -1331,20 +1398,38 @@ async fn build_server_with_acme(
 /// Build one runtime server per configured inbound. Connection limits are
 /// shared so adding listeners cannot bypass the process-wide safety limits.
 pub async fn build_servers(config: config::ServerConfig) -> Result<Vec<Server>> {
+    Ok(build_servers_with_runtime(config, None, None).await?.0)
+}
+
+/// Builds a server generation, optionally reusing the ACME manager from the
+/// preceding generation. Reuse keeps a successful ACME resolver alive across
+/// listener reloads instead of starting duplicate renewal tasks.
+async fn build_servers_with_runtime(
+    config: config::ServerConfig,
+    existing_acme_manager: Option<acme::AcmeManager>,
+    existing_connection_limits: Option<ConnectionLimits>,
+) -> Result<(Vec<Server>, Option<acme::AcmeManager>, ConnectionLimits)> {
     let inbound_configs = config.expand_inbounds()?;
     let shared_acme_manager = if inbound_configs.iter().any(|inbound| inbound.use_acme) {
-        let settings = config
-            .acme_settings()?
-            .ok_or_else(|| anyhow!("ACME inbound requires [server.acme]"))?;
-        Some(acme::AcmeManager::new(&settings)?)
+        match existing_acme_manager {
+            Some(manager) => Some(manager),
+            None => {
+                let settings = config
+                    .acme_settings()?
+                    .ok_or_else(|| anyhow!("ACME inbound requires [server.acme]"))?;
+                Some(acme::AcmeManager::new(&settings)?)
+            }
+        }
     } else {
-        None
+        existing_acme_manager
     };
-    let shared_limits = ConnectionLimits::new(
-        config.max_connections,
-        config.max_tls_handshakes,
-        config.max_connections_per_ip,
-    );
+    let shared_limits = existing_connection_limits.unwrap_or_else(|| {
+        ConnectionLimits::new(
+            config.max_connections,
+            config.max_tls_handshakes,
+            config.max_connections_per_ip,
+        )
+    });
     let mut servers = Vec::with_capacity(inbound_configs.len());
     for inbound_config in inbound_configs {
         let acme_manager = inbound_config
@@ -1355,7 +1440,7 @@ pub async fn build_servers(config: config::ServerConfig) -> Result<Vec<Server>> 
         server.connection_limits = shared_limits.clone();
         servers.push(server);
     }
-    Ok(servers)
+    Ok((servers, shared_acme_manager, shared_limits))
 }
 
 fn transport_mode_for_config(config: &config::ServerConfig) -> TransportMode {
@@ -1387,40 +1472,95 @@ fn validate_config_for_startup(config: &config::ServerConfig) -> Result<usize> {
     Ok(inbounds.len())
 }
 
-async fn wait_for_shutdown_signal() -> Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessSignal {
+    Shutdown,
+    Reload,
+}
+
+async fn wait_for_process_signal() -> Result<ProcessSignal> {
     #[cfg(unix)]
     {
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
         tokio::select! {
-            result = tokio::signal::ctrl_c() => result?,
-            _ = terminate.recv() => {}
+            result = tokio::signal::ctrl_c() => {
+                result?;
+                Ok(ProcessSignal::Shutdown)
+            }
+            _ = terminate.recv() => Ok(ProcessSignal::Shutdown),
+            _ = hangup.recv() => Ok(ProcessSignal::Reload),
         }
     }
     #[cfg(not(unix))]
     {
         tokio::signal::ctrl_c().await?;
+        Ok(ProcessSignal::Shutdown)
     }
-    Ok(())
 }
 
-async fn run_servers(servers: Vec<Server>, shutdown_timeout: Duration) -> Result<()> {
-    let limits = servers
-        .first()
-        .map(|server| server.connection_limits.clone());
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let server_tasks = futures::future::try_join_all(
-        servers
-            .into_iter()
-            .map(|server| server.run_with_shutdown(shutdown_rx.clone())),
-    );
-    tokio::pin!(server_tasks);
+async fn run_servers(mut config: config::ServerConfig) -> Result<()> {
+    let config_path = config
+        .config_file
+        .clone()
+        .ok_or_else(|| anyhow!("configuration reload requires a configuration file"))?;
+    let mut acme_settings = None;
+    let (mut servers, mut acme_manager, connection_limits) =
+        build_servers_with_runtime(config.clone(), None, None).await?;
+    if acme_manager.is_some() {
+        acme_settings = config.acme_settings()?;
+    }
 
-    tokio::select! {
-        result = &mut server_tasks => result.map(|_| ()),
-        signal = wait_for_shutdown_signal() => {
-            signal?;
-            log::info!(timeout_secs = shutdown_timeout.as_secs(), "Shutdown signal received; waiting for active connections");
+    loop {
+        let limits = servers
+            .first()
+            .map(|server| server.connection_limits.clone());
+        let shutdown_timeout = Duration::from_secs(config.shutdown_timeout_secs);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server_tasks = futures::future::try_join_all(
+            servers
+                .into_iter()
+                .map(|server| server.run_with_shutdown(shutdown_rx.clone())),
+        );
+        tokio::pin!(server_tasks);
+
+        let reload_config = loop {
+            let signal = tokio::select! {
+                result = &mut server_tasks => return result.map(|_| ()),
+                signal = wait_for_process_signal() => signal?,
+            };
+
+            match signal {
+                ProcessSignal::Shutdown => break None,
+                ProcessSignal::Reload => match config::ServerConfig::load_from_file(&config_path)
+                    .and_then(|candidate| {
+                        validate_config_for_startup(&candidate)?;
+                        candidate.outbound_policy.build()?;
+                        Ok(candidate)
+                    }) {
+                    Ok(candidate) => {
+                        if acme_manager.is_some() {
+                            let candidate_acme = candidate.acme_settings()?;
+                            if candidate_acme.as_ref() != acme_settings.as_ref() {
+                                log::error!("Configuration reload rejected: changing [server.acme] requires a process restart");
+                                continue;
+                            }
+                        }
+                        break Some(candidate);
+                    }
+                    Err(error) => {
+                        log::error!(error = %error, "Configuration reload rejected; keeping the current configuration");
+                    }
+                },
+            }
+        };
+
+        let Some(candidate) = reload_config else {
+            log::info!(
+                timeout_secs = shutdown_timeout.as_secs(),
+                "Shutdown signal received; waiting for active connections"
+            );
             let _ = shutdown_tx.send(true);
             server_tasks.await?;
             if let Some(limits) = limits {
@@ -1432,13 +1572,56 @@ async fn run_servers(servers: Vec<Server>, shutdown_timeout: Duration) -> Result
                         break;
                     }
                     if tokio::time::Instant::now() >= deadline {
-                        log::warn!(active_connections = active, "Shutdown timeout reached; closing remaining connections");
+                        log::warn!(
+                            active_connections = active,
+                            "Shutdown timeout reached; closing remaining connections"
+                        );
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
-            Ok(())
+            return Ok(());
+        };
+
+        log::info!("Configuration reload accepted; replacing inbound listeners");
+        let _ = shutdown_tx.send(true);
+        server_tasks.await?;
+
+        let candidate_policy = candidate.outbound_policy.build()?;
+        match build_servers_with_runtime(
+            candidate.clone(),
+            acme_manager.clone(),
+            Some(connection_limits.clone()),
+        )
+        .await
+        {
+            Ok((new_servers, new_acme_manager, _)) => {
+                outbound::replace(candidate_policy)?;
+                connection_limits.update(
+                    candidate.max_connections,
+                    candidate.max_tls_handshakes,
+                    candidate.max_connections_per_ip,
+                );
+                if new_acme_manager.is_some() && acme_settings.is_none() {
+                    acme_settings = candidate.acme_settings()?;
+                }
+                acme_manager = new_acme_manager;
+                config = candidate;
+                servers = new_servers;
+                log::info!("Configuration reload completed");
+            }
+            Err(error) => {
+                log::error!(error = %error, "Configuration reload failed after listeners stopped; restoring the previous configuration");
+                let (restored_servers, restored_manager, _) = build_servers_with_runtime(
+                    config.clone(),
+                    acme_manager.clone(),
+                    Some(connection_limits.clone()),
+                )
+                .await?;
+                servers = restored_servers;
+                acme_manager = restored_manager;
+            }
         }
     }
 }
@@ -1461,9 +1644,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let shutdown_timeout = Duration::from_secs(config.shutdown_timeout_secs);
-    let servers = build_servers(config).await?;
-    run_servers(servers, shutdown_timeout).await
+    run_servers(config).await
 }
 
 #[cfg(test)]
@@ -1510,6 +1691,32 @@ mod tests {
         assert!(limits.try_acquire_tls_handshake().is_none());
         drop(handshake);
         assert!(limits.try_acquire_tls_handshake().is_some());
+    }
+
+    #[test]
+    fn reloaded_connection_limits_keep_active_connections_accounted_for() {
+        let limits = ConnectionLimits::new(2, 2, 2);
+        let first = limits
+            .try_acquire_connection(None)
+            .expect("first connection should be accepted");
+        let second = limits
+            .try_acquire_connection(None)
+            .expect("second connection should be accepted");
+
+        limits.update(1, 1, 1);
+        assert!(matches!(
+            limits.try_acquire_connection(None),
+            Err(ConnectionLimitError::Total)
+        ));
+
+        drop(first);
+        assert!(matches!(
+            limits.try_acquire_connection(None),
+            Err(ConnectionLimitError::Total)
+        ));
+
+        drop(second);
+        assert!(limits.try_acquire_connection(None).is_ok());
     }
 
     #[test]
