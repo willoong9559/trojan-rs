@@ -33,7 +33,7 @@ cargo build --release
 
 ## 配置
 
-`[server]` 定义共享的资源限制、gRPC 限制和可选的内置 ACME 设置。每个 `[[inbounds]]` 必须设置自己的 `protocol` 和 `password`。`trojan` 与 `shadowsocks` 的 `password` 是普通密码；`vless` 和 `vmess` 的 `password` 必须是 UUID。`listen` 是 Socket 地址数组，因此 `0.0.0.0:PORT` 与 `[::]:PORT` 可以同时监听同一端口的 IPv4 和 IPv6。
+`[server]` 定义共享的资源限制；`[server.grpc]` 定义 gRPC 共享限制，`[server.acme]` 为可选的内置 ACME 设置。每个 `[[inbounds]]` 必须设置自己的 `protocol` 和 `password`。`trojan` 与 `shadowsocks` 的 `password` 是普通密码；`vless` 和 `vmess` 的 `password` 必须是 UUID。`listen` 是 Socket 地址数组，因此 `0.0.0.0:PORT` 与 `[::]:PORT` 可以同时监听同一端口的 IPv4 和 IPv6。
 
 ```toml
 [server]
@@ -55,13 +55,18 @@ block_private_addresses = true
 # deny_ports = [25]
 
 # 所有 gRPC 入口共享这些限制。
-grpc_max_concurrent_streams = 128
-grpc_max_read_buffer_bytes = 262144
-grpc_max_message_bytes = 16384
-grpc_max_send_queue_bytes = 131072
+[server.grpc]
+max_concurrent_streams = 128
+max_read_buffer_bytes = 262144
+max_message_bytes = 16384
+max_send_queue_bytes = 131072
 
 # 内置 ACME：只由 acme = true 的入口使用。
-acme = { domain = "tunnel.example.com", email = "admin@example.com", cache_dir = "/var/lib/trojan-rs/acme", staging = false }
+[server.acme]
+domain = "tunnel.example.com"
+email = "admin@example.com"
+cache_dir = "/var/lib/trojan-rs/acme"
+staging = false
 
 # 1. 原生 Trojan TCP over 内置 ACME TLS
 [[inbounds]]
@@ -146,7 +151,7 @@ VMess 默认支持 Xray 的 AEAD（`alterId = 0`）认证方式；为兼容旧�
 
 Xray 客户端默认会为部分 UDP 目标启用 XUDP/Mux；使用本实现的 VMess UDP 时，需将客户端环境变量设为 `XRAY_CONE_DISABLED=true`，使其发送标准 VMess UDP 命令。
 
-入口只能在 `tls`、`acme = true`、`reality` 三种 TLS 方式中选择一种。`acme = true` 必须配合 `[server]` 中的 `acme`；所有选用 ACME 的入口共享同一账户和证书。ACME 只能用于 TCP 监听，不能用于 `unix_path`。
+入口只能在 `tls`、`acme = true`、`reality` 三种 TLS 方式中选择一种。`acme = true` 必须配合 `[server.acme]`；所有选用 ACME 的入口共享同一账户和证书。ACME 只能用于 TCP 监听，不能用于 `unix_path`。
 
 ## REALITY 密钥
 

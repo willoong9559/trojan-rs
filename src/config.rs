@@ -587,17 +587,8 @@ pub struct ServerSettings {
     #[serde(default)]
     pub acme: Option<AcmeSettings>,
 
-    #[serde(default = "default_grpc_max_concurrent_streams")]
-    pub grpc_max_concurrent_streams: u32,
-
-    #[serde(default = "default_grpc_max_read_buffer_bytes")]
-    pub grpc_max_read_buffer_bytes: usize,
-
-    #[serde(default = "default_grpc_max_message_bytes")]
-    pub grpc_max_message_bytes: usize,
-
-    #[serde(default = "default_grpc_max_send_queue_bytes")]
-    pub grpc_max_send_queue_bytes: usize,
+    #[serde(default)]
+    pub grpc: GrpcSettings,
 
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
@@ -613,6 +604,34 @@ pub struct ServerSettings {
 
     #[serde(default = "default_shutdown_timeout_secs")]
     pub shutdown_timeout_secs: u64,
+}
+
+/// Resource limits shared by every gRPC inbound.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrpcSettings {
+    #[serde(default = "default_grpc_max_concurrent_streams")]
+    pub max_concurrent_streams: u32,
+
+    #[serde(default = "default_grpc_max_read_buffer_bytes")]
+    pub max_read_buffer_bytes: usize,
+
+    #[serde(default = "default_grpc_max_message_bytes")]
+    pub max_message_bytes: usize,
+
+    #[serde(default = "default_grpc_max_send_queue_bytes")]
+    pub max_send_queue_bytes: usize,
+}
+
+impl Default for GrpcSettings {
+    fn default() -> Self {
+        Self {
+            max_concurrent_streams: default_grpc_max_concurrent_streams(),
+            max_read_buffer_bytes: default_grpc_max_read_buffer_bytes(),
+            max_message_bytes: default_grpc_max_message_bytes(),
+            max_send_queue_bytes: default_grpc_max_send_queue_bytes(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -803,10 +822,7 @@ impl TomlConfig {
         let example = TomlConfig {
             server: ServerSettings {
                 acme: None,
-                grpc_max_concurrent_streams: default_grpc_max_concurrent_streams(),
-                grpc_max_read_buffer_bytes: default_grpc_max_read_buffer_bytes(),
-                grpc_max_message_bytes: default_grpc_max_message_bytes(),
-                grpc_max_send_queue_bytes: default_grpc_max_send_queue_bytes(),
+                grpc: GrpcSettings::default(),
                 max_connections: default_max_connections(),
                 max_tls_handshakes: default_max_tls_handshakes(),
                 max_connections_per_ip: default_max_connections_per_ip(),
@@ -838,10 +854,10 @@ impl TomlConfig {
             grpc_service_name: None,
             vmess_alter_id: 0,
             shadowsocks_method: None,
-            grpc_max_concurrent_streams: self.server.grpc_max_concurrent_streams,
-            grpc_max_read_buffer_bytes: self.server.grpc_max_read_buffer_bytes,
-            grpc_max_message_bytes: self.server.grpc_max_message_bytes,
-            grpc_max_send_queue_bytes: self.server.grpc_max_send_queue_bytes,
+            grpc_max_concurrent_streams: self.server.grpc.max_concurrent_streams,
+            grpc_max_read_buffer_bytes: self.server.grpc.max_read_buffer_bytes,
+            grpc_max_message_bytes: self.server.grpc.max_message_bytes,
+            grpc_max_send_queue_bytes: self.server.grpc.max_send_queue_bytes,
             max_connections: self.server.max_connections,
             max_tls_handshakes: self.server.max_tls_handshakes,
             max_connections_per_ip: self.server.max_connections_per_ip,
@@ -1065,10 +1081,14 @@ mod tests {
 
     #[test]
     fn acme_is_shared_in_server_settings_and_selected_per_inbound() {
-        let config: super::TomlConfig = toml::from_str(
+        let config = toml::from_str::<super::TomlConfig>(
             r#"
                 [server]
-                acme = { domain = "tunnel.example.com", email = "admin@example.com", staging = true }
+
+                [server.acme]
+                domain = "tunnel.example.com"
+                email = "admin@example.com"
+                staging = true
 
                 [[inbounds]]
                 listen = ["0.0.0.0:443"]
@@ -1114,7 +1134,11 @@ mod tests {
         let conflicting_settings: super::TomlConfig = toml::from_str(
             r#"
                 [server]
-                acme = { domain = "tunnel.example.com", email = "admin@example.com" }
+
+                [server.acme]
+                domain = "tunnel.example.com"
+                email = "admin@example.com"
+
                 [[inbounds]]
                 listen = ["127.0.0.1:443"]
                 protocol = "trojan"
@@ -1147,6 +1171,47 @@ mod tests {
         config.grpc_max_read_buffer_bytes = 1024;
 
         assert!(config.grpc_limits().is_err());
+    }
+
+    #[test]
+    fn grpc_settings_use_a_nested_table_and_reject_legacy_flat_fields() {
+        let config = toml::from_str::<super::TomlConfig>(
+            r#"
+                [server]
+
+                [server.grpc]
+                max_concurrent_streams = 7
+                max_read_buffer_bytes = 65536
+                max_message_bytes = 8192
+                max_send_queue_bytes = 16384
+
+                [[inbounds]]
+                listen = ["127.0.0.1:0"]
+                protocol = "trojan"
+                password = "test-password"
+            "#,
+        )
+        .unwrap()
+        .to_server_config();
+
+        let limits = config.grpc_limits().unwrap();
+        assert_eq!(limits.max_concurrent_streams, 7);
+        assert_eq!(limits.max_read_buffer_bytes, 65536);
+        assert_eq!(limits.max_message_bytes, 8192);
+        assert_eq!(limits.max_send_queue_bytes, 16384);
+
+        let legacy = toml::from_str::<super::TomlConfig>(
+            r#"
+                [server]
+                grpc_max_concurrent_streams = 7
+
+                [[inbounds]]
+                listen = ["127.0.0.1:0"]
+                protocol = "trojan"
+                password = "test-password"
+            "#,
+        );
+        assert!(legacy.is_err());
     }
 
     #[test]
