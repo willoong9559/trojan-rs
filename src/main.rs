@@ -157,6 +157,23 @@ pub enum TransportMode {
     Grpc,
 }
 
+fn protocol_label(protocol: config::InboundProtocol) -> &'static str {
+    match protocol {
+        config::InboundProtocol::Trojan => "trojan",
+        config::InboundProtocol::Vless => "vless",
+        config::InboundProtocol::Vmess => "vmess",
+        config::InboundProtocol::Shadowsocks => "shadowsocks",
+    }
+}
+
+fn transport_label(mode: TransportMode) -> &'static str {
+    match mode {
+        TransportMode::Tcp => "tcp",
+        TransportMode::WebSocket => "websocket",
+        TransportMode::Grpc => "grpc",
+    }
+}
+
 pub struct Server {
     pub listener: Option<Listener>,
     pub password: [u8; 56],
@@ -803,12 +820,12 @@ async fn handle_connect<S: AsyncRead + AsyncWrite + Unpin>(
     initial_payload: Bytes,
     peer_addr: String,
 ) -> Result<()> {
-    log::info!(peer = %peer_addr, target = %target_addr.to_key(), "Connecting to target");
+    log::info!(peer = %peer_addr, "Connecting to target");
 
     let remote_addrs = target_addr.resolve_socket_addrs().await?;
-    let (mut remote_stream, remote_addr) =
+    let (mut remote_stream, _remote_addr) =
         connect_first_available(&peer_addr, &remote_addrs).await?;
-    log::info!(peer = %peer_addr, remote = %remote_addr, "Connected to remote server");
+    log::info!(peer = %peer_addr, "Connected to remote server");
 
     if !initial_payload.is_empty() {
         remote_stream.write_all(&initial_payload).await?;
@@ -983,9 +1000,21 @@ impl Server {
         let tls_enabled = server.tls_acceptor.is_some()
             || server.acme_tls.is_some()
             || server.reality_acceptor.is_some();
+        let inbound = server.inbound_tag.as_deref().unwrap_or("legacy").to_owned();
+        let protocol = protocol_label(server.protocol);
+        let transport = transport_label(server.transport_mode);
+        let security = if server.reality_acceptor.is_some() {
+            "reality"
+        } else if server.acme_tls.is_some() {
+            "acme"
+        } else if server.tls_acceptor.is_some() {
+            "tls"
+        } else {
+            "none"
+        };
 
         log::info!(
-            inbound = server.inbound_tag.as_deref().unwrap_or("legacy"),
+            inbound, protocol, transport, security,
             address = %addr,
             mode = mode,
             tls = tls_enabled,
@@ -1020,8 +1049,9 @@ impl Server {
                         }
                     };
 
-                    log::connection(&peer_addr, "new");
+                    log::info!(peer = %peer_addr, inbound, protocol, transport, security, event = "new", "Connection");
                     let server_clone = Arc::clone(&server);
+                    let inbound_for_log = inbound.clone();
 
                     tokio::spawn(async move {
                         let _connection_permit = connection_permit;
@@ -1139,9 +1169,9 @@ impl Server {
                         };
 
                         if let Err(e) = result {
-                            log::error!(peer = %peer_addr, error = %e, "Connection error");
+                            log::error!(peer = %peer_addr, inbound = %inbound_for_log, protocol, transport, security, reason = %e, "Connection closed with error");
                         } else {
-                            log::connection(&peer_addr, "closed");
+                            log::info!(peer = %peer_addr, inbound = %inbound_for_log, protocol, transport, security, event = "closed", reason = "completed", "Connection");
                         }
                     });
                 }

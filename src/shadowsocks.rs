@@ -294,10 +294,10 @@ where
 }
 
 async fn connect_target(address: &Address, peer_addr: &str) -> Result<TcpStream> {
-    log::info!(peer = %peer_addr, target = %address.to_key(), "Shadowsocks connecting to target");
+    log::info!(peer = %peer_addr, "Shadowsocks connecting to target");
     let remote_addrs = address.resolve_socket_addrs().await?;
-    let (stream, remote_addr) = connect_first_available(peer_addr, &remote_addrs).await?;
-    log::info!(peer = %peer_addr, remote = %remote_addr, "Shadowsocks connected to remote server");
+    let (stream, _remote_addr) = connect_first_available(peer_addr, &remote_addrs).await?;
+    log::info!(peer = %peer_addr, "Shadowsocks connected to remote server");
     Ok(stream)
 }
 

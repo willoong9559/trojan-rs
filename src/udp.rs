@@ -463,7 +463,7 @@ pub async fn handle_vless_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send
         SocketAddr::V6(_) => UdpSocket::bind("[::]:0").await?,
     };
     socket.connect(remote).await?;
-    log::info!(peer = %peer_addr, target = %target.to_key(), "Starting VLESS UDP associate");
+    log::info!(peer = %peer_addr, "Starting VLESS UDP associate");
 
     let (mut client_read, mut client_write) = tokio::io::split(client_stream);
     let mut incoming = BytesMut::with_capacity(BUF_SIZE);
@@ -525,7 +525,7 @@ pub async fn handle_vmess_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send
         SocketAddr::V6(_) => UdpSocket::bind("[::]:0").await?,
     };
     socket.connect(remote).await?;
-    log::info!(peer = %peer_addr, target = %target.to_key(), "Starting VMess UDP associate");
+    log::info!(peer = %peer_addr, "Starting VMess UDP associate");
 
     let mut udp_read_buf = vec![0_u8; VLESS_UDP_MAX_PACKET_SIZE];
     let mut last_activity = Instant::now();

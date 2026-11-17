@@ -95,11 +95,6 @@ pub fn init_logger(log_level: Option<LogLevel>) {
 pub mod log {
     pub use tracing::{debug, error, info, warn};
 
-    /// 记录连接事件
-    pub fn connection(addr: &str, event: &str) {
-        info!(peer = addr, event = event, "Connection");
-    }
-
     /// 记录认证事件
     pub fn authentication(addr: &str, success: bool) {
         if success {
