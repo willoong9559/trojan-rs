@@ -15,12 +15,19 @@ cargo build --release
 ./target/release/trojan-rs --generate-config server.toml
 ```
 
+部署前可校验配置、证书与 REALITY 密钥；此模式不会监听端口或请求 ACME 证书：
+
+```bash
+./target/release/trojan-rs --config-file server.toml --check-config
+```
+
 常用命令行参数仅用于选择配置、日志与生成 REALITY 密钥：
 
 ```text
 -c, --config-file <FILE>
 --generate-config <FILE>
 --generate-reality-keypair
+--check-config
 --log-level <trace|debug|info|warn|error>
 ```
 
@@ -34,6 +41,8 @@ cargo build --release
 max_connections = 1024
 max_tls_handshakes = 64
 max_connections_per_ip = 32
+# 收到 SIGTERM 或 Ctrl-C 后，等待已有连接结束的最长秒数。
+shutdown_timeout_secs = 30
 
 # 所有 gRPC 入口共享这些限制。
 grpc_max_concurrent_streams = 128

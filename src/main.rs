@@ -27,7 +27,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 
 const BUF_SIZE: usize = 32 * 1024;
@@ -157,7 +157,7 @@ pub enum TransportMode {
 }
 
 pub struct Server {
-    pub listener: Listener,
+    pub listener: Option<Listener>,
     pub password: [u8; 56],
     pub protocol: config::InboundProtocol,
     pub vless_user_id: Option<[u8; 16]>,
@@ -179,6 +179,7 @@ pub struct Server {
 #[derive(Clone)]
 struct ConnectionLimits {
     active_connections: Arc<Semaphore>,
+    max_connections: usize,
     tls_handshakes: Arc<Semaphore>,
     per_ip_limit: usize,
     per_ip_connections: Arc<Mutex<HashMap<IpAddr, usize>>>,
@@ -204,6 +205,7 @@ impl ConnectionLimits {
     fn new(max_connections: usize, max_tls_handshakes: usize, per_ip_limit: usize) -> Self {
         Self {
             active_connections: Arc::new(Semaphore::new(max_connections)),
+            max_connections,
             tls_handshakes: Arc::new(Semaphore::new(max_tls_handshakes)),
             per_ip_limit,
             per_ip_connections: Arc::new(Mutex::new(HashMap::new())),
@@ -247,6 +249,11 @@ impl ConnectionLimits {
 
     fn try_acquire_tls_handshake(&self) -> Option<OwnedSemaphorePermit> {
         self.tls_handshakes.clone().try_acquire_owned().ok()
+    }
+
+    fn active_connection_count(&self) -> usize {
+        self.max_connections
+            .saturating_sub(self.active_connections.available_permits())
     }
 }
 
@@ -956,8 +963,17 @@ where
 
 impl Server {
     pub async fn run(self) -> Result<()> {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        self.run_with_shutdown(shutdown_rx).await
+    }
+
+    async fn run_with_shutdown(mut self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+        let listener = self
+            .listener
+            .take()
+            .expect("server listener is present before run");
+        let addr = listener.local_addr_string()?;
         let server = Arc::new(self);
-        let addr = server.listener.local_addr_string()?;
         let mode = match server.transport_mode {
             TransportMode::Tcp => "TCP",
             TransportMode::WebSocket => "WebSocket",
@@ -976,7 +992,17 @@ impl Server {
         );
 
         loop {
-            match server.listener.accept().await {
+            let accepted = tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_ok() && *shutdown.borrow() {
+                        log::info!(inbound = server.inbound_tag.as_deref().unwrap_or("legacy"), "Server stopped accepting new connections");
+                        break;
+                    }
+                    continue;
+                }
+                accepted = listener.accept() => accepted,
+            };
+            match accepted {
                 Ok((stream, peer_addr, peer_ip)) => {
                     let connection_permit = match server
                         .connection_limits
@@ -1125,6 +1151,8 @@ impl Server {
             }
         }
 
+        // `listener` is local rather than retained by connection tasks, so it
+        // is dropped immediately after shutdown and the port is released.
         Ok(())
     }
 }
@@ -1249,7 +1277,7 @@ async fn build_server_with_acme(
     let reality_acceptor = reality.map(reality::RealityAcceptor::new).transpose()?;
 
     Ok(Server {
-        listener,
+        listener: Some(listener),
         password,
         protocol,
         vless_user_id,
@@ -1299,9 +1327,89 @@ pub async fn build_servers(config: config::ServerConfig) -> Result<Vec<Server>> 
     Ok(servers)
 }
 
-async fn run_servers(servers: Vec<Server>) -> Result<()> {
-    futures::future::try_join_all(servers.into_iter().map(Server::run)).await?;
+fn transport_mode_for_config(config: &config::ServerConfig) -> TransportMode {
+    if config.enable_grpc {
+        TransportMode::Grpc
+    } else if config.enable_ws {
+        TransportMode::WebSocket
+    } else {
+        TransportMode::Tcp
+    }
+}
+
+/// Validate every runtime inbound without binding sockets or initializing ACME.
+fn validate_config_for_startup(config: &config::ServerConfig) -> Result<usize> {
+    config.validate_connection_limits()?;
+    let inbounds = config.expand_inbounds()?;
+    for inbound in &inbounds {
+        if let Some(reality) = inbound.reality_settings()? {
+            reality::RealityAcceptor::new(reality)?;
+        } else if !inbound.use_acme {
+            tls::get_tls_acceptor(
+                inbound.cert.clone(),
+                inbound.key.clone(),
+                inbound.cert_chain.clone(),
+                transport_mode_for_config(inbound),
+            )?;
+        }
+    }
+    Ok(inbounds.len())
+}
+
+async fn wait_for_shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+    }
     Ok(())
+}
+
+async fn run_servers(servers: Vec<Server>, shutdown_timeout: Duration) -> Result<()> {
+    let limits = servers
+        .first()
+        .map(|server| server.connection_limits.clone());
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server_tasks = futures::future::try_join_all(
+        servers
+            .into_iter()
+            .map(|server| server.run_with_shutdown(shutdown_rx.clone())),
+    );
+    tokio::pin!(server_tasks);
+
+    tokio::select! {
+        result = &mut server_tasks => result.map(|_| ()),
+        signal = wait_for_shutdown_signal() => {
+            signal?;
+            log::info!(timeout_secs = shutdown_timeout.as_secs(), "Shutdown signal received; waiting for active connections");
+            let _ = shutdown_tx.send(true);
+            server_tasks.await?;
+            if let Some(limits) = limits {
+                let deadline = tokio::time::Instant::now() + shutdown_timeout;
+                loop {
+                    let active = limits.active_connection_count();
+                    if active == 0 {
+                        log::info!("All active connections closed");
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        log::warn!(active_connections = active, "Shutdown timeout reached; closing remaining connections");
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 #[tokio::main]
@@ -1315,8 +1423,15 @@ async fn main() -> Result<()> {
 
     let config = config::ServerConfig::load()?;
 
+    if config.check_config {
+        let inbound_count = validate_config_for_startup(&config)?;
+        log::info!(inbounds = inbound_count, "Configuration is valid");
+        return Ok(());
+    }
+
+    let shutdown_timeout = Duration::from_secs(config.shutdown_timeout_secs);
     let servers = build_servers(config).await?;
-    run_servers(servers).await
+    run_servers(servers, shutdown_timeout).await
 }
 
 #[cfg(test)]
@@ -1441,8 +1556,8 @@ mod tests {
 
         let servers = build_servers(config).await.unwrap();
         assert_eq!(servers.len(), 2);
-        assert!(matches!(servers[0].listener, Listener::Tcp(_)));
-        assert!(matches!(servers[1].listener, Listener::Tcp(_)));
+        assert!(matches!(servers[0].listener, Some(Listener::Tcp(_))));
+        assert!(matches!(servers[1].listener, Some(Listener::Tcp(_))));
         assert_eq!(servers[0].inbound_tag.as_deref(), Some("first"));
         assert_eq!(servers[1].inbound_tag.as_deref(), Some("second"));
         assert!(matches!(servers[1].transport_mode, TransportMode::Grpc));
@@ -1536,6 +1651,7 @@ mod tests {
             max_connections: 10,
             max_tls_handshakes: 2,
             max_connections_per_ip: 3,
+            shutdown_timeout_secs: 30,
             cert: None,
             key: None,
             cert_chain: Vec::new(),
@@ -1547,6 +1663,7 @@ mod tests {
             reality_short_ids: Vec::new(),
             reality_max_time_diff_ms: None,
             config_file: None,
+            check_config: false,
             generate_config: None,
             generate_reality_keypair: false,
             log_level: None,

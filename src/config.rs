@@ -11,6 +11,7 @@ use crate::grpc::{
 pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 pub const DEFAULT_MAX_TLS_HANDSHAKES: usize = 64;
 pub const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 32;
+pub const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_ACME_CACHE_DIR: &str = "/var/lib/trojan-rs/acme";
 
 /// Shared, built-in ACME configuration. Certificates are provisioned and
@@ -151,6 +152,9 @@ pub struct ServerConfig {
     pub max_connections_per_ip: usize,
 
     #[arg(skip)]
+    pub shutdown_timeout_secs: u64,
+
+    #[arg(skip)]
     pub cert: Option<String>,
 
     #[arg(skip)]
@@ -187,6 +191,10 @@ pub struct ServerConfig {
     #[arg(short = 'c', long)]
     pub config_file: Option<String>,
 
+    /// Validate configuration and exit without opening listeners or requesting ACME certificates
+    #[arg(long, default_value_t = false)]
+    pub check_config: bool,
+
     /// Generate example configuration file
     #[arg(long)]
     pub generate_config: Option<String>,
@@ -214,9 +222,9 @@ pub struct ServerConfig {
 impl ServerConfig {
     /// 从 TOML 文件或命令行参数加载配置
     pub fn load() -> Result<Self> {
-        let config = Self::parse();
+        let cli = Self::parse();
 
-        if config.generate_reality_keypair {
+        if cli.generate_reality_keypair {
             let (private_key, public_key) = crate::reality::generate_keypair()?;
             println!("Private key: {private_key}");
             println!("Public key:  {public_key}");
@@ -224,18 +232,19 @@ impl ServerConfig {
         }
 
         // 如果指定了生成配置文件，生成后退出
-        if let Some(ref path) = config.generate_config {
+        if let Some(ref path) = cli.generate_config {
             TomlConfig::generate_example(path)?;
             println!("Example configuration file generated at: {}", path);
             std::process::exit(0);
         }
 
-        let config_path = config.config_file.clone().ok_or_else(|| {
+        let config_path = cli.config_file.clone().ok_or_else(|| {
             anyhow!("a TOML configuration file is required; use --config-file <FILE>")
         })?;
         println!("Loading configuration from: {config_path}");
         let mut config = TomlConfig::from_file(&config_path)?.to_server_config();
         config.config_file = Some(config_path);
+        config.check_config = cli.check_config;
 
         if config.inbounds.is_empty()
             || config
@@ -488,6 +497,9 @@ impl ServerConfig {
                 "maximum connections per IP must be greater than zero"
             ));
         }
+        if self.shutdown_timeout_secs == 0 {
+            return Err(anyhow!("shutdown timeout must be greater than zero"));
+        }
         Ok(())
     }
 
@@ -590,6 +602,9 @@ pub struct ServerSettings {
 
     #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: usize,
+
+    #[serde(default = "default_shutdown_timeout_secs")]
+    pub shutdown_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -628,6 +643,10 @@ const fn default_max_tls_handshakes() -> usize {
 
 const fn default_max_connections_per_ip() -> usize {
     DEFAULT_MAX_CONNECTIONS_PER_IP
+}
+
+const fn default_shutdown_timeout_secs() -> u64 {
+    DEFAULT_SHUTDOWN_TIMEOUT_SECS
 }
 
 fn default_acme_cache_dir() -> String {
@@ -783,6 +802,7 @@ impl TomlConfig {
                 max_connections: default_max_connections(),
                 max_tls_handshakes: default_max_tls_handshakes(),
                 max_connections_per_ip: default_max_connections_per_ip(),
+                shutdown_timeout_secs: default_shutdown_timeout_secs(),
             },
             log: Some(LogSettings {
                 level: "info".to_string(),
@@ -816,6 +836,7 @@ impl TomlConfig {
             max_connections: self.server.max_connections,
             max_tls_handshakes: self.server.max_tls_handshakes,
             max_connections_per_ip: self.server.max_connections_per_ip,
+            shutdown_timeout_secs: self.server.shutdown_timeout_secs,
             cert: None,
             key: None,
             cert_chain: Vec::new(),
@@ -827,6 +848,7 @@ impl TomlConfig {
             reality_short_ids: Vec::new(),
             reality_max_time_diff_ms: None,
             config_file: None,
+            check_config: false,
             generate_config: None,
             generate_reality_keypair: false,
             log_level: self.log.map(|l| l.level),
@@ -1123,11 +1145,28 @@ mod tests {
         assert_eq!(default_config.max_connections, 1024);
         assert_eq!(default_config.max_tls_handshakes, 64);
         assert_eq!(default_config.max_connections_per_ip, 32);
+        assert_eq!(default_config.shutdown_timeout_secs, 30);
         assert!(default_config.validate_connection_limits().is_ok());
 
         let mut invalid_config = test_config();
         invalid_config.max_connections_per_ip = 0;
         assert!(invalid_config.validate_connection_limits().is_err());
+
+        invalid_config.max_connections_per_ip = 32;
+        invalid_config.shutdown_timeout_secs = 0;
+        assert!(invalid_config.validate_connection_limits().is_err());
+    }
+
+    #[test]
+    fn check_config_flag_is_parsed() {
+        let config = ServerConfig::try_parse_from([
+            "trojan-rs",
+            "--config-file",
+            "server.toml",
+            "--check-config",
+        ])
+        .unwrap();
+        assert!(config.check_config);
     }
 
     #[test]
