@@ -14,6 +14,9 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 const UDP_TIMEOUT: u64 = 60; // UDP association timeout in seconds;
 const BUF_SIZE: usize = 4 * 1024;
+// Trojan frames encode the payload length as u16. Using BUF_SIZE here silently
+// truncated a valid remote UDP datagram before it was forwarded to the client.
+const TROJAN_UDP_MAX_PACKET_SIZE: usize = u16::MAX as usize;
 const UDP_CHANNEL_BUFFER_SIZE: usize = 64;
 const TCP_WRITE_CHANNEL_BUFFER_SIZE: usize = 32;
 const TCP_WRITE_BATCH_BYTES: usize = 256 * 1024;
@@ -196,7 +199,7 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     let last_activity_clone = Arc::clone(&last_activity);
 
     let udp_recv_handle = tokio::spawn(async move {
-        let mut buf = BytesMut::with_capacity(BUF_SIZE);
+        let mut buf = BytesMut::with_capacity(TROJAN_UDP_MAX_PACKET_SIZE);
         loop {
             tokio::select! {
                 _ = &mut cancel_rx => {
@@ -204,10 +207,10 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 }
                 result = {
                     buf.clear();
-                    if buf.capacity() < BUF_SIZE {
-                        buf.reserve(BUF_SIZE - buf.capacity());
+                    if buf.capacity() < TROJAN_UDP_MAX_PACKET_SIZE {
+                        buf.reserve(TROJAN_UDP_MAX_PACKET_SIZE - buf.capacity());
                     }
-                    buf.resize(BUF_SIZE, 0);
+                    buf.resize(TROJAN_UDP_MAX_PACKET_SIZE, 0);
                     socket_clone.recv_from(&mut buf[..])
                 } => {
                     match result {
@@ -228,8 +231,8 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                                 }
                             }
 
-                            if buf.capacity() > BUF_SIZE * 2 {
-                                buf = BytesMut::with_capacity(BUF_SIZE);
+                            if buf.capacity() > TROJAN_UDP_MAX_PACKET_SIZE * 2 {
+                                buf = BytesMut::with_capacity(TROJAN_UDP_MAX_PACKET_SIZE);
                             }
                         }
                         Err(e) => {
@@ -243,7 +246,7 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     });
 
     let peer_addr_for_write = peer_addr.clone();
-    let tcp_write_handle = tokio::spawn(async move {
+    let mut tcp_write_handle = tokio::spawn(async move {
         let mut client_write = client_write;
         while let Some(encoded) = tcp_write_rx.recv().await {
             let mut batch_bytes = encoded.len();
@@ -409,7 +412,7 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
 
     match tokio::time::timeout(
         std::time::Duration::from_secs(CLEANUP_TIMEOUT_SECS),
-        tcp_write_handle,
+        &mut tcp_write_handle,
     )
     .await
     {
@@ -423,12 +426,15 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 timeout_secs = CLEANUP_TIMEOUT_SECS,
                 "TCP write task cleanup timeout"
             );
+            tcp_write_handle.abort();
+            let _ = tcp_write_handle.await;
         }
     }
 
+    let mut udp_recv_handle = udp_recv_handle;
     match tokio::time::timeout(
         std::time::Duration::from_secs(CLEANUP_TIMEOUT_SECS),
-        udp_recv_handle,
+        &mut udp_recv_handle,
     )
     .await
     {
@@ -442,6 +448,8 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
                 timeout_secs = CLEANUP_TIMEOUT_SECS,
                 "UDP receive task cleanup timeout"
             );
+            udp_recv_handle.abort();
+            let _ = udp_recv_handle.await;
         }
     }
 
@@ -576,7 +584,7 @@ mod tests {
     use super::*;
     use std::io::ErrorKind;
     use std::net::IpAddr;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::{timeout, Duration};
 
     #[tokio::test]
@@ -628,6 +636,61 @@ mod tests {
             .await
             .expect("UDP associate task should join")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_associate_forwards_remote_datagrams_larger_than_four_kib() {
+        let udp_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_server_addr = udp_server.local_addr().unwrap();
+        let target = socks5::Address::IPv4(
+            match udp_server_addr.ip() {
+                IpAddr::V4(ip) => ip.octets(),
+                IpAddr::V6(_) => panic!("test UDP server must be IPv4"),
+            },
+            udp_server_addr.port(),
+        );
+        let initial_packet = UdpPacket {
+            addr: target,
+            length: 4,
+            payload: Bytes::from_static(b"ping"),
+        }
+        .encode();
+        let (client_stream, mut client_side) = tokio::io::duplex(32 * 1024);
+        let handle = tokio::spawn(handle_udp_associate(
+            client_stream,
+            socks5::Address::IPv4([0, 0, 0, 0], 0),
+            Bytes::from(initial_packet),
+            "127.0.0.1:12345".to_string(),
+        ));
+
+        let mut probe = [0_u8; 16];
+        let (_, relay_addr) = timeout(Duration::from_secs(3), udp_server.recv_from(&mut probe))
+            .await
+            .unwrap()
+            .unwrap();
+        let expected = vec![0x5a; 8 * 1024];
+        udp_server.send_to(&expected, relay_addr).await.unwrap();
+
+        let mut encoded = BytesMut::new();
+        let mut read_buf = [0_u8; 4096];
+        let response = loop {
+            match UdpPacket::decode(&encoded) {
+                DecodeResult::Ok(packet, _) => break packet,
+                DecodeResult::NeedMoreData => {}
+                DecodeResult::Invalid => panic!("received an invalid Trojan UDP frame"),
+            }
+            let length = timeout(Duration::from_secs(3), client_side.read(&mut read_buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(length, 0, "UDP associate closed before returning a packet");
+            encoded.extend_from_slice(&read_buf[..length]);
+        };
+        assert_eq!(response.length as usize, expected.len());
+        assert_eq!(response.payload.as_ref(), expected.as_slice());
+
+        client_side.shutdown().await.unwrap();
+        handle.await.unwrap().unwrap();
     }
 
     #[tokio::test]
