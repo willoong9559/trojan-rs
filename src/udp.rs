@@ -6,22 +6,26 @@ use anyhow::{anyhow, Result};
 use bytes::{Bytes, BytesMut};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
-use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot, Mutex};
 
 const UDP_TIMEOUT: u64 = 60; // UDP association timeout in seconds;
 const BUF_SIZE: usize = 4 * 1024;
-// Trojan frames encode the payload length as u16. Using BUF_SIZE here silently
-// truncated a valid remote UDP datagram before it was forwarded to the client.
-const TROJAN_UDP_MAX_PACKET_SIZE: usize = u16::MAX as usize;
-const UDP_CHANNEL_BUFFER_SIZE: usize = 64;
-const TCP_WRITE_CHANNEL_BUFFER_SIZE: usize = 32;
-const TCP_WRITE_BATCH_BYTES: usize = 256 * 1024;
-const CLEANUP_TIMEOUT_SECS: u64 = 5;
-const VLESS_UDP_MAX_PACKET_SIZE: usize = u16::MAX as usize;
+// trojan-gfw uses MAX_LENGTH (8 KiB) for both the UDP socket and the encrypted
+// stream accumulator. Keep the same per-datagram limit, and close the
+// association rather than forwarding a truncated datagram.
+const TROJAN_UDP_MAX_PACKET_SIZE: usize = 8 * 1024;
+
+async fn connect_udp_target(target: &socks5::Address) -> Result<UdpSocket> {
+    let remote = target.to_socket_addr().await?;
+    let socket = match remote {
+        SocketAddr::V4(_) => UdpSocket::bind("0.0.0.0:0").await?,
+        SocketAddr::V6(_) => UdpSocket::bind("[::]:0").await?,
+    };
+    socket.connect(remote).await?;
+    Ok(socket)
+}
 
 // UDP Packet for Trojan UDP Associate
 #[derive(Debug)]
@@ -186,274 +190,106 @@ pub async fn handle_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             UdpSocket::bind("0.0.0.0:0").await?
         }
     };
-    let socket = Arc::new(socket);
-    let last_activity = Arc::new(Mutex::new(Instant::now()));
+    let socket_uses_v6 = matches!(socket.local_addr(), Ok(SocketAddr::V6(_)));
+    let (mut client_read, mut client_write) = tokio::io::split(client_stream);
+    let mut read_buf = vec![0_u8; TROJAN_UDP_MAX_PACKET_SIZE];
+    // An extra byte lets us recognize (and reject) a packet exceeding the
+    // trojan-gfw 8 KiB buffer without ever relaying a truncated payload.
+    let mut udp_read_buf = vec![0_u8; TROJAN_UDP_MAX_PACKET_SIZE + 1];
+    let mut buffer = BytesMut::with_capacity(TROJAN_UDP_MAX_PACKET_SIZE);
+    buffer.extend_from_slice(&initial_payload);
+    let mut last_activity = Instant::now();
 
-    let (mut client_read, client_write) = tokio::io::split(client_stream);
+    'main_loop: loop {
+        while !buffer.is_empty() {
+            match UdpPacket::decode(&buffer) {
+                DecodeResult::Ok(udp_packet, consumed) => {
+                    if udp_packet.payload.len() > TROJAN_UDP_MAX_PACKET_SIZE {
+                        return Err(anyhow!(
+                            "Trojan UDP packet exceeds the 8 KiB trojan-gfw limit"
+                        ));
+                    }
+                    let _ = buffer.split_to(consumed);
+                    last_activity = Instant::now();
 
-    let (udp_tx, mut udp_rx) = mpsc::channel::<(SocketAddr, Bytes)>(UDP_CHANNEL_BUFFER_SIZE);
-    let (tcp_write_tx, mut tcp_write_rx) = mpsc::channel::<Vec<u8>>(TCP_WRITE_CHANNEL_BUFFER_SIZE);
-    let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
-
-    let socket_clone = Arc::clone(&socket);
-    let last_activity_clone = Arc::clone(&last_activity);
-
-    let udp_recv_handle = tokio::spawn(async move {
-        let mut buf = BytesMut::with_capacity(TROJAN_UDP_MAX_PACKET_SIZE);
-        loop {
-            tokio::select! {
-                _ = &mut cancel_rx => {
+                    match udp_packet.addr.to_socket_addr().await {
+                        Ok(remote_addr) => {
+                            let target = match remote_addr {
+                                SocketAddr::V4(v4) if socket_uses_v6 => SocketAddr::V6(
+                                    SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0),
+                                ),
+                                addr => addr,
+                            };
+                            if let Err(error) = socket.send_to(&udp_packet.payload, target).await {
+                                log::debug!(peer = %peer_addr, error = %error, "Failed to send UDP packet");
+                            }
+                        }
+                        Err(error) => {
+                            log::debug!(peer = %peer_addr, error = %error, "Failed to resolve UDP target address");
+                        }
+                    }
+                }
+                DecodeResult::NeedMoreData => {
+                    if buffer.len() > TROJAN_UDP_MAX_PACKET_SIZE {
+                        return Err(anyhow!(
+                            "incomplete Trojan UDP packet exceeds the 8 KiB trojan-gfw limit"
+                        ));
+                    }
                     break;
                 }
-                result = {
-                    buf.clear();
-                    if buf.capacity() < TROJAN_UDP_MAX_PACKET_SIZE {
-                        buf.reserve(TROJAN_UDP_MAX_PACKET_SIZE - buf.capacity());
-                    }
-                    buf.resize(TROJAN_UDP_MAX_PACKET_SIZE, 0);
-                    socket_clone.recv_from(&mut buf[..])
-                } => {
-                    match result {
-                        Ok((len, from_addr)) => {
-                            *last_activity_clone.lock().await = Instant::now();
-
-                            buf.truncate(len);
-
-                            let data = buf.split_to(len).freeze();
-
-                            match udp_tx.try_send((from_addr, data)) {
-                                Ok(_) => {}
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    log::debug!("UDP channel full, dropping packet");
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    break;
-                                }
-                            }
-
-                            if buf.capacity() > TROJAN_UDP_MAX_PACKET_SIZE * 2 {
-                                buf = BytesMut::with_capacity(TROJAN_UDP_MAX_PACKET_SIZE);
-                            }
-                        }
-                        Err(e) => {
-                            log::debug!("UDP socket recv error: {}", e);
-                            break;
-                        }
-                    }
+                DecodeResult::Invalid => {
+                    log::debug!(peer = %peer_addr, "Invalid UDP packet, closing connection");
+                    break 'main_loop;
                 }
             }
         }
-    });
 
-    let peer_addr_for_write = peer_addr.clone();
-    let mut tcp_write_handle = tokio::spawn(async move {
-        let mut client_write = client_write;
-        while let Some(encoded) = tcp_write_rx.recv().await {
-            let mut batch_bytes = encoded.len();
-
-            if let Err(e) = client_write.write_all(&encoded).await {
-                log::debug!(peer = %peer_addr_for_write, error = %e, "Error writing UDP response to client, dropping UDP");
-                return;
-            }
-
-            while batch_bytes < TCP_WRITE_BATCH_BYTES {
-                match tcp_write_rx.try_recv() {
-                    Ok(encoded) => {
-                        batch_bytes += encoded.len();
-                        if let Err(e) = client_write.write_all(&encoded).await {
-                            log::debug!(peer = %peer_addr_for_write, error = %e, "Error writing UDP response to client, dropping UDP");
-                            return;
-                        }
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+        let sleep_duration =
+            Duration::from_secs(UDP_TIMEOUT).saturating_sub(last_activity.elapsed());
+        tokio::select! {
+            _ = tokio::time::sleep(sleep_duration) => {
+                if last_activity.elapsed().as_secs() >= UDP_TIMEOUT {
+                    log::info!(peer = %peer_addr, "UDP associate timeout due to inactivity");
+                    break;
                 }
             }
+            read_result = client_read.read(&mut read_buf) => match read_result {
+                Ok(0) => break,
+                Ok(length) => buffer.extend_from_slice(&read_buf[..length]),
+                Err(error) => {
+                    log::debug!(peer = %peer_addr, error = %error, "Error reading from client stream");
+                    break;
+                }
+            },
+            recv_result = socket.recv_from(&mut udp_read_buf) => {
+                let (length, from_addr) = recv_result?;
+                if length > TROJAN_UDP_MAX_PACKET_SIZE {
+                    return Err(anyhow!(
+                        "UDP response exceeds the 8 KiB trojan-gfw limit"
+                    ));
+                }
 
-            if let Err(e) = client_write.flush().await {
-                log::debug!(peer = %peer_addr_for_write, error = %e, "Error flushing UDP response to client, dropping UDP");
-                return;
+                let addr = match from_addr {
+                    SocketAddr::V4(v4) => socks5::Address::IPv4(v4.ip().octets(), v4.port()),
+                    SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+                        Some(v4) => socks5::Address::IPv4(v4.octets(), v6.port()),
+                        None => socks5::Address::IPv6(v6.ip().octets(), v6.port()),
+                    },
+                };
+                let udp_packet = UdpPacket {
+                    addr,
+                    length: length as u16,
+                    payload: Bytes::copy_from_slice(&udp_read_buf[..length]),
+                };
+                client_write.write_all(&udp_packet.encode()).await?;
+                client_write.flush().await?;
+                last_activity = Instant::now();
             }
-        }
-
-        if let Err(e) = client_write.shutdown().await {
-            log::debug!(peer = %peer_addr_for_write, error = %e, "Error shutting down client stream after UDP associate");
-        }
-    });
-
-    let result = async {
-        let mut read_buf = vec![0u8; BUF_SIZE];
-        let mut buffer = BytesMut::with_capacity(BUF_SIZE);
-        buffer.extend_from_slice(&initial_payload);
-
-        'main_loop: loop {
-            while !buffer.is_empty() {
-                match UdpPacket::decode(&buffer) {
-                    DecodeResult::Ok(udp_packet, consumed) => {
-                        let _ = buffer.split_to(consumed);
-
-                        *last_activity.lock().await = Instant::now();
-
-                        match udp_packet.addr.to_socket_addr().await {
-                            Ok(remote_addr) => {
-                                let target = match remote_addr {
-                                    SocketAddr::V4(v4)
-                                        if matches!(
-                                            socket.local_addr(),
-                                            Ok(SocketAddr::V6(_))
-                                        ) =>
-                                    {
-                                        SocketAddr::V6(SocketAddrV6::new(
-                                            v4.ip().to_ipv6_mapped(),
-                                            v4.port(),
-                                            0,
-                                            0,
-                                        ))
-                                    }
-                                    addr => addr,
-                                };
-                                if let Err(e) = socket
-                                    .send_to(&udp_packet.payload, target)
-                                    .await
-                                {
-                                    log::debug!(peer = %peer_addr, error = %e, "Failed to send UDP packet");
-                                }
-                            }
-                            Err(e) => {
-                                log::debug!(peer = %peer_addr, error = %e, "Failed to resolve UDP target address");
-                            }
-                        }
-                    }
-                    DecodeResult::NeedMoreData => {
-                        break;
-                    }
-                    DecodeResult::Invalid => {
-                        log::debug!(peer = %peer_addr, "Invalid UDP packet, closing connection");
-                        break 'main_loop;
-                    }
-                }
-            }
-
-            let timeout_duration = std::time::Duration::from_secs(UDP_TIMEOUT);
-            let time_since_activity = {
-                let last = *last_activity.lock().await;
-                last.elapsed()
-            };
-            let sleep_duration = timeout_duration.saturating_sub(time_since_activity);
-
-            tokio::select! {
-                _ = tokio::time::sleep(sleep_duration) => {
-                    let last = *last_activity.lock().await;
-                    if last.elapsed().as_secs() >= UDP_TIMEOUT {
-                        log::info!(peer = %peer_addr, "UDP associate timeout due to inactivity");
-                        break 'main_loop;
-                    }
-                }
-
-                read_result = client_read.read(&mut read_buf) => {
-                    match read_result {
-                        Ok(0) => {
-                            break 'main_loop;
-                        }
-                        Ok(n) => {
-                            buffer.extend_from_slice(&read_buf[..n]);
-                        }
-                        Err(e) => {
-                            log::debug!(peer = %peer_addr, error = %e, "Error reading from client stream");
-                            break 'main_loop;
-                        }
-                    }
-                }
-
-                packet = udp_rx.recv() => {
-                    match packet {
-                        Some((from_addr, data)) => {
-                            let addr = match from_addr {
-                                SocketAddr::V4(v4) => socks5::Address::IPv4(v4.ip().octets(), v4.port()),
-                                SocketAddr::V6(v6) => {
-                                    if let Some(v4) = v6.ip().to_ipv4_mapped() {
-                                        socks5::Address::IPv4(v4.octets(), v6.port())
-                                    } else {
-                                        socks5::Address::IPv6(v6.ip().octets(), v6.port())
-                                    }
-                                }
-                            };
-
-                            let udp_packet = UdpPacket {
-                                addr,
-                                length: data.len() as u16,
-                                payload: data,
-                            };
-
-                            let encoded = udp_packet.encode();
-                            match tcp_write_tx.try_send(encoded) {
-                                Ok(_) => {}
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    log::debug!(peer = %peer_addr, "TCP write channel full, dropping packet");
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    break 'main_loop;
-                                }
-                            }
-                        }
-                        None => {
-                            break 'main_loop;
-                        }
-                    }
-                }
-            }
-        }
-        Ok::<(), anyhow::Error>(())
-    }.await;
-
-    drop(tcp_write_tx);
-
-    let _ = cancel_tx.send(());
-
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(CLEANUP_TIMEOUT_SECS),
-        &mut tcp_write_handle,
-    )
-    .await
-    {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => {
-            log::warn!(peer = %peer_addr, error = %e, "TCP write task ended with error");
-        }
-        Err(_) => {
-            log::warn!(
-                peer = %peer_addr,
-                timeout_secs = CLEANUP_TIMEOUT_SECS,
-                "TCP write task cleanup timeout"
-            );
-            tcp_write_handle.abort();
-            let _ = tcp_write_handle.await;
         }
     }
 
-    let mut udp_recv_handle = udp_recv_handle;
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(CLEANUP_TIMEOUT_SECS),
-        &mut udp_recv_handle,
-    )
-    .await
-    {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => {
-            log::warn!(peer = %peer_addr, error = %e, "UDP receive task ended with error");
-        }
-        Err(_) => {
-            log::warn!(
-                peer = %peer_addr,
-                timeout_secs = CLEANUP_TIMEOUT_SECS,
-                "UDP receive task cleanup timeout"
-            );
-            udp_recv_handle.abort();
-            let _ = udp_recv_handle.await;
-        }
-    }
-
-    result
+    client_write.shutdown().await?;
+    Ok(())
 }
 
 /// Handles standard VLESS UDP. The VLESS request header fixes the destination,
@@ -465,19 +301,14 @@ pub async fn handle_vless_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send
     initial_payload: Bytes,
     peer_addr: String,
 ) -> Result<()> {
-    let remote = target.to_socket_addr().await?;
-    let socket = match remote {
-        SocketAddr::V4(_) => UdpSocket::bind("0.0.0.0:0").await?,
-        SocketAddr::V6(_) => UdpSocket::bind("[::]:0").await?,
-    };
-    socket.connect(remote).await?;
+    let socket = connect_udp_target(&target).await?;
     log::info!(peer = %peer_addr, "Starting VLESS UDP associate");
 
     let (mut client_read, mut client_write) = tokio::io::split(client_stream);
     let mut incoming = BytesMut::with_capacity(BUF_SIZE);
     incoming.extend_from_slice(&initial_payload);
     let mut client_read_buf = vec![0_u8; BUF_SIZE];
-    let mut udp_read_buf = vec![0_u8; VLESS_UDP_MAX_PACKET_SIZE];
+    let mut udp_read_buf = vec![0_u8; u16::MAX as usize];
     let mut last_activity = Instant::now();
 
     loop {
@@ -488,7 +319,7 @@ pub async fn handle_vless_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send
             }
             last_activity = Instant::now();
         }
-        if incoming.len() > VLESS_UDP_MAX_PACKET_SIZE + 2 {
+        if incoming.len() > u16::MAX as usize + 2 {
             return Err(anyhow!("VLESS UDP packet exceeds maximum size"));
         }
 
@@ -527,15 +358,10 @@ pub async fn handle_vmess_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send
     target: socks5::Address,
     peer_addr: String,
 ) -> Result<()> {
-    let remote = target.to_socket_addr().await?;
-    let socket = match remote {
-        SocketAddr::V4(_) => UdpSocket::bind("0.0.0.0:0").await?,
-        SocketAddr::V6(_) => UdpSocket::bind("[::]:0").await?,
-    };
-    socket.connect(remote).await?;
+    let socket = connect_udp_target(&target).await?;
     log::info!(peer = %peer_addr, "Starting VMess UDP associate");
 
-    let mut udp_read_buf = vec![0_u8; VLESS_UDP_MAX_PACKET_SIZE];
+    let mut udp_read_buf = vec![0_u8; vmess::MAX_UDP_PACKET_SIZE + 1];
     let mut last_activity = Instant::now();
     loop {
         let idle_remaining =
@@ -556,6 +382,9 @@ pub async fn handle_vmess_udp_associate<S: AsyncRead + AsyncWrite + Unpin + Send
             },
             received = socket.recv(&mut udp_read_buf) => {
                 let length = received?;
+                if length > vmess::MAX_UDP_PACKET_SIZE {
+                    return Err(anyhow!("VMess UDP response is too large"));
+                }
                 client_stream.write_packet(&udp_read_buf[..length]).await?;
                 last_activity = Instant::now();
             }
@@ -639,7 +468,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_associate_forwards_remote_datagrams_larger_than_four_kib() {
+    async fn udp_associate_forwards_datagrams_up_to_trojan_gfw_limit() {
         let udp_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let udp_server_addr = udp_server.local_addr().unwrap();
         let target = socks5::Address::IPv4(
@@ -691,6 +520,70 @@ mod tests {
 
         client_side.shutdown().await.unwrap();
         handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_associate_rejects_remote_datagrams_larger_than_trojan_gfw_limit() {
+        let udp_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_server_addr = udp_server.local_addr().unwrap();
+        let target = socks5::Address::IPv4(
+            match udp_server_addr.ip() {
+                IpAddr::V4(ip) => ip.octets(),
+                IpAddr::V6(_) => panic!("test UDP server must be IPv4"),
+            },
+            udp_server_addr.port(),
+        );
+        let initial_packet = UdpPacket {
+            addr: target,
+            length: 4,
+            payload: Bytes::from_static(b"ping"),
+        }
+        .encode();
+        let (client_stream, _client_side) = tokio::io::duplex(32 * 1024);
+        let handle = tokio::spawn(handle_udp_associate(
+            client_stream,
+            socks5::Address::IPv4([0, 0, 0, 0], 0),
+            Bytes::from(initial_packet),
+            "127.0.0.1:12345".to_string(),
+        ));
+
+        let mut probe = [0_u8; 16];
+        let (_, relay_addr) = timeout(Duration::from_secs(3), udp_server.recv_from(&mut probe))
+            .await
+            .unwrap()
+            .unwrap();
+        udp_server
+            .send_to(&vec![0x5a; TROJAN_UDP_MAX_PACKET_SIZE + 1], relay_addr)
+            .await
+            .unwrap();
+
+        let error = timeout(Duration::from_secs(3), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("trojan-gfw limit"));
+    }
+
+    #[tokio::test]
+    async fn udp_associate_rejects_oversized_client_packet() {
+        let packet = UdpPacket {
+            addr: socks5::Address::IPv4([127, 0, 0, 1], 53),
+            length: (TROJAN_UDP_MAX_PACKET_SIZE + 1) as u16,
+            payload: vec![0; TROJAN_UDP_MAX_PACKET_SIZE + 1].into(),
+        }
+        .encode();
+        let (client_stream, _client_side) = tokio::io::duplex(16 * 1024);
+
+        let error = handle_udp_associate(
+            client_stream,
+            socks5::Address::IPv4([0, 0, 0, 0], 0),
+            Bytes::from(packet),
+            "127.0.0.1:12345".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("trojan-gfw limit"));
     }
 
     #[tokio::test]

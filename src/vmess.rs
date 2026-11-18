@@ -36,6 +36,9 @@ use crate::socks5;
 
 const HEADER_MAX_LEN: usize = 1024;
 const MAX_CHUNK_LEN: usize = 16 * 1024;
+/// Largest UDP datagram which fits in one VMess standard-format record after
+/// accounting for AEAD authentication data and optional global padding.
+pub const MAX_UDP_PACKET_SIZE: usize = MAX_CHUNK_LEN - 16 - 63;
 const AUTH_ID_MAX_TIME_DIFF_SECS: u64 = 120;
 const LEGACY_AUTH_CACHE_REFRESH_SECS: u64 = 10;
 pub const MAX_LEGACY_ALTER_ID: u16 = 256;
@@ -955,7 +958,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream<S> {
 
     /// Send one VMess UDP record without coalescing it with another datagram.
     pub async fn write_packet(&mut self, packet: &[u8]) -> io::Result<()> {
-        if packet.len() > MAX_CHUNK_LEN - 16 - 63 {
+        if packet.len() > MAX_UDP_PACKET_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "VMess UDP packet is too large",
@@ -1005,7 +1008,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Stream<S> {
             if input.is_empty() {
                 return Poll::Ready(Ok(0));
             }
-            let length = cmp::min(input.len(), MAX_CHUNK_LEN - 16 - 63);
+            let length = cmp::min(input.len(), MAX_UDP_PACKET_SIZE);
             let frame = self.encode_chunk(&input[..length])?;
             self.write_pending = Some((frame, length));
             self.write_offset = 0;
@@ -1136,6 +1139,26 @@ mod tests {
     fn parses_uuid_with_shared_vless_helper() {
         let id = crate::vless::parse_uuid("01234567-89ab-cdef-0123-456789abcdef").unwrap();
         assert_ne!(command_key(&id), [0; 16]);
+    }
+
+    #[tokio::test]
+    async fn vmess_udp_rejects_packets_that_do_not_fit_one_record() {
+        let (inner, _peer) = tokio::io::duplex(1);
+        let mut stream = Stream::new(
+            inner,
+            [1; 16],
+            [2; 16],
+            [3; 16],
+            [4; 16],
+            SECURITY_AES_128_GCM,
+            OPTION_CHUNK_STREAM,
+        )
+        .unwrap();
+        let error = stream
+            .write_packet(&vec![0; MAX_UDP_PACKET_SIZE + 1])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
