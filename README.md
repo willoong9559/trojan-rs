@@ -41,6 +41,10 @@ cargo build --release
 max_connections = 1024
 max_tls_handshakes = 64
 max_connections_per_ip = 32
+# 若使用 TCP 或 WebSocket 等非复用传输，请考虑提高为：
+# max_connections = 4096
+# max_tls_handshakes = 128 # 同时进行的 TLS / REALITY 握手，不是连接总上限。
+# max_connections_per_ip = 128
 # 收到 SIGTERM 或 Ctrl-C 后，等待已有连接结束的最长秒数。
 shutdown_timeout_secs = 30
 
