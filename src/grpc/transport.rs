@@ -57,11 +57,7 @@ impl GrpcH2cTransport {
             pending_release_capacity: 0,
             send_queue: VecDeque::new(),
             send_queue_bytes: 0,
-            pending_payload: BytesMut::with_capacity(
-                limits
-                    .max_message_bytes
-                    .min(MAX_OUTBOUND_GRPC_PAYLOAD_BYTES),
-            ),
+            pending_payload: BytesMut::with_capacity(MAX_OUTBOUND_GRPC_PAYLOAD_BYTES),
             current_frame: None,
             current_frame_offset: 0,
             recv_closed: false,
@@ -78,9 +74,7 @@ impl GrpcH2cTransport {
     }
 
     fn max_outbound_payload_bytes(&self) -> usize {
-        self.limits
-            .max_message_bytes
-            .min(MAX_OUTBOUND_GRPC_PAYLOAD_BYTES)
+        MAX_OUTBOUND_GRPC_PAYLOAD_BYTES
     }
 
     fn send_capacity_timed_out(&mut self, cx: &mut Context<'_>) -> bool {
@@ -343,6 +337,17 @@ impl AsyncRead for GrpcH2cTransport {
             } else {
                 match parse_grpc_header(&self.read_pending) {
                     Ok(Some(header)) => {
+                        if let Err(error) = validate_inbound_hunk_size(
+                            header.payload_len,
+                            self.limits.max_inbound_hunk_bytes,
+                        ) {
+                            warn!(
+                                payload_len = header.payload_len,
+                                limit = self.limits.max_inbound_hunk_bytes,
+                                "Rejecting oversized inbound gRPC Hunk"
+                            );
+                            return Poll::Ready(Err(error));
+                        }
                         self.read_pending.advance(header.header_len);
                         self.release_flow_control_capacity(header.header_len);
                         self.read_remaining = header.payload_len;
@@ -522,6 +527,16 @@ impl AsyncWrite for GrpcH2cTransport {
     }
 }
 
+fn validate_inbound_hunk_size(payload_len: usize, limit: usize) -> io::Result<()> {
+    if payload_len > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("gRPC Hunk payload {payload_len} exceeds configured maximum {limit}"),
+        ));
+    }
+    Ok(())
+}
+
 fn is_benign_trailer_send_error(error: &h2::Error) -> bool {
     error.is_remote()
         || error.is_io()
@@ -542,6 +557,15 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{oneshot, Mutex};
     use tokio::time::{timeout, Duration};
+
+    #[test]
+    fn oversized_inbound_hunk_is_rejected() {
+        let error = validate_inbound_hunk_size(4 * 1024 * 1024 + 1, 4 * 1024 * 1024)
+            .expect_err("Hunk over the configured inbound limit must fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds configured maximum"));
+    }
 
     #[tokio::test]
     async fn transport_write_all_succeeds() {

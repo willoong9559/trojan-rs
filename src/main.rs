@@ -1885,7 +1885,7 @@ mod tests {
             shadowsocks_method: None,
             grpc_max_concurrent_streams: 7,
             grpc_max_read_buffer_bytes: 64 * 1024,
-            grpc_max_message_bytes: 8 * 1024,
+            grpc_max_inbound_hunk_bytes: 8 * 1024,
             grpc_max_send_queue_bytes: 16 * 1024,
             max_connections: 10,
             max_tls_handshakes: 2,
@@ -1916,7 +1916,7 @@ mod tests {
         let server = build_server(config).await.expect("failed to build server");
         assert_eq!(server.grpc_limits.max_concurrent_streams, 7);
         assert_eq!(server.grpc_limits.max_read_buffer_bytes, 64 * 1024);
-        assert_eq!(server.grpc_limits.max_message_bytes, 8 * 1024);
+        assert_eq!(server.grpc_limits.max_inbound_hunk_bytes, 8 * 1024);
         assert_eq!(server.grpc_limits.max_send_queue_bytes, 16 * 1024);
         let server_run_task = tokio::spawn(async move {
             let _ = server.run().await;

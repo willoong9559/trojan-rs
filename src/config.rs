@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{fs, net::SocketAddr, path::Path};
 
 use crate::grpc::{
-    GrpcLimits, DEFAULT_GRPC_MAX_CONCURRENT_STREAMS, DEFAULT_GRPC_MAX_MESSAGE_BYTES,
+    GrpcLimits, DEFAULT_GRPC_MAX_CONCURRENT_STREAMS, DEFAULT_GRPC_MAX_INBOUND_HUNK_BYTES,
     DEFAULT_GRPC_MAX_READ_BUFFER_BYTES, DEFAULT_GRPC_MAX_SEND_QUEUE_BYTES, MAX_FRAME_SIZE,
 };
 use crate::outbound::OutboundPolicySettings;
@@ -138,7 +138,7 @@ pub struct ServerConfig {
     pub grpc_max_read_buffer_bytes: usize,
 
     #[arg(skip)]
-    pub grpc_max_message_bytes: usize,
+    pub grpc_max_inbound_hunk_bytes: usize,
 
     #[arg(skip)]
     pub grpc_max_send_queue_bytes: usize,
@@ -466,9 +466,9 @@ impl ServerConfig {
                 "gRPC maximum concurrent streams must be greater than zero"
             ));
         }
-        if self.grpc_max_message_bytes == 0 {
+        if self.grpc_max_inbound_hunk_bytes == 0 {
             return Err(anyhow!(
-                "gRPC maximum message size must be greater than zero"
+                "gRPC maximum inbound Hunk size must be greater than zero"
             ));
         }
         if self.grpc_max_read_buffer_bytes < MAX_FRAME_SIZE as usize {
@@ -477,25 +477,14 @@ impl ServerConfig {
                 MAX_FRAME_SIZE
             ));
         }
-        if self.grpc_max_read_buffer_bytes < self.grpc_max_message_bytes {
-            return Err(anyhow!(
-                "gRPC maximum read buffer must not be smaller than the maximum message size"
-            ));
-        }
-        let framed_message_bytes = self
-            .grpc_max_message_bytes
-            .checked_add(16)
-            .ok_or_else(|| anyhow!("gRPC maximum message size is too large"))?;
-        if self.grpc_max_send_queue_bytes < framed_message_bytes {
-            return Err(anyhow!(
-                "gRPC maximum send queue must fit one framed gRPC message"
-            ));
+        if self.grpc_max_send_queue_bytes == 0 {
+            return Err(anyhow!("gRPC maximum send queue must be greater than zero"));
         }
 
         Ok(GrpcLimits {
             max_concurrent_streams: self.grpc_max_concurrent_streams,
             max_read_buffer_bytes: self.grpc_max_read_buffer_bytes,
-            max_message_bytes: self.grpc_max_message_bytes,
+            max_inbound_hunk_bytes: self.grpc_max_inbound_hunk_bytes,
             max_send_queue_bytes: self.grpc_max_send_queue_bytes,
         })
     }
@@ -626,8 +615,8 @@ pub struct GrpcSettings {
     #[serde(default = "default_grpc_max_read_buffer_bytes")]
     pub max_read_buffer_bytes: usize,
 
-    #[serde(default = "default_grpc_max_message_bytes")]
-    pub max_message_bytes: usize,
+    #[serde(default = "default_grpc_max_inbound_hunk_bytes")]
+    pub max_inbound_hunk_bytes: usize,
 
     #[serde(default = "default_grpc_max_send_queue_bytes")]
     pub max_send_queue_bytes: usize,
@@ -638,7 +627,7 @@ impl Default for GrpcSettings {
         Self {
             max_concurrent_streams: default_grpc_max_concurrent_streams(),
             max_read_buffer_bytes: default_grpc_max_read_buffer_bytes(),
-            max_message_bytes: default_grpc_max_message_bytes(),
+            max_inbound_hunk_bytes: default_grpc_max_inbound_hunk_bytes(),
             max_send_queue_bytes: default_grpc_max_send_queue_bytes(),
         }
     }
@@ -662,8 +651,8 @@ const fn default_grpc_max_read_buffer_bytes() -> usize {
     DEFAULT_GRPC_MAX_READ_BUFFER_BYTES
 }
 
-const fn default_grpc_max_message_bytes() -> usize {
-    DEFAULT_GRPC_MAX_MESSAGE_BYTES
+const fn default_grpc_max_inbound_hunk_bytes() -> usize {
+    DEFAULT_GRPC_MAX_INBOUND_HUNK_BYTES
 }
 
 const fn default_grpc_max_send_queue_bytes() -> usize {
@@ -866,7 +855,7 @@ impl TomlConfig {
             shadowsocks_method: None,
             grpc_max_concurrent_streams: self.server.grpc.max_concurrent_streams,
             grpc_max_read_buffer_bytes: self.server.grpc.max_read_buffer_bytes,
-            grpc_max_message_bytes: self.server.grpc.max_message_bytes,
+            grpc_max_inbound_hunk_bytes: self.server.grpc.max_inbound_hunk_bytes,
             grpc_max_send_queue_bytes: self.server.grpc.max_send_queue_bytes,
             max_connections: self.server.max_connections,
             max_tls_handshakes: self.server.max_tls_handshakes,
@@ -1170,8 +1159,8 @@ mod tests {
         let limits = config.grpc_limits().unwrap();
 
         assert_eq!(limits.max_concurrent_streams, 128);
-        assert_eq!(limits.max_read_buffer_bytes, 256 * 1024);
-        assert_eq!(limits.max_message_bytes, 16 * 1024);
+        assert_eq!(limits.max_read_buffer_bytes, 64 * 1024);
+        assert_eq!(limits.max_inbound_hunk_bytes, 4 * 1024 * 1024);
         assert_eq!(limits.max_send_queue_bytes, 128 * 1024);
     }
 
@@ -1192,7 +1181,7 @@ mod tests {
                 [server.grpc]
                 max_concurrent_streams = 7
                 max_read_buffer_bytes = 65536
-                max_message_bytes = 8192
+                max_inbound_hunk_bytes = 8192
                 max_send_queue_bytes = 16384
 
                 [[inbounds]]
@@ -1207,7 +1196,7 @@ mod tests {
         let limits = config.grpc_limits().unwrap();
         assert_eq!(limits.max_concurrent_streams, 7);
         assert_eq!(limits.max_read_buffer_bytes, 65536);
-        assert_eq!(limits.max_message_bytes, 8192);
+        assert_eq!(limits.max_inbound_hunk_bytes, 8192);
         assert_eq!(limits.max_send_queue_bytes, 16384);
 
         let legacy = toml::from_str::<super::TomlConfig>(

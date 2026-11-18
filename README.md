@@ -57,8 +57,8 @@ block_private_addresses = true
 # 所有 gRPC 入口共享这些限制。
 [server.grpc]
 max_concurrent_streams = 128
-max_read_buffer_bytes = 262144
-max_message_bytes = 16384
+max_read_buffer_bytes = 65536 # 未消费的 HTTP/2 DATA 缓冲上限。
+max_inbound_hunk_bytes = 4194304 # 入站单条 gRPC Hunk payload 上限（4 MiB）。
 max_send_queue_bytes = 131072
 
 # 内置 ACME：只由 acme = true 的入口使用。
